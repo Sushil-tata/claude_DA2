@@ -100,9 +100,30 @@ def income_estimation_pipeline(config: Dict[str, Any], spark=None) -> Dict[str, 
 
     # Step 7: Write decisions
     logger.info("Step 7: Writing decisions to Delta Lake...")
+
+    # Add predictions to Spark DataFrame (no toPandas)
+    from pyspark.sql.types import DoubleType, LongType, StructType, StructField
+    from pyspark.sql import functions as F
+    from pyspark.sql.window import Window
+
+    # Create predictions DataFrame
+    predictions_data = [(i, float(pred)) for i, pred in enumerate(test_pred)]
+    predictions_schema = StructType([
+        StructField("_row_num", LongType(), False),
+        StructField("prediction", DoubleType(), False)
+    ])
+
+    predictions_spark_df = spark.createDataFrame(predictions_data, predictions_schema)
+
+    # Add row numbers to test_features and join
+    window_spec = Window.orderBy(F.monotonically_increasing_id())
+    test_with_rownum = test_features.withColumn("_row_num", F.row_number().over(window_spec) - 1)
+    test_with_predictions = test_with_rownum.join(predictions_spark_df, "_row_num").drop("_row_num")
+
+    # Write decisions (Spark-native)
     decision_table = write_decisions(
         spark=spark,
-        predictions_df=test_features.toPandas().assign(prediction=test_pred),
+        predictions_df=test_with_predictions,
         config=config,
         model_version="v1.0",
         run_id="local_run_001"

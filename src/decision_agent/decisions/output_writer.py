@@ -11,22 +11,24 @@ logger = logging.getLogger(__name__)
 
 def write_decisions(
     spark,
-    predictions_df: pd.DataFrame,
+    predictions_df,
     config: Dict[str, Any],
     model_version: str,
     run_id: str,
-    as_of_date: str = None
+    as_of_date: str = None,
+    prediction_col: str = "prediction"
 ):
     """
-    Write decision output to Delta Lake table.
+    Write decision output to Delta Lake table (Spark-native).
 
     Args:
         spark: Spark session
-        predictions_df: Pandas DataFrame with customer_id and prediction columns
+        predictions_df: Spark or pandas DataFrame with customer_id and predictions
         config: Use case configuration
         model_version: Model version identifier
         run_id: MLflow run ID or execution run ID
         as_of_date: As-of date for decisions (default: today)
+        prediction_col: Name of prediction column
 
     Returns:
         Table name where decisions were written
@@ -48,29 +50,58 @@ def write_decisions(
 
     logger.info(f"Writing decisions to {table_name}...")
 
-    # Prepare decision records
-    decision_data = predictions_df[["customer_id", "prediction"]].copy()
-    decision_data = decision_data.rename(columns={"prediction": "predicted_value"})
+    # Check if Spark DataFrame
+    try:
+        from pyspark.sql import DataFrame as SparkDataFrame
+        is_spark = isinstance(predictions_df, SparkDataFrame)
+    except ImportError:
+        is_spark = False
 
-    # Add metadata columns
-    decision_data["run_id"] = run_id
-    decision_data["model_version"] = model_version
-    decision_data["as_of_dt"] = as_of_date
-    decision_data["use_case_id"] = use_case_id
-    decision_data["created_timestamp"] = datetime.now().isoformat()
+    if not is_spark:
+        # Convert pandas to Spark if needed
+        if spark is None:
+            logger.warning("No Spark session available. Saving decisions locally to CSV.")
+            import pandas as pd
 
-    logger.info(f"Prepared {len(decision_data)} decision records")
-    logger.info(f"Sample decisions:\n{decision_data.head()}")
+            decision_data = predictions_df[["customer_id", prediction_col]].copy()
+            decision_data = decision_data.rename(columns={prediction_col: "predicted_value"})
+            decision_data["run_id"] = run_id
+            decision_data["model_version"] = model_version
+            decision_data["as_of_dt"] = as_of_date
+            decision_data["use_case_id"] = use_case_id
+            decision_data["created_timestamp"] = datetime.now().isoformat()
 
-    if spark is None:
-        logger.warning("No Spark session available. Saving decisions locally to CSV.")
-        output_path = f"decisions_{use_case_id}_{run_id}.csv"
-        decision_data.to_csv(output_path, index=False)
-        logger.info(f"Decisions saved to {output_path}")
-        return output_path
+            output_path = f"decisions_{use_case_id}_{run_id}.csv"
+            decision_data.to_csv(output_path, index=False)
+            logger.info(f"Decisions saved to {output_path}")
+            return output_path
 
-    # Convert to Spark DataFrame
-    decisions_spark_df = spark.createDataFrame(decision_data)
+        predictions_df = spark.createDataFrame(predictions_df)
+
+    # Prepare decision records (Spark operations only)
+    from pyspark.sql import functions as F
+
+    decisions_spark_df = predictions_df.select(
+        F.col("customer_id"),
+        F.col(prediction_col).alias("predicted_value")
+    ).withColumn(
+        "run_id", F.lit(run_id)
+    ).withColumn(
+        "model_version", F.lit(model_version)
+    ).withColumn(
+        "as_of_dt", F.lit(as_of_date)
+    ).withColumn(
+        "use_case_id", F.lit(use_case_id)
+    ).withColumn(
+        "created_timestamp", F.lit(datetime.now().isoformat())
+    )
+
+    num_decisions = decisions_spark_df.count()
+    logger.info(f"Prepared {num_decisions:,} decision records")
+
+    # Show sample (limited to 5 rows, safe to collect)
+    logger.info("Sample decisions:")
+    decisions_spark_df.show(5, truncate=False)
 
     try:
         # Check if table exists
@@ -133,8 +164,10 @@ def read_decisions(
     table_name: str,
     use_case_id: str = None,
     as_of_date: str = None,
-    limit: int = None
-) -> pd.DataFrame:
+    limit: int = None,
+    as_pandas: bool = False,
+    max_rows_pandas: int = 10000
+):
     """
     Read decisions from Delta Lake table.
 
@@ -144,9 +177,11 @@ def read_decisions(
         use_case_id: Filter by use case (optional)
         as_of_date: Filter by decision date (optional)
         limit: Maximum number of records to return
+        as_pandas: If True, convert to pandas (with safety checks)
+        max_rows_pandas: Maximum rows allowed for pandas conversion
 
     Returns:
-        Pandas DataFrame with decisions
+        Spark DataFrame (default) or pandas DataFrame (if as_pandas=True)
     """
     logger.info(f"Reading decisions from {table_name}...")
 
@@ -165,7 +200,21 @@ def read_decisions(
     if limit:
         query += f" LIMIT {limit}"
 
-    df = spark.sql(query).toPandas()
+    df = spark.sql(query)
+    row_count = df.count()
 
-    logger.info(f"Read {len(df)} decision records")
+    logger.info(f"Read {row_count:,} decision records")
+
+    if as_pandas:
+        # Use safe_to_pandas with guardrails
+        from decision_agent.utils.spark_guards import safe_to_pandas
+
+        if row_count > max_rows_pandas:
+            logger.warning(
+                f"DataFrame has {row_count:,} rows, limiting to {max_rows_pandas:,} for pandas conversion"
+            )
+            df = df.limit(max_rows_pandas)
+
+        return safe_to_pandas(df, max_rows=max_rows_pandas, sample_for_estimate=False)
+
     return df

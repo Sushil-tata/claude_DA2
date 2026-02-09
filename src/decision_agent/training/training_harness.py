@@ -156,15 +156,24 @@ class TrainingHarness:
         else:
             raise ValueError(f"Unknown algorithm: {self.algorithm}")
 
-    def _to_pandas(self, df):
-        """Convert Spark DataFrame to pandas if needed"""
+    def _to_pandas(self, df, max_rows: int = 100000):
+        """
+        Convert Spark DataFrame to pandas with safety guards.
+
+        Only training_harness is allowed to use toPandas() for model training.
+        Uses safe_to_pandas with size checks.
+        """
         try:
             from pyspark.sql import DataFrame as SparkDataFrame
+            from decision_agent.utils.spark_guards import safe_to_pandas
 
             if isinstance(df, SparkDataFrame):
-                logger.info("Converting Spark DataFrame to pandas...")
-                pdf = df.toPandas()
-                logger.info(f"Converted to pandas: {pdf.shape}")
+                logger.info("Converting Spark DataFrame to pandas for model training...")
+
+                # Use safe_to_pandas with guardrails
+                pdf = safe_to_pandas(df, max_rows=max_rows, sample_for_estimate=True)
+
+                logger.info(f"✓ Safely converted to pandas: {pdf.shape}")
                 return pdf
         except ImportError:
             pass

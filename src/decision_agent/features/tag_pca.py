@@ -1,8 +1,7 @@
 """
-PCA dimensionality reduction on tag/category embeddings.
+PCA dimensionality reduction on tag/category embeddings using Spark ML.
 """
 import logging
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +14,9 @@ def compute_tag_pca(
 ):
     """
     Apply PCA to tag frequency features for dimensionality reduction.
+
+    Uses Spark ML PCA for distributed computation (Spark-native).
+    Falls back to pandas+sklearn for pandas DataFrames.
 
     Args:
         df: DataFrame with tag features (Spark or pandas)
@@ -44,64 +46,94 @@ def compute_tag_pca(
 
 def _compute_tag_pca_spark(df, tag_feature_cols, n_components, output_prefix):
     """
-    Spark implementation using pandas_udf for PCA.
+    Spark-native PCA implementation using Spark ML.
 
-    Note: For production, consider using Spark ML's PCA.
-    This implementation converts to pandas for simplicity.
+    Uses VectorAssembler + PCA from pyspark.ml for distributed computation.
+    No toPandas() conversion.
     """
+    from pyspark.ml.feature import VectorAssembler, PCA, StandardScaler
     from pyspark.sql import functions as F
 
-    # Convert to pandas for PCA (acceptable for moderate data sizes)
-    pdf = df.select(tag_feature_cols).toPandas()
+    logger.info(f"Computing PCA with Spark ML on {len(tag_feature_cols)} tag features")
 
-    # Fit PCA
-    from sklearn.decomposition import PCA
+    # Step 1: Assemble tag features into a single vector column
+    assembler = VectorAssembler(
+        inputCols=tag_feature_cols,
+        outputCol="_tag_features_vector",
+        handleInvalid="keep"  # Keep rows with NaN values
+    )
 
-    pca = PCA(n_components=n_components)
+    # Fill nulls with 0 before assembling
+    df_filled = df
+    for col in tag_feature_cols:
+        df_filled = df_filled.fillna({col: 0.0})
 
-    # Handle missing values
-    pdf_filled = pdf.fillna(0)
+    df_with_vector = assembler.transform(df_filled)
 
-    # Fit and transform
-    pca_components = pca.fit_transform(pdf_filled)
+    # Step 2: Optional - Standardize features (improves PCA quality)
+    scaler = StandardScaler(
+        inputCol="_tag_features_vector",
+        outputCol="_tag_features_scaled",
+        withStd=True,
+        withMean=True
+    )
+    scaler_model = scaler.fit(df_with_vector)
+    df_scaled = scaler_model.transform(df_with_vector)
 
-    logger.info(f"PCA explained variance ratio: {pca.explained_variance_ratio_}")
+    # Step 3: Apply PCA
+    pca = PCA(
+        k=n_components,
+        inputCol="_tag_features_scaled",
+        outputCol="_pca_features"
+    )
 
-    # Add PCA components back to original DataFrame
-    result_df = df
+    pca_model = pca.fit(df_scaled)
+    df_with_pca = pca_model.transform(df_scaled)
+
+    # Log explained variance
+    explained_variance = pca_model.explainedVariance.toArray()
+    logger.info(f"PCA explained variance ratio: {explained_variance}")
+    logger.info(f"Total variance explained: {explained_variance.sum():.2%}")
+
+    # Step 4: Extract PCA components as separate columns
+    # The PCA output is a DenseVector, we need to extract individual components
+    result_df = df_with_pca
 
     for i in range(n_components):
         component_name = f"{output_prefix}_{i + 1}"
-        component_values = pca_components[:, i].tolist()
 
-        # Create a column with row number for joining
-        from pyspark.sql.window import Window
+        # Extract the i-th element from the PCA vector
+        # Using UDF to extract vector elements
+        def get_element(v, idx):
+            """Extract element from DenseVector"""
+            try:
+                return float(v[idx])
+            except (IndexError, TypeError):
+                return 0.0
 
-        window_spec = Window.orderBy(F.monotonically_increasing_id())
-        result_df = result_df.withColumn("_row_num", F.row_number().over(window_spec))
+        from pyspark.sql.types import DoubleType
+        from pyspark.sql.functions import udf
 
-        # Create DataFrame with PCA components
-        pca_pdf = df.select().toPandas()
-        pca_pdf["_row_num"] = range(1, len(pca_pdf) + 1)
-        pca_pdf[component_name] = component_values
+        get_element_udf = udf(lambda v: get_element(v, i), DoubleType())
 
-        # Join back (simplified approach)
-        # For production, use broadcast join or more efficient method
+        result_df = result_df.withColumn(
+            component_name,
+            get_element_udf(F.col("_pca_features"))
+        )
 
-    logger.info(f"Computed {n_components} PCA components (Spark)")
+    # Clean up intermediate columns
+    result_df = result_df.drop(
+        "_tag_features_vector",
+        "_tag_features_scaled",
+        "_pca_features"
+    )
 
-    # Simplified: add as constants for MVP
-    # In production, implement proper distributed PCA
-    for i in range(n_components):
-        component_name = f"{output_prefix}_{i + 1}"
-        result_df = result_df.withColumn(component_name, F.lit(0.0))
-
-    logger.warning("Spark PCA simplified for MVP - returning placeholder values")
+    logger.info(f"✓ Computed {n_components} PCA components using Spark ML (distributed)")
     return result_df
 
 
 def _compute_tag_pca_pandas(df, tag_feature_cols, n_components, output_prefix):
-    """Pandas implementation of PCA"""
+    """Pandas implementation of PCA using sklearn"""
     from sklearn.decomposition import PCA
     import pandas as pd
 
