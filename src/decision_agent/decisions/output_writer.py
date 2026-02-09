@@ -3,8 +3,11 @@ Decision output writer to Delta Lake.
 """
 import logging
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import pandas as pd
+
+# Phase 1: Import prediction logger for audit trail
+from decision_agent.decisions.prediction_logger import PredictionLogger
 
 logger = logging.getLogger(__name__)
 
@@ -16,10 +19,14 @@ def write_decisions(
     model_version: str,
     run_id: str,
     as_of_date: str = None,
-    prediction_col: str = "prediction"
+    prediction_col: str = "prediction",
+    model_uri: Optional[str] = None,
+    enable_audit_logging: bool = True
 ):
     """
     Write decision output to Delta Lake table (Spark-native).
+
+    Phase 1: Optionally creates audit trail via PredictionLogger.
 
     Args:
         spark: Spark session
@@ -29,6 +36,8 @@ def write_decisions(
         run_id: MLflow run ID or execution run ID
         as_of_date: As-of date for decisions (default: today)
         prediction_col: Name of prediction column
+        model_uri: MLflow model URI (for audit logging)
+        enable_audit_logging: If True, creates audit trail (Phase 1)
 
     Returns:
         Table name where decisions were written
@@ -145,6 +154,29 @@ def write_decisions(
         # Show table info
         count = spark.sql(f"SELECT COUNT(*) as count FROM {table_name}").collect()[0]["count"]
         logger.info(f"Total records in {table_name}: {count}")
+
+        # Phase 1: Create audit trail
+        if enable_audit_logging and config.get("output", {}).get("enable_audit_logging", True):
+            try:
+                logger.info("Creating audit trail with PredictionLogger...")
+                audit_logger = PredictionLogger(
+                    spark=spark,
+                    audit_table=config.get("output", {}).get("audit_table", "decision_agent.prediction_audit_log")
+                )
+
+                # Log predictions with metadata
+                audit_logger.log_predictions(
+                    predictions_df=predictions_df,
+                    model_version=model_version,
+                    model_uri=model_uri or f"models:/{use_case_id}/{model_version}",
+                    run_id=run_id,
+                    use_case_id=use_case_id,
+                    prediction_timestamp=datetime.now().isoformat(),
+                    log_features=config.get("output", {}).get("log_features_in_audit", False)
+                )
+                logger.info("✓ Audit trail created successfully")
+            except Exception as e:
+                logger.warning(f"Failed to create audit trail: {e}. Continuing without it.")
 
     except Exception as e:
         logger.error(f"Failed to write to Delta Lake: {e}")

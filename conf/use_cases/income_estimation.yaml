@@ -9,6 +9,30 @@ data:
   val_end_date: "2024-11-30"
   test_end_date: "2024-12-31"
 
+# Phase 1: Data Quality Validation (P0 Gate)
+data_quality:
+  schema_validation: true
+  null_threshold: 0.20  # Max 20% nulls allowed
+  min_sample_size: 100
+  temporal_coverage_days: 30
+  freshness_threshold_days: 7
+  outlier_detection: true
+  outlier_method: isolation_forest
+  outlier_contamination: 0.05
+  label_distribution_check: true
+
+# Phase 1: Sparse History Handling
+sparse_history:
+  min_days_history: 90
+  min_transaction_count: 10
+  min_deposit_count: 3
+  weight_days: 0.4
+  weight_deposits: 0.3
+  weight_transactions: 0.3
+  thresholds:
+    sufficient: 0.7
+    marginal: 0.5
+
 features:
   snapshot_timestamp: "{{ execution_date }}"
   lookback_windows: [7, 30, 90]  # days
@@ -28,8 +52,20 @@ features:
     - tag_pca_component_3
     - income_expense_ratio
     - avg_balance_30d
+    # Phase 1: Income-specific signals
+    - detected_period_days
+    - period_confidence
+    - is_regular_paycheck
+    - deposit_stability_score
+    - deposit_cv
   leakage_prevention: true
   point_in_time_join: true
+
+  # Phase 1: Income Signal Configuration
+  income_signals:
+    deposit_periodicity: true
+    deposit_stability: true
+    min_deposit_threshold: 500  # Min amount to consider as income deposit
 
 model:
   algorithm: gradient_boosting
@@ -54,7 +90,7 @@ validation:
     min_samples_per_bin: 50
 
   adversarial_validation:
-    enabled: false  # Disable for MVP
+    enabled: true  # Phase 1: Enable adversarial validation
     threshold_auc: 0.55
 
   business_metrics: []  # Empty for MVP
@@ -63,6 +99,40 @@ validation:
     min_r2_score: 0.5  # For regression
     max_mae: 20000  # Max mean absolute error in income
 
+# Phase 1: Fair Lending Evaluation (P0 REGULATORY GATE)
+fair_lending:
+  enabled: true
+  protected_attributes:
+    - gender
+    - race
+    - age_group
+  reference_groups:
+    gender: male
+    race: white
+    age_group: 25-44
+  di_threshold: 0.80  # 80% rule
+  mean_diff_threshold: 0.10  # Max 10% prediction difference
+  enable_shap: true
+
+# Phase 1: Champion/Challenger Comparison (P0 GATE)
+champion_challenger:
+  enabled: false  # Enable when Champion model available
+  champion_model_uri: ""  # MLflow model URI for Champion
+  metrics:
+    - mae
+    - r2_score
+    - rmse
+  improvement_thresholds:
+    mae: -0.05  # Challenger must be 5% better (lower MAE)
+    r2_score: 0.02  # Challenger must be 2% better (higher R²)
+  stability_threshold: 0.85  # Min correlation between Champion and Challenger
+  segment_checks: true
+
 output:
   table_name: decision_agent.income_decisions
   explain_predictions: false
+
+  # Phase 1: Audit Logging
+  enable_audit_logging: true
+  audit_table: decision_agent.prediction_audit_log
+  log_features_in_audit: false  # Set true for full feature logging (increases storage)
