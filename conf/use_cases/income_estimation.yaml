@@ -1,0 +1,68 @@
+use_case_id: income_estimation
+version: v1.0.0
+description: Estimate individual income levels based on transaction patterns and liquidity features
+
+data:
+  use_synthetic: true  # Use synthetic data for MVP
+  train_start_date: "2024-01-01"
+  train_end_date: "2024-09-30"
+  val_end_date: "2024-11-30"
+  test_end_date: "2024-12-31"
+
+features:
+  snapshot_timestamp: "{{ execution_date }}"
+  lookback_windows: [7, 30, 90]  # days
+  feature_list:
+    - transaction_count_7d
+    - transaction_count_30d
+    - transaction_count_90d
+    - transaction_sum_7d
+    - transaction_sum_30d
+    - transaction_sum_90d
+    - avg_transaction_amount_30d
+    - salary_deposit_count_30d
+    - rent_payment_count_30d
+    - grocery_spend_30d
+    - tag_pca_component_1
+    - tag_pca_component_2
+    - tag_pca_component_3
+    - income_expense_ratio
+    - avg_balance_30d
+  leakage_prevention: true
+  point_in_time_join: true
+
+model:
+  algorithm: gradient_boosting
+  target_column: income_level
+  hyperparameters:
+    n_estimators: 100
+    max_depth: 5
+    learning_rate: 0.1
+    min_samples_split: 10
+    min_samples_leaf: 5
+    random_state: 42
+
+validation:
+  segments:
+    - dimension: income_quartile
+      values: [Q1, Q2, Q3, Q4]
+
+  calibration_config:
+    method: isotonic
+    by_segment: true
+    by_time: false
+    min_samples_per_bin: 50
+
+  adversarial_validation:
+    enabled: false  # Disable for MVP
+    threshold_auc: 0.55
+
+  business_metrics: []  # Empty for MVP
+
+  quality_gates:
+    min_r2_score: 0.5  # For regression
+    max_mae: 20000  # Max mean absolute error in income
+
+output:
+  table_name: decision_agent.income_decisions
+  explain_predictions: false

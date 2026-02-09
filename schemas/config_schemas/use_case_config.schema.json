@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Use Case Configuration Schema",
+  "description": "Schema for decision agent use case configurations",
+  "type": "object",
+  "required": ["use_case_id", "version", "features", "model", "validation", "output"],
+  "properties": {
+    "use_case_id": {
+      "type": "string",
+      "description": "Unique identifier for the use case"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^v\\d+\\.\\d+\\.\\d+$",
+      "description": "Version string in format vX.Y.Z"
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of the use case"
+    },
+    "features": {
+      "type": "object",
+      "required": ["snapshot_timestamp", "lookback_windows", "feature_list"],
+      "properties": {
+        "snapshot_timestamp": {
+          "type": "string",
+          "description": "Timestamp for point-in-time feature extraction"
+        },
+        "lookback_windows": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "description": "Rolling window sizes in days (e.g., [7, 30, 90])"
+        },
+        "feature_list": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "List of feature names to compute"
+        },
+        "leakage_prevention": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable point-in-time safe feature computation"
+        },
+        "point_in_time_join": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use as-of joins for temporal safety"
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "required": ["algorithm", "hyperparameters"],
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "enum": ["gradient_boosting", "random_forest", "logistic_regression", "linear_regression"],
+          "description": "ML algorithm to use"
+        },
+        "hyperparameters": {
+          "type": "object",
+          "description": "Algorithm-specific hyperparameters"
+        },
+        "target_column": {
+          "type": "string",
+          "description": "Name of the target/label column"
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "required": ["segments", "calibration_config"],
+      "properties": {
+        "segments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["dimension", "values"],
+            "properties": {
+              "dimension": {
+                "type": "string"
+              },
+              "values": {
+                "type": "array"
+              }
+            }
+          },
+          "description": "Dimensions for segment validation"
+        },
+        "calibration_config": {
+          "type": "object",
+          "properties": {
+            "method": {
+              "type": "string",
+              "enum": ["isotonic", "platt"],
+              "default": "isotonic"
+            },
+            "by_segment": {
+              "type": "boolean",
+              "default": true
+            },
+            "by_time": {
+              "type": "boolean",
+              "default": false
+            },
+            "min_samples_per_bin": {
+              "type": "integer",
+              "default": 100
+            }
+          }
+        },
+        "adversarial_validation": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "threshold_auc": {
+              "type": "number",
+              "default": 0.55,
+              "description": "Maximum AUC for train/test similarity"
+            }
+          }
+        },
+        "business_metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "formula": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Business value metrics"
+        },
+        "quality_gates": {
+          "type": "object",
+          "properties": {
+            "min_auc_roc": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "max_calibration_error": {
+              "type": "number"
+            },
+            "min_net_business_value": {
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "required": ["table_name"],
+      "properties": {
+        "table_name": {
+          "type": "string",
+          "description": "Delta table name for decision output"
+        },
+        "decision_threshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Threshold for binary decisions"
+        },
+        "explain_predictions": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include prediction explanations"
+        }
+      }
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "source_table": {
+          "type": "string",
+          "description": "Source data table name"
+        },
+        "use_synthetic": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use synthetic data for testing"
+        },
+        "train_start_date": {
+          "type": "string"
+        },
+        "train_end_date": {
+          "type": "string"
+        },
+        "val_end_date": {
+          "type": "string"
+        },
+        "test_end_date": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

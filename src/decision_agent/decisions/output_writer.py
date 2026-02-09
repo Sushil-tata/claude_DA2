@@ -1,0 +1,171 @@
+"""
+Decision output writer to Delta Lake.
+"""
+import logging
+from datetime import datetime
+from typing import Dict, Any
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+
+def write_decisions(
+    spark,
+    predictions_df: pd.DataFrame,
+    config: Dict[str, Any],
+    model_version: str,
+    run_id: str,
+    as_of_date: str = None
+):
+    """
+    Write decision output to Delta Lake table.
+
+    Args:
+        spark: Spark session
+        predictions_df: Pandas DataFrame with customer_id and prediction columns
+        config: Use case configuration
+        model_version: Model version identifier
+        run_id: MLflow run ID or execution run ID
+        as_of_date: As-of date for decisions (default: today)
+
+    Returns:
+        Table name where decisions were written
+
+    Decision table schema:
+        - customer_id: Customer identifier
+        - predicted_value: Model prediction
+        - run_id: Execution run identifier
+        - model_version: Model version
+        - as_of_dt: Decision date
+        - use_case_id: Use case identifier
+        - created_timestamp: Record creation timestamp
+    """
+    if as_of_date is None:
+        as_of_date = datetime.now().strftime("%Y-%m-%d")
+
+    table_name = config["output"]["table_name"]
+    use_case_id = config["use_case_id"]
+
+    logger.info(f"Writing decisions to {table_name}...")
+
+    # Prepare decision records
+    decision_data = predictions_df[["customer_id", "prediction"]].copy()
+    decision_data = decision_data.rename(columns={"prediction": "predicted_value"})
+
+    # Add metadata columns
+    decision_data["run_id"] = run_id
+    decision_data["model_version"] = model_version
+    decision_data["as_of_dt"] = as_of_date
+    decision_data["use_case_id"] = use_case_id
+    decision_data["created_timestamp"] = datetime.now().isoformat()
+
+    logger.info(f"Prepared {len(decision_data)} decision records")
+    logger.info(f"Sample decisions:\n{decision_data.head()}")
+
+    if spark is None:
+        logger.warning("No Spark session available. Saving decisions locally to CSV.")
+        output_path = f"decisions_{use_case_id}_{run_id}.csv"
+        decision_data.to_csv(output_path, index=False)
+        logger.info(f"Decisions saved to {output_path}")
+        return output_path
+
+    # Convert to Spark DataFrame
+    decisions_spark_df = spark.createDataFrame(decision_data)
+
+    try:
+        # Check if table exists
+        try:
+            spark.sql(f"DESCRIBE TABLE {table_name}")
+            table_exists = True
+        except Exception:
+            table_exists = False
+
+        if table_exists:
+            # Append to existing table
+            logger.info(f"Appending to existing table: {table_name}")
+            decisions_spark_df.write \
+                .format("delta") \
+                .mode("append") \
+                .saveAsTable(table_name)
+        else:
+            # Create new table
+            logger.info(f"Creating new table: {table_name}")
+
+            # Extract catalog and schema from table name
+            parts = table_name.split(".")
+            if len(parts) == 2:
+                catalog_schema = parts[0]
+                table = parts[1]
+
+                # Create schema if it doesn't exist
+                try:
+                    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog_schema}")
+                    logger.info(f"Created schema: {catalog_schema}")
+                except Exception as e:
+                    logger.warning(f"Could not create schema: {e}")
+
+            decisions_spark_df.write \
+                .format("delta") \
+                .mode("overwrite") \
+                .saveAsTable(table_name)
+
+        logger.info(f"✓ Decisions written successfully to {table_name}")
+
+        # Show table info
+        count = spark.sql(f"SELECT COUNT(*) as count FROM {table_name}").collect()[0]["count"]
+        logger.info(f"Total records in {table_name}: {count}")
+
+    except Exception as e:
+        logger.error(f"Failed to write to Delta Lake: {e}")
+        logger.info("Falling back to local file storage...")
+
+        # Fallback: save as Parquet locally
+        output_path = f"decisions_{use_case_id}_{run_id}.parquet"
+        decisions_spark_df.write.mode("overwrite").parquet(output_path)
+        logger.info(f"Decisions saved to {output_path}")
+        return output_path
+
+    return table_name
+
+
+def read_decisions(
+    spark,
+    table_name: str,
+    use_case_id: str = None,
+    as_of_date: str = None,
+    limit: int = None
+) -> pd.DataFrame:
+    """
+    Read decisions from Delta Lake table.
+
+    Args:
+        spark: Spark session
+        table_name: Decision table name
+        use_case_id: Filter by use case (optional)
+        as_of_date: Filter by decision date (optional)
+        limit: Maximum number of records to return
+
+    Returns:
+        Pandas DataFrame with decisions
+    """
+    logger.info(f"Reading decisions from {table_name}...")
+
+    query = f"SELECT * FROM {table_name}"
+    filters = []
+
+    if use_case_id:
+        filters.append(f"use_case_id = '{use_case_id}'")
+
+    if as_of_date:
+        filters.append(f"as_of_dt = '{as_of_date}'")
+
+    if filters:
+        query += " WHERE " + " AND ".join(filters)
+
+    if limit:
+        query += f" LIMIT {limit}"
+
+    df = spark.sql(query).toPandas()
+
+    logger.info(f"Read {len(df)} decision records")
+    return df

@@ -1,51 +1,68 @@
-"""Setup configuration for Principal Data Science Decision Agent."""
-
+"""
+Setup script for Decision Agent platform.
+"""
 from setuptools import setup, find_packages
+from pathlib import Path
 
-with open("README.md", "r", encoding="utf-8") as fh:
-    long_description = fh.read()
-
-with open("requirements.txt", "r", encoding="utf-8") as fh:
-    requirements = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
+# Read README for long description
+readme_path = Path(__file__).parent / "README.md"
+long_description = readme_path.read_text() if readme_path.exists() else ""
 
 setup(
-    name="principal-ds-agent",
+    name="decision-agent",
     version="0.1.0",
-    author="Principal Data Science Team",
-    author_email="ds-team@example.com",
-    description="A comprehensive Principal Data Science Decision Agent for financial services",
+    description="Principal Data Science Decision Agent Platform",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/Sushil-tata/claude",
-    packages=find_packages(where="src"),
+    author="Data Science Team",
+    python_requires=">=3.10",
+
+    # Package discovery
     package_dir={"": "src"},
-    classifiers=[
-        "Development Status :: 3 - Alpha",
-        "Intended Audience :: Financial and Insurance Industry",
-        "Topic :: Scientific/Engineering :: Artificial Intelligence",
-        "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
-        "License :: OSI Approved :: MIT License",
-        "Operating System :: OS Independent",
+    packages=find_packages(where="src"),
+
+    # Dependencies
+    install_requires=[
+        "pandas>=2.0.0",
+        "numpy>=1.24.0",
+        "scikit-learn>=1.3.0",
+        "pyyaml>=6.0.0",
+        "jsonschema>=4.17.0",
+        "mlflow>=2.8.0",
     ],
-    python_requires=">=3.9",
-    install_requires=requirements,
+
+    # Optional dependencies
     extras_require={
         "dev": [
             "pytest>=7.4.0",
             "pytest-cov>=4.1.0",
-            "black>=23.7.0",
-            "flake8>=6.1.0",
-            "mypy>=1.5.0",
-            "jupyter>=1.0.0",
-            "ipython>=8.14.0",
-        ]
-    },
-    entry_points={
-        "console_scripts": [
-            "ds-agent=agent.decision_agent:main",
+            "black>=23.0.0",
+            "isort>=5.12.0",
+            "pylint>=2.17.0",
+            "flake8>=6.0.0",
+        ],
+        "databricks": [
+            "pyspark>=3.4.0",
+            "delta-spark>=2.4.0",
+            "databricks-feature-store>=0.15.0",
         ],
     },
+
+    # Entry points
+    entry_points={
+        "console_scripts": [
+            "decision-agent=decision_agent.cli:main",
+        ],
+    },
+
+    # Classifiers
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Developers",
+        "Intended Audience :: Science/Research",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    ],
 )

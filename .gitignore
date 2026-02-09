@@ -16,7 +16,6 @@ parts/
 sdist/
 var/
 wheels/
-pip-wheel-metadata/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
@@ -25,9 +24,10 @@ MANIFEST
 
 # Virtual environments
 venv/
-ENV/
 env/
-.venv
+ENV/
+env.bak/
+venv.bak/
 
 # IDEs
 .vscode/
@@ -37,24 +37,52 @@ env/
 *~
 .DS_Store
 
-# Jupyter Notebook
-.ipynb_checkpoints
-
 # Testing
 .pytest_cache/
 .coverage
 htmlcov/
 .tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# Spark
+metastore_db/
+derby.log
+spark-warehouse/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Delta Lake
+_delta_log/
+*.parquet
+*.snappy.parquet
+
+# Local data
+data/
+*.csv
+*.json
+!schemas/**/*.json
+decisions_*.csv
+decisions_*.parquet
 
 # Logs
-logs/
 *.log
+logs/
 
-# Data files (if any)
-*.csv
-*.xlsx
-*.db
-*.sqlite
+# Environment variables
+.env
+.env.local
+
+# Databricks
+.databricks/
 
 # Temporary files
 tmp/

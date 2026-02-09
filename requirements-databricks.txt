@@ -1,0 +1,15 @@
+# Databricks-specific dependencies
+# These are typically pre-installed in Databricks runtimes
+
+# Spark and Delta Lake
+pyspark>=3.4.0
+delta-spark>=2.4.0
+
+# MLflow (usually pre-installed in Databricks ML Runtime)
+mlflow>=2.8.0
+
+# Databricks Feature Store
+databricks-feature-store>=0.15.0
+
+# All base requirements
+-r requirements.txt
