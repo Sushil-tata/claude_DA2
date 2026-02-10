@@ -1,0 +1,73 @@
+use_case_id: income_estimation
+description: Gradual rollout configuration for Challenger model deployment
+
+# Rollout State Management
+state_table: decision_agent.rollout_state
+
+# Rollout Schedule (percentages to progress through)
+rollout_schedule:
+  - 0   # Shadow mode (Champion only in production)
+  - 10  # Initial rollout
+  - 25  # Quarter rollout
+  - 50  # Half rollout (requires manual approval)
+  - 75  # Three-quarter rollout
+  - 100 # Full rollout (requires manual approval)
+
+# Manual Approval Gates
+manual_approval_at:
+  - 50   # Require manual approval at 50%
+  - 100  # Require manual approval before full rollout
+
+# Stability Thresholds
+stability_threshold: 0.85  # Min correlation between Champion and Challenger
+mae_increase_threshold: 0.10  # Max MAE increase (10%)
+mean_shift_threshold: 0.05  # Max prediction mean shift (5%)
+
+# Rollback Conditions (any trigger automatic rollback)
+rollback_conditions:
+  correlation_below: 0.80  # Rollback if correlation < 0.80
+  mae_increase_above: 0.15  # Rollback if MAE increases > 15%
+  data_quality_failure: true  # Rollback on data quality issues
+  fair_lending_violation: true  # Rollback on bias detection
+
+# Traffic Splitting
+traffic_splitting:
+  hash_seed: 42  # Seed for deterministic hashing
+  sticky_assignments: true  # Same customer always sees same model
+  verification_enabled: true  # Verify split distribution matches target
+
+# Monitoring During Rollout
+monitoring:
+  check_interval_hours: 24  # Check stability every 24 hours
+  min_samples_for_check: 1000  # Min predictions needed for stability check
+  alert_on_anomaly: true  # Alert if predictions anomalous
+
+# Shadow Mode Configuration
+shadow_mode:
+  enabled: true  # Enable shadow mode at 0% rollout
+  log_table: decision_agent.shadow_predictions
+  comparison_metrics:
+    - correlation
+    - mae_difference
+    - mean_shift
+    - prediction_distribution
+
+# Notifications
+notifications:
+  slack_webhook: null  # Set to Slack webhook URL
+  pagerduty_integration_key: null  # Set to PagerDuty key
+  email_list:
+    - ml-team@company.com
+  notify_on:
+    - rollout_progression
+    - rollback
+    - manual_approval_required
+    - stability_check_failure
+
+# Approval Workflow
+approval_workflow:
+  approvers:
+    - ml-team-lead@company.com
+    - product-owner@company.com
+  approval_timeout_hours: 48  # Auto-reject if not approved within 48h
+  require_all_approvers: false  # Only one approver needed
