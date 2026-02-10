@@ -1,0 +1,77 @@
+use_case_id: income_estimation
+model_version: production
+description: Production inference configuration for Income Estimation
+
+# Champion Model (always loaded)
+champion_model_uri: "models:/income_estimation_champion/Production"
+
+# Challenger Model (optional, for A/B testing)
+challenger_model_uri: "models:/income_estimation_challenger/Staging"
+enable_ab_testing: false  # Set true to enable A/B testing
+
+# Feature Data
+feature_table: decision_agent.customer_features_latest
+
+# Routing Configuration (used when enable_ab_testing = true)
+routing:
+  # OOD Detection
+  ood_detection:
+    enabled: true
+    threshold: -0.5  # Isolation Forest score threshold
+    route_to: champion  # Route OOD customers to Champion (safer)
+
+  # Data Sufficiency
+  data_sufficiency:
+    enabled: true
+    min_score: 0.5  # Route customers with score < 0.5 to Champion
+    route_to: champion
+
+  # New Customer Handling
+  new_customer:
+    enabled: true
+    tenure_threshold_days: 90  # Customers with < 90 days → Champion
+    route_to: champion
+
+  # A/B Testing
+  ab_testing:
+    enabled: true
+    rollout_percentage: 10  # Start with 10% to Challenger
+    hash_seed: 42  # For deterministic splits
+    sticky_assignments: true  # Same customer always sees same model
+
+# Explainability (SHAP)
+explainability:
+  enabled: true
+  top_k_features: 3  # Number of top features for reason codes
+  compute_shap_values: false  # Set true for full SHAP (expensive)
+  top_features:  # Simplified reason codes (when compute_shap_values=false)
+    - deposit_periodicity
+    - deposit_stability_score
+    - transaction_sum_30d
+
+# Business Rules
+business_rules:
+  # Filtering
+  exclude_insufficient_data: true  # Exclude customers with data_quality_flag='insufficient'
+  min_customer_age: 18  # Minimum customer age
+  custom_filter_sql: null  # Optional custom SQL filter
+
+  # Decision Thresholds
+  decision_threshold: 50000  # Income threshold for approve/decline
+  confidence_high_multiplier: 1.2  # High confidence if prediction > threshold * 1.2
+  confidence_low_multiplier: 0.8  # Low confidence if prediction < threshold * 0.8
+
+# Audit Logging
+audit_logging:
+  enabled: true
+  audit_table: decision_agent.prediction_audit_log
+  log_features: false  # Set true to log full feature vectors (storage intensive)
+  log_shap_values: false  # Set true to log SHAP values
+
+# Output
+output_table: decision_agent.production_predictions
+
+# Performance
+batch_size: 10000  # Customers per batch
+parallelism: 8  # Spark parallelism
+cache_models: true  # Cache models in memory for reuse
