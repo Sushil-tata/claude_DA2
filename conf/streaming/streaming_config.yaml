@@ -1,0 +1,131 @@
+# Streaming Feature Pipeline Configuration
+#
+# This configuration defines the real-time streaming pipeline for
+# computing features from event streams.
+
+# Input source configuration
+input_source: kafka  # kafka, kinesis, or delta
+
+# Kafka configuration (if input_source = kafka)
+kafka_config:
+  bootstrap_servers: "localhost:9092"
+  topic: "customer_transactions"
+  starting_offsets: "latest"  # latest or earliest
+  max_offsets_per_trigger: 10000
+
+  # Security (optional)
+  security_protocol: "SASL_SSL"
+  sasl_mechanism: "PLAIN"
+  sasl_username: "{{ secrets.kafka_username }}"
+  sasl_password: "{{ secrets.kafka_password }}"
+
+# Kinesis configuration (if input_source = kinesis)
+kinesis_config:
+  stream_name: "customer-transactions-stream"
+  region: "us-west-2"
+  initial_position: "latest"  # latest, trim_horizon, or at_timestamp
+
+  # AWS credentials (use IAM role in production)
+  aws_access_key_id: "{{ secrets.aws_access_key_id }}"
+  aws_secret_access_key: "{{ secrets.aws_secret_access_key }}"
+
+# Delta table configuration (if input_source = delta, for testing)
+delta_config:
+  table_name: "decision_agent.raw_events"
+
+# Checkpoint configuration
+checkpoint_location: "dbfs:/decision_agent/streaming/checkpoints/feature_stream"
+
+# Output configuration
+output_table: "decision_agent.customer_features_streaming"
+
+# Window configurations
+window_durations:
+  - "1 minute"
+  - "5 minutes"
+  - "15 minutes"
+
+# Watermark configuration (for late data handling)
+watermark_delay: "10 minutes"
+
+# Trigger interval (how often to process micro-batches)
+trigger_interval: "30 seconds"
+
+# Feature computation configuration
+features:
+  # Transaction aggregations
+  transaction_features:
+    - count
+    - sum
+    - avg
+    - std
+
+  # Deposit/withdrawal features
+  deposit_withdrawal:
+    - deposit_sum
+    - withdrawal_sum
+    - deposit_count
+    - withdrawal_count
+
+  # Balance features
+  balance_features:
+    - latest_balance
+    - min_balance
+    - max_balance
+
+# Stateful features (customer-level state)
+stateful_features:
+  enabled: true
+  state_timeout: "30 days"  # Clean up old state
+  features:
+    - lifetime_transaction_count
+    - lifetime_deposit_sum
+    - days_since_first_transaction
+    - days_since_last_transaction
+
+# Performance settings
+performance:
+  shuffle_partitions: 200
+  max_files_per_trigger: 100
+  enable_schema_merge: true
+
+# Monitoring
+monitoring:
+  # Emit metrics every N batches
+  metrics_interval_batches: 10
+
+  # Alert thresholds
+  alert_if_lag_seconds: 300  # Alert if processing lag > 5 minutes
+  alert_if_error_rate_pct: 5  # Alert if error rate > 5%
+
+  # Logging
+  log_level: "INFO"
+  log_sample_rate: 0.01  # Log 1% of records for debugging
+
+# Online feature store integration
+online_store:
+  enabled: true
+  redis_config:
+    host: "{{ secrets.redis_host }}"
+    port: 6379
+    db: 0
+    password: "{{ secrets.redis_password }}"
+    ttl_seconds: 86400  # 24 hours
+
+  # Cache warming strategy
+  cache_warming:
+    enabled: true
+    schedule: "0 0 2 * * ?"  # Daily at 2 AM
+    top_n_customers: 100000  # Top 100K active customers
+
+# Retry configuration
+retry:
+  max_attempts: 3
+  backoff_multiplier: 2
+  max_backoff_seconds: 300
+
+# Error handling
+error_handling:
+  dead_letter_table: "decision_agent.streaming_errors"
+  continue_on_error: true
+  max_error_rate_pct: 10  # Stop stream if error rate > 10%
