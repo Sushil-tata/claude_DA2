@@ -18,8 +18,8 @@ Once running:
 
 import argparse
 import json
-import sys
 import os
+import sys
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -28,10 +28,14 @@ from typing import Optional, Dict, Any, List
 
 # ── Internal imports ──────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent / "src"))
-from decision_agent.nba_builder.schema_parser  import SchemaParser
-from decision_agent.nba_builder.questionnaire  import Questionnaire
-from decision_agent.nba_builder.constraint_engine import ConstraintEngine, AccountContext
-from decision_agent.nba_builder.decision_engine   import DecisionEngine
+from decision_agent.nba_builder.schema_parser      import SchemaParser
+from decision_agent.nba_builder.questionnaire      import Questionnaire
+from decision_agent.nba_builder.constraint_engine  import ConstraintEngine, AccountContext
+from decision_agent.nba_builder.decision_engine    import DecisionEngine
+from decision_agent.nba_builder.feature_engineering import FeatureEngineer
+from decision_agent.nba_builder.training_data      import TrainingDataGenerator
+from decision_agent.nba_builder.model_trainer      import ModelTrainer
+from decision_agent.nba_builder.model_scorer       import ModelScorer
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,10 +163,14 @@ class NBAAgent:
         self.questionnaire    : Optional[Questionnaire]    = None
         self.constraint_engine: Optional[ConstraintEngine] = None
         self.decision_engine  : Optional[DecisionEngine]   = None
+        self.feature_engineer : Optional[FeatureEngineer]  = None
+        self.model_trainer    : Optional[ModelTrainer]     = None
+        self.model_scorer     : Optional[ModelScorer]      = None
         self.config           : Dict                       = {}
         self.accounts_df      : Optional[pd.DataFrame]     = None
         self.decisions_df     : Optional[pd.DataFrame]     = None
         self.is_live          : bool                       = False
+        self.models_trained   : bool                       = False
 
     # ── SETUP FLOW ────────────────────────────────────────────────────────────
 
@@ -445,29 +453,83 @@ class NBAAgent:
         self.constraint_engine = ConstraintEngine(self.config)
         self.decision_engine   = DecisionEngine(self.config, self.constraint_engine)
 
-        # Generate model scores (mock or real)
-        print("  Generating action scores for all accounts...")
         enabled_actions = [a for a, v in self.config["actions"].items() if v.get("enabled")]
-        scores_df = generate_mock_model_scores(self.accounts_df, enabled_actions)
 
-        # Run decisions
-        print("  Running constraint checks and scoring...")
+        # ── Train real models if not already trained ───────────────────────
+        if not self.models_trained:
+            print("  Training models on synthetic data...")
+            self.feature_engineer = FeatureEngineer(self.config)
+
+            # Generate labeled training data
+            gen = TrainingDataGenerator(
+                n_accounts=3000,
+                n_months=6,
+                actions=enabled_actions,
+            )
+            train_data = gen.generate()
+
+            # Engineer features
+            train_data = self.feature_engineer.fit_transform(train_data)
+            feature_cols = self.feature_engineer.get_feature_columns()
+
+            # Remove outcome/split cols from features
+            feature_cols = [
+                c for c in feature_cols
+                if c not in ("outcome_pay_any", "outcome_pay_amount", "split", "month_idx")
+            ]
+
+            train_split = train_data[train_data["split"] == "train"]
+            val_split   = train_data[train_data["split"] == "val"]
+
+            self.model_trainer = ModelTrainer(
+                mlflow_tracking_uri="mlruns",
+                experiment_name="nba_debt_collection",
+            )
+            artifacts = self.model_trainer.train(train_split, val_split, feature_cols)
+
+            # Evaluate by segment
+            test_split = train_data[train_data["split"] == "test"]
+            seg_metrics = self.model_trainer.evaluate_segments(test_split, feature_cols, "bucket")
+            print(f"\n  {bold('Segment performance (AUC by delinquency bucket):')}")
+            print(f"  {seg_metrics.to_string(index=False)}\n")
+
+            # Setup scorer
+            self.model_scorer = ModelScorer()
+            self.model_scorer.load_from_trainer(artifacts)
+
+            # Save models
+            os.makedirs("models", exist_ok=True)
+            self.model_scorer.save_to_disk("models/nba_models")
+            print(f"  {green('✓')} Models saved to models/nba_models/")
+            self.models_trained = True
+        else:
+            print("  Using previously trained models...")
+
+        # ── Engineer features for scoring accounts ─────────────────────────
+        print("  Computing features for scoring batch...")
+        scoring_data = self.feature_engineer.fit_transform(self.accounts_df)
+
+        # ── Score all accounts × all actions ──────────────────────────────
+        print(f"  Scoring {len(scoring_data):,} accounts × {len(enabled_actions)} actions...")
+        scores_df = self.model_scorer.score(scoring_data, actions=enabled_actions)
+
+        # ── Assign personas ────────────────────────────────────────────────
         personas_df = pd.DataFrame({
             "account_id": self.accounts_df["account_id"],
             "persona": self._assign_personas(self.accounts_df),
         })
 
+        # ── Run decisions ──────────────────────────────────────────────────
+        print("  Running constraint engine and ranking decisions...")
         self.decisions_df = self.decision_engine.decide_batch(
-            self.accounts_df, scores_df, personas_df
+            scoring_data, scores_df, personas_df
         )
 
-        # Apply capacity constraints
+        # ── Apply capacity constraints ─────────────────────────────────────
         print("  Applying capacity constraints...")
         self.decisions_df = self.decision_engine.apply_capacity_constraints(self.decisions_df)
 
         self.is_live = True
-
-        # Print summary
         self._print_decision_summary()
 
     def _assign_personas(self, df: pd.DataFrame) -> pd.Series:
@@ -672,6 +734,9 @@ class NBAAgent:
             if "=" in filter_str:
                 key, val = filter_str.split("=", 1)
                 key = key.strip()
+                # alias: 'action' → 'recommended_action'
+                if key == "action":
+                    key = "recommended_action"
                 val = val.strip()
                 if key in df.columns:
                     try:
