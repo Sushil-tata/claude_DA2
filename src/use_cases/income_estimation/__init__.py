@@ -83,3 +83,27 @@ __all__ = [
 ]
 
 __version__ = '1.0.0'
+
+# New conformal calibration module
+try:
+    from .conformal_calibration import (
+        ConformalPredictor as ConformalPredictorV2,
+        IsotonicCalibrator as IsotonicCalibratorV2,
+        QuantileRegressor as QuantileRegressorV2,
+        DynamicCalibrator as DynamicCalibratorV2,
+        PredictionInterval as PredictionIntervalV2,
+        CalibrationMetrics as CalibrationMetricsV2,
+    )
+except ImportError:
+    pass
+
+# New graph payment network module
+try:
+    from .graph_payment_network import (
+        PaymentNetworkAnalyzer as PaymentNetworkAnalyzerV2,
+        EmployerNode as EmployerNodeV2,
+        PeerComparison as PeerComparisonV2,
+        NetworkValidation as NetworkValidationV2,
+    )
+except ImportError:
+    pass

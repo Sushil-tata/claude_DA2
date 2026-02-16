@@ -37,6 +37,9 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import LabelEncoder
 
+from .uplift_engine import TLearner, XLearner, UpliftEnsemble, qini_coefficient
+from .leakage_detector import LeakageDetector
+
 logger = logging.getLogger(__name__)
 
 
@@ -102,6 +105,30 @@ class ModelTrainer:
         """
         self.feature_cols = feature_cols
         cfg = config or {}
+        model_type = cfg.get("model_type", "slearner")  # "slearner" | "xlearner" | "ensemble"
+
+        # ── 0. Leakage check before training ─────────────────────────────
+        leakage_cfg = cfg.get("leakage_check", {})
+        if leakage_cfg.get("enabled", True):
+            detector = LeakageDetector(
+                correlation_threshold=leakage_cfg.get("correlation_threshold", 0.90),
+                adversarial_auc_threshold=leakage_cfg.get("adversarial_auc_threshold", 0.55),
+            )
+            report = detector.check_all(
+                train_df, val_df,
+                target_col="outcome_pay_any",
+                feature_cols=feature_cols,
+            )
+            if report["leakage_detected"]:
+                msg = (f"Leakage detected! Flagged features: {report['flagged_features']}. "
+                       f"Adversarial AUC: {report['checks'].get('adversarial', {}).get('adversarial_auc', 'n/a')}")
+                if leakage_cfg.get("block_on_leakage", False):
+                    raise RuntimeError(msg)
+                else:
+                    logger.warning(msg)
+                    print(f"  ⚠️  {msg}")
+            else:
+                print("  ✓ Leakage check passed.")
 
         # ── 1. Encode action as numeric feature ───────────────────────────
         all_actions = pd.concat([train_df["action"], val_df["action"]]).unique()
@@ -114,9 +141,13 @@ class ModelTrainer:
         y_amt_train   = train_df["outcome_pay_amount"].values
         y_amt_val     = val_df["outcome_pay_amount"].values
 
-        print(f"  Training pay_any model ({len(X_train):,} samples)...")
+        # Treatment vector for uplift models (NO_ACTION = control)
+        treatment_train = (train_df["action"] != "NO_ACTION").astype(int).values
+        treatment_val   = (val_df["action"]   != "NO_ACTION").astype(int).values
 
-        # ── 2. Train pay_any (binary classifier) ─────────────────────────
+        print(f"  Training pay_any model [{model_type}] ({len(X_train):,} samples)...")
+
+        # ── 2. Train pay_any model ────────────────────────────────────────
         pay_params = {
             "n_estimators":  cfg.get("n_estimators_pay", 150),
             "max_depth":     cfg.get("max_depth_pay",    4),
@@ -124,17 +155,46 @@ class ModelTrainer:
             "subsample":     0.8,
             "random_state":  42,
         }
-        pos_weight = (y_pay_train == 0).sum() / max((y_pay_train == 1).sum(), 1)
+        pos_weight     = (y_pay_train == 0).sum() / max((y_pay_train == 1).sum(), 1)
         sample_weights = np.where(y_pay_train == 1, pos_weight, 1.0)
 
+        # S-Learner (default): action is encoded as a feature
         self.pay_any_model = GradientBoostingClassifier(**pay_params)
         self.pay_any_model.fit(X_train, y_pay_train, sample_weight=sample_weights)
 
         pay_val_proba = self.pay_any_model.predict_proba(X_val)[:, 1]
         pay_auc  = _safe_auc(y_pay_val, pay_val_proba)
         pay_pr   = average_precision_score(y_pay_val, pay_val_proba)
+        print(f"  pay_any (S-Learner): AUC={pay_auc:.4f}, PR-AUC={pay_pr:.4f}")
 
-        print(f"  pay_any model: AUC={pay_auc:.4f}, PR-AUC={pay_pr:.4f}")
+        # ── 2b. Uplift model (XLearner or Ensemble) ───────────────────────
+        self.uplift_model = None
+        uplift_qini       = float("nan")
+
+        if model_type in ("xlearner", "ensemble"):
+            # Feature matrix without action encoding (uplift models handle treatment separately)
+            X_feat_train = train_df[feature_cols].fillna(0).values.astype(float)
+            X_feat_val   = val_df[feature_cols].fillna(0).values.astype(float)
+
+            if model_type == "xlearner":
+                self.uplift_model = XLearner(
+                    n_estimators=cfg.get("n_estimators_pay", 100),
+                    max_depth=cfg.get("max_depth_pay", 4),
+                    learning_rate=cfg.get("learning_rate", 0.05),
+                )
+            else:
+                self.uplift_model = UpliftEnsemble(
+                    models=[TLearner(n_estimators=100), XLearner(n_estimators=100)]
+                )
+
+            try:
+                self.uplift_model.fit(X_feat_train, treatment_train, y_pay_train)
+                uplift_preds = self.uplift_model.predict_uplift(X_feat_val)
+                uplift_qini  = qini_coefficient(uplift_preds, treatment_val, y_pay_val)
+                print(f"  uplift ({model_type}): Qini={uplift_qini:.4f}")
+            except Exception as e:
+                logger.warning("Uplift model training failed: %s — using S-Learner only.", e)
+                self.uplift_model = None
 
         # ── 3. Train amount model (Tweedie-style regression) ──────────────
         print(f"  Training amount model...")
@@ -175,13 +235,16 @@ class ModelTrainer:
         return {
             "pay_any_model":      self.pay_any_model,
             "amount_model":       self.amount_model,
+            "uplift_model":       self.uplift_model,   # None for slearner
+            "model_type":         model_type,
             "action_encoder":     self.action_encoder,
             "feature_cols":       feature_cols,
             "metrics": {
-                "pay_auc":   pay_auc,
-                "pay_pr_auc":pay_pr,
-                "amt_mae":   amt_mae,
-                "amt_rmse":  amt_rmse,
+                "pay_auc":      pay_auc,
+                "pay_pr_auc":   pay_pr,
+                "amt_mae":      amt_mae,
+                "amt_rmse":     amt_rmse,
+                "uplift_qini":  uplift_qini,
             },
             "feature_importance": {"pay_any": pay_imp, "amount": amt_imp},
             "mlflow_run_id":      run_id,
