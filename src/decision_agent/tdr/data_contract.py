@@ -64,6 +64,22 @@ BUREAU_FIELDS: List[Tuple[str, float, str]] = [
     ("bureau_delinquent_other",   2.0, "Delinquent at other lenders"),
 ]
 
+# Balance decomposition — enables cheapest-first waiver ordering in OfferGenerator
+# principal_outstanding + accrued_interest + penalty_charges should sum to balance
+BALANCE_DECOMP_FIELDS: List[Tuple[str, float, str]] = [
+    ("principal_outstanding", 4.0, "Outstanding principal (excluding interest and charges)"),
+    ("accrued_interest",      3.0, "Interest accrued and unpaid"),
+    ("penalty_charges",       3.0, "Late fees and penalty charges"),
+]
+
+# Recovery context — persona and months_at_180plus drive paydown curve selection
+RECOVERY_CONTEXT_FIELDS: List[Tuple[str, float, str]] = [
+    ("persona",            3.0, "Recovery persona from RecoveryScorecard "
+                                "(SELECTIVE_DEFAULTER, LIFE_EVENT, etc.)"),
+    ("months_at_180plus",  3.0, "Months account has been at 180+ DPD"),
+    ("p_recovery_90d",     2.0, "P(any payment in 90d) from RecoveryScorecard"),
+]
+
 TDR_HISTORY_FIELDS: List[Tuple[str, float, str]] = [
     ("tdr_date",           3.0, "Date of TDR (accepted offers only)"),
     ("tdr_type",           3.0, "Offer type accepted"),
@@ -71,7 +87,10 @@ TDR_HISTORY_FIELDS: List[Tuple[str, float, str]] = [
     ("tdr_tenor_months",   3.0, "Tenor of accepted TDR"),
 ]
 
-ALL_OPTIONAL_FIELDS = STANDARD_FIELDS + BUREAU_FIELDS + TDR_HISTORY_FIELDS
+ALL_OPTIONAL_FIELDS = (
+    STANDARD_FIELDS + BUREAU_FIELDS + TDR_HISTORY_FIELDS
+    + BALANCE_DECOMP_FIELDS + RECOVERY_CONTEXT_FIELDS
+)
 TOTAL_OPTIONAL_WEIGHT = sum(w for _, w, _ in ALL_OPTIONAL_FIELDS)
 
 
@@ -146,6 +165,21 @@ class DataContract:
             else:
                 missing_tdr.append(f)
 
+        missing_decomp   = []
+        missing_recovery = []
+
+        for f, w, _ in BALANCE_DECOMP_FIELDS:
+            if f in account.index and not _is_null(account[f]):
+                score += w
+            else:
+                missing_decomp.append(f)
+
+        for f, w, _ in RECOVERY_CONTEXT_FIELDS:
+            if f in account.index and not _is_null(account[f]):
+                score += w
+            else:
+                missing_recovery.append(f)
+
         completeness = round(score / TOTAL_OPTIONAL_WEIGHT * 100, 1)
 
         confidence = (
@@ -156,14 +190,15 @@ class DataContract:
 
         has_tdr = len(missing_tdr) < len(TDR_HISTORY_FIELDS)
 
-        # 3. Derived fields
-        derived, warnings = self._derive_fields(account, has_tdr)
+        # 3. Derived fields + warnings
+        derived, warnings = self._derive_fields(account, has_tdr, missing_decomp, missing_recovery)
 
         return DataQuality(
             account_id=aid,
             completeness_pct=completeness,
             confidence_level=confidence,
-            missing_fields=missing_standard + missing_bureau + missing_tdr,
+            missing_fields=missing_standard + missing_bureau + missing_tdr
+                           + missing_decomp + missing_recovery,
             missing_standard=missing_standard,
             missing_bureau=missing_bureau,
             has_tdr_history=has_tdr,
@@ -295,7 +330,11 @@ class DataContract:
     # ── PRIVATE ───────────────────────────────────────────────────────────────
 
     def _derive_fields(
-        self, account: pd.Series, has_tdr: bool
+        self,
+        account: pd.Series,
+        has_tdr: bool,
+        missing_decomp: List[str],
+        missing_recovery: List[str],
     ) -> Tuple[List[str], List[str]]:
         derived  = []
         warnings = []
@@ -327,6 +366,25 @@ class DataContract:
         if _is_null(account.get("bureau_secured_loan_flag")):
             warnings.append(
                 "bureau_secured_loan_flag missing — legal path cannot be assessed"
+            )
+
+        # Balance decomposition warnings
+        if missing_decomp:
+            warnings.append(
+                f"Balance decomposition missing ({', '.join(missing_decomp)}) — "
+                "waivers will use 70/20/10 principal/interest/charges split estimate"
+            )
+
+        # Recovery context warnings
+        if "persona" in missing_recovery:
+            warnings.append(
+                "persona missing — paydown curves will use UNKNOWN (conservative default). "
+                "Run RecoveryScorecard.score() first for persona assignment."
+            )
+        if "months_at_180plus" in missing_recovery:
+            warnings.append(
+                "months_at_180plus missing — defaulting to 0 (fresh 180+ DPD bucket). "
+                "Provide for accurate staleness-adjusted recovery curves."
             )
 
         return derived, warnings

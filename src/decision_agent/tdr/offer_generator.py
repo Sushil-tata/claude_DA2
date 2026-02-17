@@ -1,24 +1,16 @@
 """
 Offer Generator + Path Ranker (v2)
 ====================================
-Generates single best TDR offer using only confirmed available fields.
-FICO: Collection Treatment Optimization + Strategy Science.
+Generates single best TDR offer using paydown-curve NPV (no take-up rate).
 
-Key design decisions:
-  - Single best offer output (Q9)
-  - within_policy flag for approval workflow (Q7)
-  - Confidence level from data completeness (Q6)
-  - Talking points for agent (Q8 - agent sees history not offers)
-  - Audit log row per recommendation (Q11)
-  - Export-ready output (Q10)
-  
-Survivorship bias note (Q4):
-  TDR history contains ACCEPTED offers only.
-  Rejected offer details not stored.
-  take_up_probability is therefore estimated from:
-    - Similar accepted offers in history
-    - Willingness score from contact + payment signals
-    - Stage adjustment
+Key design:
+  - No take-up probability — NPV grounded in empirical paydown curves
+  - Balance decomposition: waivers applied cheapest-first (charges → interest → principal)
+  - Offer ranking by incremental_npv (gain over Curve A baseline)
+  - Affordability check: instalment ≤ ATP from AffordabilityEngine
+  - within_policy flag for approval workflow
+  - Confidence level from data completeness
+  - Audit log row per recommendation
 """
 
 import logging
@@ -33,6 +25,7 @@ import pandas as pd
 from .affordability_engine import AffordabilityEngine, AffordabilityConfig, AffordabilityProfile
 from .npv_engine import NPVEngine, NPVConfig, LoanNPV, PathValuation
 from .data_contract import DataContract, DataQuality
+from .paydown_curves import PaydownCurveEngine, BalanceDecomposition, compute_waivers
 
 logger = logging.getLogger(__name__)
 
@@ -69,45 +62,54 @@ class OfferRecommendation:
     recommendation_id: str
     account_id: str
     generated_at: str
-    
+
     # Account context
     outstanding: float
     stage: str
+    persona: str
+    months_at_180plus: int
     confidence_level: str
     completeness_pct: float
-    
+
     # Affordability
     estimated_monthly_income: float
     income_tier_used: int
     payment_capacity: float
     is_over_indebted: bool
-    
+
     # Recommended path
     recommended_path: str
     path_rationale: str
-    
-    # Best offer (if TDR)
+
+    # Best offer (if TDR) — paydown-curve NPV, no take-up probability
     offer_type: str
     monthly_instalment: float
     tenor_months: int
     haircut_pct: float
     total_recovery: float
-    take_up_probability: float
-    loan_npv: float
-    
+    loan_npv: float            # PV(Curve_B) − concession
+    incremental_npv: float     # gain over natural recovery (Curve_A baseline)
+    hold_npv: float            # PV(Curve_A) — what we get without any offer
+
+    # Balance decomposition
+    principal_waived: float
+    interest_waived: float
+    charges_waived: float
+    concession_cost: float
+
     # Policy
     within_policy: bool
     needs_approval: bool
     approval_reason: str
-    
+
     # Comparators
     debt_sale_floor: float
     legal_viable: bool
-    
+
     # Agent talking points
     talking_points: List[str]
-    
-    # Audit (Q11)
+
+    # Audit
     agent_id: Optional[str]
     outcome: Optional[str]       # filled later: accepted/rejected/countered
     outcome_timestamp: Optional[str]
@@ -116,11 +118,13 @@ class OfferRecommendation:
 
 @dataclass
 class AuditLogRow:
-    """One row per recommendation — for feedback loop (Q11)."""
+    """One row per recommendation — for feedback loop."""
     recommendation_id: str
     account_id: str
     generated_at: str
     stage: str
+    persona: str
+    months_at_180plus: int
     outstanding: float
     recommended_path: str
     offer_type: str
@@ -128,7 +132,9 @@ class AuditLogRow:
     tenor_months: int
     haircut_pct: float
     loan_npv: float
-    take_up_probability: float
+    incremental_npv: float
+    hold_npv: float
+    concession_cost: float
     within_policy: bool
     confidence_level: str
     completeness_pct: float
@@ -138,51 +144,11 @@ class AuditLogRow:
     outcome_timestamp: Optional[str]
 
 
-class TakeUpEstimator:
-    """
-    Estimates take-up probability from willingness signals.
-    NOTE: Survivorship bias — trained on accepted offers only (Q4).
-    Replace with proper model once rejected offer tracking is added.
-    """
-
-    BASE_RATES = {
-        "FULL_SETTLEMENT":        0.22,
-        "PARTIAL_SETTLEMENT":     0.32,
-        "RESCHEDULE_SAME_RATE":   0.40,
-        "RESCHEDULE_RATE_REDUCE": 0.52,
-        "FEE_WAIVER":             0.45,
-        "FULL_RESTRUCTURE":       0.58,
-    }
-
-    def predict(
-        self,
-        offer_type: str,
-        haircut_pct: float,
-        instalment: float,
-        payment_capacity: float,
-        stage: str,
-        willingness_score: float = 0.5,
-    ) -> float:
-        base          = self.BASE_RATES.get(offer_type, 0.30)
-        haircut_boost = haircut_pct * 0.25
-        stage_adj     = {"SM": 0.05, "NPL": 0.0, "CHARGEOFF": -0.08}.get(stage, 0.0)
-        
-        if payment_capacity > 0:
-            ratio        = min(instalment / payment_capacity, 3.0)
-            afford_boost = max(0.10 - ratio * 0.08, -0.15)
-        else:
-            afford_boost = -0.10
-
-        will_boost = (willingness_score - 0.5) * 0.20
-
-        p = base + haircut_boost + stage_adj + afford_boost + will_boost
-        return float(np.clip(p, 0.02, 0.92))
-
-
 class OfferGenerator:
     """
     Generates single best TDR offer recommendation.
-    Uses only confirmed available fields — degrades gracefully on missing data.
+    Uses paydown-curve NPV (no take-up rate) and cheapest-first balance waivers.
+    Degrades gracefully on missing data.
     """
 
     def __init__(
@@ -190,42 +156,65 @@ class OfferGenerator:
         policy_config:        Optional[PolicyConfig]        = None,
         affordability_config: Optional[AffordabilityConfig] = None,
         npv_config:           Optional[NPVConfig]           = None,
+        curve_engine:         Optional[PaydownCurveEngine]  = None,
     ):
-        self.policy     = policy_config        or PolicyConfig()
-        self.aff_engine = AffordabilityEngine(affordability_config)
-        self.npv_engine = NPVEngine(npv_config)
-        self.takeup     = TakeUpEstimator()
-        self.contract   = DataContract()
+        self.policy       = policy_config        or PolicyConfig()
+        self.aff_engine   = AffordabilityEngine(affordability_config)
+        self.curve_engine = curve_engine or PaydownCurveEngine()
+        self.npv_engine   = NPVEngine(npv_config, self.curve_engine)
+        self.contract     = DataContract()
 
     def generate(
         self,
         account: pd.Series,
         stage: Optional[str] = None,
+        persona: Optional[str] = None,
+        months_at_180plus: Optional[int] = None,
         agent_id: Optional[str] = None,
     ) -> OfferRecommendation:
-        """Generate single best offer recommendation for one account."""
+        """
+        Generate single best offer recommendation for one account.
+
+        Args:
+            account: pd.Series with account fields (see DataContract)
+            stage: SM | NPL | CHARGEOFF (overrides account["stage"])
+            persona: recovery persona from RecoveryScorecard
+                     (SELECTIVE_DEFAULTER, LIFE_EVENT, etc.)
+                     Falls back to account["persona"] then "UNKNOWN"
+            months_at_180plus: how long account has been at 180+ DPD;
+                               falls back to account["months_at_180plus"] then 0
+            agent_id: agent identifier for audit log
+        """
 
         # 1. Validate + enrich
         quality  = self.contract.validate(account)
         account  = self.contract.enrich(account)
 
-        outstanding = float(account.get("balance", 0))
-        account_id  = str(account.get("account_id", "unknown"))
-        stage       = (stage or str(account.get("stage", "NPL"))).upper()
-        rec_id      = str(uuid.uuid4())[:12]
-        now         = datetime.now().isoformat(timespec="seconds")
+        outstanding        = float(account.get("balance", 0))
+        account_id         = str(account.get("account_id", "unknown"))
+        stage              = (stage or str(account.get("stage", "NPL"))).upper()
+        persona            = persona or str(account.get("persona", "UNKNOWN"))
+        months_at_180plus  = int(months_at_180plus or account.get("months_at_180plus", 0) or 0)
+        rec_id             = str(uuid.uuid4())[:12]
+        now                = datetime.now().isoformat(timespec="seconds")
 
         # 2. Affordability
         aff = self.aff_engine.assess(account)
-        willingness = float(account.get("willingness_score", 0.5))
 
-        # 3. Generate offer candidates
-        candidates = self._generate_candidates(outstanding, stage, account, aff, willingness)
+        # 3. Balance decomposition (cheapest-first waiver ordering)
+        decomp = self._extract_balance_decomp(account, outstanding)
 
-        # 4. Rank by expected cashflow
-        best_offer = max(candidates, key=lambda x: x.expected_cashflow) if candidates else None
+        # 4. Generate offer candidates (uses paydown-curve NPV, no take-up rate)
+        candidates = self._generate_candidates(
+            outstanding, stage, decomp, aff, persona, months_at_180plus
+        )
 
-        # 5. Path comparison
+        # 5. Rank by incremental_npv (gain over Curve A baseline)
+        affordable = [c for c in candidates if c.is_affordable]
+        ranked     = affordable or candidates
+        best_offer = max(ranked, key=lambda x: x.incremental_npv) if ranked else None
+
+        # 6. Path comparison (includes HOLD = Curve A NPV)
         bureau_asset = float(account.get("bureau_secured_outstanding", 0) or 0)
         has_asset    = bool(account.get("bureau_secured_loan_flag", False))
 
@@ -234,16 +223,18 @@ class OfferGenerator:
             outstanding=outstanding,
             stage=stage,
             tdr_offers=candidates,
+            persona=persona,
+            months_at_180plus=months_at_180plus,
             bureau_asset_value=bureau_asset,
             has_secured_asset=has_asset,
         )
 
-        # 6. Policy check
+        # 7. Policy check
         within_policy, needs_approval, approval_reason = self._check_policy(
             best_offer, stage
         )
 
-        # 7. Talking points
+        # 8. Talking points
         talking_points = self._build_talking_points(
             account, aff, best_offer, stage, path_val, quality
         )
@@ -254,6 +245,8 @@ class OfferGenerator:
             generated_at=now,
             outstanding=outstanding,
             stage=stage,
+            persona=persona,
+            months_at_180plus=months_at_180plus,
             confidence_level=quality.confidence_level,
             completeness_pct=quality.completeness_pct,
             estimated_monthly_income=aff.estimated_monthly_income,
@@ -263,15 +256,19 @@ class OfferGenerator:
             recommended_path=path_val.recommended_path,
             path_rationale=path_val.path_rationale,
             offer_type=best_offer.offer_type if best_offer else "NONE",
-            monthly_instalment=best_offer.monthly_instalment if best_offer else 0,
+            monthly_instalment=best_offer.monthly_instalment if best_offer else 0.0,
             tenor_months=best_offer.tenor_months if best_offer else 0,
-            haircut_pct=best_offer.haircut_pct if best_offer else 0,
+            haircut_pct=best_offer.haircut_pct if best_offer else 0.0,
             total_recovery=round(
-                (best_offer.monthly_instalment or 0) * (best_offer.tenor_months or 0)
-                + outstanding * (best_offer.haircut_pct or 0), 2
-            ) if best_offer else 0,
-            take_up_probability=best_offer.take_up_probability if best_offer else 0,
-            loan_npv=best_offer.loan_npv if best_offer else 0,
+                (best_offer.monthly_instalment or 0) * (best_offer.tenor_months or 0), 2
+            ) if best_offer else 0.0,
+            loan_npv=best_offer.loan_npv if best_offer else 0.0,
+            incremental_npv=best_offer.incremental_npv if best_offer else 0.0,
+            hold_npv=path_val.hold_npv,
+            principal_waived=best_offer.principal_waived if best_offer else 0.0,
+            interest_waived=best_offer.interest_waived if best_offer else 0.0,
+            charges_waived=best_offer.charges_waived if best_offer else 0.0,
+            concession_cost=best_offer.concession_cost if best_offer else 0.0,
             within_policy=within_policy,
             needs_approval=needs_approval,
             approval_reason=approval_reason,
@@ -297,54 +294,65 @@ class OfferGenerator:
 
     def to_dataframe(self, recommendations: List[OfferRecommendation]) -> pd.DataFrame:
         return pd.DataFrame([{
-            "recommendation_id":       r.recommendation_id,
-            "account_id":              r.account_id,
-            "generated_at":            r.generated_at,
-            "stage":                   r.stage,
-            "outstanding":             r.outstanding,
-            "confidence_level":        r.confidence_level,
-            "completeness_pct":        r.completeness_pct,
-            "recommended_path":        r.recommended_path,
-            "offer_type":              r.offer_type,
-            "monthly_instalment":      r.monthly_instalment,
-            "tenor_months":            r.tenor_months,
-            "haircut_pct":             r.haircut_pct,
-            "total_recovery":          r.total_recovery,
-            "take_up_probability":     r.take_up_probability,
-            "loan_npv":                r.loan_npv,
-            "within_policy":           r.within_policy,
-            "needs_approval":          r.needs_approval,
-            "payment_capacity":        r.payment_capacity,
-            "income_tier_used":        r.income_tier_used,
-            "debt_sale_floor":         r.debt_sale_floor,
-            "legal_viable":            r.legal_viable,
-            "talking_points":          " | ".join(r.talking_points),
-            "agent_id":                r.agent_id,
-            "outcome":                 r.outcome,
-            "data_warnings":           "; ".join(r.data_warnings),
+            "recommendation_id":  r.recommendation_id,
+            "account_id":         r.account_id,
+            "generated_at":       r.generated_at,
+            "stage":              r.stage,
+            "persona":            r.persona,
+            "months_at_180plus":  r.months_at_180plus,
+            "outstanding":        r.outstanding,
+            "confidence_level":   r.confidence_level,
+            "completeness_pct":   r.completeness_pct,
+            "recommended_path":   r.recommended_path,
+            "offer_type":         r.offer_type,
+            "monthly_instalment": r.monthly_instalment,
+            "tenor_months":       r.tenor_months,
+            "haircut_pct":        r.haircut_pct,
+            "total_recovery":     r.total_recovery,
+            "loan_npv":           r.loan_npv,
+            "incremental_npv":    r.incremental_npv,
+            "hold_npv":           r.hold_npv,
+            "principal_waived":   r.principal_waived,
+            "interest_waived":    r.interest_waived,
+            "charges_waived":     r.charges_waived,
+            "concession_cost":    r.concession_cost,
+            "within_policy":      r.within_policy,
+            "needs_approval":     r.needs_approval,
+            "payment_capacity":   r.payment_capacity,
+            "income_tier_used":   r.income_tier_used,
+            "debt_sale_floor":    r.debt_sale_floor,
+            "legal_viable":       r.legal_viable,
+            "talking_points":     " | ".join(r.talking_points),
+            "agent_id":           r.agent_id,
+            "outcome":            r.outcome,
+            "data_warnings":      "; ".join(r.data_warnings),
         } for r in recommendations])
 
     def to_audit_log(self, recommendations: List[OfferRecommendation]) -> pd.DataFrame:
         return pd.DataFrame([{
-            "recommendation_id":   r.recommendation_id,
-            "account_id":          r.account_id,
-            "generated_at":        r.generated_at,
-            "stage":               r.stage,
-            "outstanding":         r.outstanding,
-            "recommended_path":    r.recommended_path,
-            "offer_type":          r.offer_type,
-            "monthly_instalment":  r.monthly_instalment,
-            "tenor_months":        r.tenor_months,
-            "haircut_pct":         r.haircut_pct,
-            "loan_npv":            r.loan_npv,
-            "take_up_probability": r.take_up_probability,
-            "within_policy":       r.within_policy,
-            "confidence_level":    r.confidence_level,
-            "completeness_pct":    r.completeness_pct,
-            "income_tier_used":    r.income_tier_used,
-            "agent_id":            r.agent_id,
-            "outcome":             r.outcome,
-            "outcome_timestamp":   r.outcome_timestamp,
+            "recommendation_id":  r.recommendation_id,
+            "account_id":         r.account_id,
+            "generated_at":       r.generated_at,
+            "stage":              r.stage,
+            "persona":            r.persona,
+            "months_at_180plus":  r.months_at_180plus,
+            "outstanding":        r.outstanding,
+            "recommended_path":   r.recommended_path,
+            "offer_type":         r.offer_type,
+            "monthly_instalment": r.monthly_instalment,
+            "tenor_months":       r.tenor_months,
+            "haircut_pct":        r.haircut_pct,
+            "loan_npv":           r.loan_npv,
+            "incremental_npv":    r.incremental_npv,
+            "hold_npv":           r.hold_npv,
+            "concession_cost":    r.concession_cost,
+            "within_policy":      r.within_policy,
+            "confidence_level":   r.confidence_level,
+            "completeness_pct":   r.completeness_pct,
+            "income_tier_used":   r.income_tier_used,
+            "agent_id":           r.agent_id,
+            "outcome":            r.outcome,
+            "outcome_timestamp":  r.outcome_timestamp,
         } for r in recommendations])
 
     def format_agent_screen(self, rec: OfferRecommendation) -> str:
@@ -373,8 +381,13 @@ class OfferGenerator:
                 f"  Monthly payment : {rec.monthly_instalment:>10,.0f} /mo",
                 f"  Tenor           : {rec.tenor_months} months",
                 f"  Haircut         : {rec.haircut_pct:.0%}",
-                f"  Take-up est.    : {rec.take_up_probability:.0%}",
+                f"  Charges waived  : {rec.charges_waived:>10,.0f}",
+                f"  Interest waived : {rec.interest_waived:>10,.0f}",
+                f"  Principal waived: {rec.principal_waived:>10,.0f}",
+                f"  Concession cost : {rec.concession_cost:>10,.0f}",
                 f"  Loan NPV        : {rec.loan_npv:>10,.0f}",
+                f"  Incremental NPV : {rec.incremental_npv:>10,.0f}  (vs natural recovery)",
+                f"  Natural recovery: {rec.hold_npv:>10,.0f}  (Curve A baseline)",
                 f"  {policy_icon}",
             ]
             if rec.needs_approval:
@@ -400,29 +413,63 @@ class OfferGenerator:
 
     # ── PRIVATE ───────────────────────────────────────────────────────────────
 
+    def _extract_balance_decomp(
+        self, account: pd.Series, outstanding: float
+    ) -> BalanceDecomposition:
+        """
+        Extract principal / interest / charges from account fields.
+        Falls back to ratio estimates if decomposition not available.
+        """
+        principal  = float(account.get("principal_outstanding", 0) or 0)
+        interest   = float(account.get("accrued_interest",      0) or 0)
+        charges    = float(account.get("penalty_charges",        0) or 0)
+
+        if principal + interest + charges > 0:
+            # Normalise to match outstanding (rounding)
+            total    = principal + interest + charges
+            scale    = outstanding / max(total, 1)
+            principal = principal * scale
+            interest  = interest  * scale
+            charges   = charges   * scale
+        else:
+            # Fall back: assume 70% principal / 20% interest / 10% charges
+            principal = outstanding * 0.70
+            interest  = outstanding * 0.20
+            charges   = outstanding * 0.10
+
+        return BalanceDecomposition(
+            principal=round(principal, 2),
+            accrued_interest=round(interest, 2),
+            penalty_charges=round(charges, 2),
+            total=round(outstanding, 2),
+        )
+
     def _generate_candidates(
-        self, outstanding, stage, account, aff, willingness
+        self,
+        outstanding: float,
+        stage: str,
+        decomp: BalanceDecomposition,
+        aff: AffordabilityProfile,
+        persona: str,
+        months_at_180plus: int,
     ) -> List[LoanNPV]:
-        policy    = self.policy
-        orig_rate = policy.policy_rate_by_stage.get(stage, 0.10)
-        max_hcut  = policy.max_haircut_by_stage.get(stage, 0.40)
+        """
+        Generate offer candidates using paydown-curve NPV.
+        No take-up rate — rank by incremental_npv (gain over Curve A baseline).
+        Waivers applied cheapest-first: charges → interest → principal.
+        """
+        policy     = self.policy
+        orig_rate  = policy.policy_rate_by_stage.get(stage, 0.10)
+        max_hcut   = policy.max_haircut_by_stage.get(stage, 0.40)
         candidates = []
 
         for offer_type, haircut, rate, tenor in self._offer_grid(stage, orig_rate, max_hcut):
-            principal = outstanding * (1 - haircut)
-            if rate > 0:
-                r = rate / 12
-                instalment = principal * r / (1 - (1 + r) ** (-tenor))
-            else:
-                instalment = principal / tenor
-
-            tup = self.takeup.predict(
-                offer_type=offer_type,
-                haircut_pct=haircut,
-                instalment=instalment,
-                payment_capacity=aff.payment_capacity,
-                stage=stage,
-                willingness_score=willingness,
+            # Waiver amount = haircut × outstanding (cheapest-first decomposition)
+            target_waiver = outstanding * haircut
+            waived_decomp, concession_cost = compute_waivers(
+                decomp,
+                target_waiver_amount=target_waiver,
+                processing_cost=self.npv_engine.config.processing_cost_per_tdr,
             )
 
             params = dict(
@@ -432,15 +479,17 @@ class OfferGenerator:
                 haircut_pct=haircut,
                 interest_rate_pa=rate,
                 tenor_months=tenor,
-                fee_waiver_amount=0.0,
-                _instalment_estimate=instalment,
+                principal_waived=waived_decomp.principal_waived,
+                interest_waived=waived_decomp.interest_waived,
+                charges_waived=waived_decomp.charges_waived,
             )
 
             ln = self.npv_engine.compute_loan_npv(
                 offer_params=params,
-                take_up_probability=tup,
-                stage=stage,
+                persona=persona,
+                months_at_180plus=months_at_180plus,
                 payment_capacity=aff.payment_capacity,
+                concession_cost=concession_cost,
             )
             candidates.append(ln)
 
@@ -512,10 +561,16 @@ class OfferGenerator:
 
         # Offer attractiveness
         if offer:
-            points.append(
-                f"Estimated {offer.take_up_probability:.0%} acceptance rate "
-                f"based on similar customer profiles"
-            )
+            if offer.incremental_npv > 0:
+                points.append(
+                    f"Offer generates {offer.incremental_npv:,.0f} incremental recovery "
+                    f"over natural paydown (Curve A baseline={offer.pv_baseline:,.0f})"
+                )
+            else:
+                points.append(
+                    f"Offer NPV ({offer.loan_npv:,.0f}) below natural recovery baseline "
+                    f"({offer.pv_baseline:,.0f}) — consider debt sale"
+                )
             if offer.is_affordable:
                 points.append(
                     f"Instalment {offer.monthly_instalment:,.0f} is within "
