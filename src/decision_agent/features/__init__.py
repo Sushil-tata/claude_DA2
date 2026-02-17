@@ -8,6 +8,7 @@ from .collection_action_aggregator import CollectionActionAggregator, ActionAggr
 from .collections_feature_pipeline import CollectionsFeaturePipeline, PipelineConfig, PipelineResult
 from .pipeline_adapter import ScorecardAdapter, NBAAdapter, build_labels_from_outcomes
 from .bureau_features import (
+    TUEFParser,
     BureauFeatureBuilder, BureauConfig,
     BUREAU_FEATURE_COLS, enrich_affordability_with_bureau,
 )
