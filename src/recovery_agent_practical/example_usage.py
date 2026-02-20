@@ -257,10 +257,15 @@ def example_component_by_component():
 
     # Merge features with labels
     train_data = features_df.merge(labels_df, on="account_id")
-    X_train = train_data.drop(columns=["account_id", "recovery_amount_180d"])
+
+    # Select only numeric features for training
+    numeric_cols = train_data.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c not in ["account_id", "recovery_amount_180d"]]
+
+    X_train = train_data[numeric_cols]
     y_train = train_data["recovery_amount_180d"]
 
-    print(f"Training on {len(X_train)} accounts...")
+    print(f"Training on {len(X_train)} accounts with {len(numeric_cols)} features...")
     metrics = scorecard.train(X_train, y_train)
 
     print(f"\n  ✓ Training complete")
@@ -269,9 +274,10 @@ def example_component_by_component():
     print(f"  - MAE: {metrics['train'].mae:.0f} THB")
     print()
 
-    # Score
+    # Score (use only numeric features)
     print("Scoring accounts...")
-    scores_df = scorecard.score_batch(features_df, score_date="2024-01-15")
+    features_numeric = features_df[["account_id"] + numeric_cols]
+    scores_df = scorecard.score_batch(features_numeric, score_date="2024-01-15")
 
     print("\nScore band distribution:")
     print(scores_df["score_band"].value_counts())

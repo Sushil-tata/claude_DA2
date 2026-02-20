@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime
 from typing import Optional, Literal
 
+import numpy as np
 import pandas as pd
 
 from recovery_agent_practical.segmentation.persona_builder import PersonaBuilder
@@ -104,9 +105,14 @@ class RecoveryAgentPipeline:
         if len(train_data) == 0:
             raise ValueError("No matching accounts between features and labels")
 
-        # Extract features and labels
-        X = train_data.drop(columns=["account_id", "recovery_amount_180d"], errors="ignore")
+        # Extract features and labels (only numeric columns)
+        numeric_cols = train_data.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_cols = [c for c in numeric_cols if c not in ["account_id", "recovery_amount_180d"]]
+
+        X = train_data[numeric_cols]
         y = train_data["recovery_amount_180d"]
+
+        logger.info(f"Using {len(numeric_cols)} numeric features for training")
 
         # Train/val split
         from sklearn.model_selection import train_test_split
@@ -191,7 +197,7 @@ class RecoveryAgentPipeline:
         # Merge actions
         enriched_df = enriched_df.merge(
             actions_df[["account_id", "recommended_action", "priority_tier",
-                       "contact_channel", "offer_type", "routing_reasoning", "balance_band"]],
+                       "contact_channel", "offer_type", "reasoning", "balance_band"]],
             on="account_id",
             how="left"
         )
@@ -231,7 +237,7 @@ class RecoveryAgentPipeline:
                 "priority_tier": row["priority_tier"],
                 "contact_channel": row["contact_channel"],
                 "offer_type": row["offer_type"],
-                "routing_reasoning": row["routing_reasoning"],
+                "routing_reasoning": row["reasoning"],
 
                 # Context
                 "stage": row["stage"],
