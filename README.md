@@ -1,543 +1,292 @@
-# CardX Debt Collections Decision Agent
+# Decision Agent Platform - Principal Data Science Agent
 
-Production-ready AI-powered debt collections system for CardX (Thai bank) with two complementary approaches: NPV-driven offer optimization and rule-based recovery routing.
+A production-grade, Databricks-native ML platform for end-to-end decision workflows.
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tested](https://img.shields.io/badge/tested-passing-brightgreen.svg)](src/recovery_agent_practical/example_usage.py)
-
----
-
-## 📋 Table of Contents
-
-- [Overview](#overview)
-- [Architecture](#architecture)
-- [Quick Start](#quick-start)
-- [Systems](#systems)
-  - [System 1: NPV-Driven TDR Engine](#system-1-npv-driven-tdr-engine)
-  - [System 2: Rule-Based Recovery Agent](#system-2-rule-based-recovery-agent)
-- [Feature Set](#feature-set)
-- [Bureau Data Integration](#bureau-data-integration)
-- [Installation](#installation)
-- [Usage Examples](#usage-examples)
-- [Outputs](#outputs)
-- [Deployment](#deployment)
-- [Documentation](#documentation)
-- [Contributing](#contributing)
+**Version:** 1.0.0-MVP  
+**Status:** Phase 1 Complete - Runnable Skeleton  
+**Branch:** copilot/create-principal-data-science-agent
 
 ---
 
-## 🎯 Overview
+## Overview
 
-This repository provides **two complementary debt collections decision systems**:
+The Decision Agent Platform is a configuration-driven ML platform designed for Databricks that handles:
+- Point-in-time safe feature engineering
+- MLflow-integrated model training
+- Segment-based validation and calibration
+- Production decision output to Delta Lake
+- Complete audit trail and lineage tracking
 
-1. **NPV-Driven TDR Engine** (`decision_agent/tdr/`) - Sophisticated offer optimization using paydown curves and NPV maximization
-2. **Rule-Based Recovery Agent** (`recovery_agent_practical/`) - Operationally simple persona-based routing with machine learning scoring
+### Key Principles
 
-Both systems leverage:
-- ✅ NCB (Thai Credit Bureau) integration with TUEF parser
-- ✅ Stage-wise feature engineering (0-30, 31-90, 91-180, 181-365 day windows)
-- ✅ Point-in-time safe feature computation (no data leakage)
-- ✅ Buddhist Era (BE) date handling
-- ✅ Production-ready schemas and audit trails
-
-**Choose the right system:**
-- **NPV-Driven**: When you have historical offer data and calibrated recovery curves
-- **Rule-Based**: For quick deployment, operational transparency, no offer history needed
+- **Databricks-Native**: All processing on Databricks (PySpark, Delta Lake, MLflow)
+- **Config-Driven**: YAML configuration with JSON schema validation
+- **Point-in-Time Safe**: No look-ahead bias, as-of joins, temporal validation
+- **Production-Ready**: ACID transactions, versioning, audit logs
 
 ---
 
-## 🏗️ Architecture
+## Current Status (Phase 1 Complete)
 
-### System Comparison
+### ✅ Delivered Components
 
-| Aspect | NPV-Driven | Rule-Based |
-|--------|-----------|------------|
-| **Optimization** | NPV maximization | Heuristic rules |
-| **Data Required** | Offer history + recovery curves | Behavioral features only |
-| **Deployment Time** | 6-8 weeks (calibration) | 2 weeks (default rules) |
-| **Interpretability** | Black box NPV | Transparent rules |
-| **Bureau Dependency** | HIGH (affordability Tier 1) | MEDIUM (capacity scoring) |
-| **Use Case** | Mature collections programs | New programs, quick wins |
+1. **Directory Structure** - Complete skeleton for all modules
+2. **Configuration System**:
+   - JSON schema for config validation (`schemas/config_schemas/use_case_config.schema.json`)
+   - MVP use case config (`conf/use_cases/income_estimation.yaml`)
+   - Config loader with validation (`src/decision_agent/utils/config_loader.py`)
 
-### Technology Stack
+3. **Orchestration**:
+   - Use case router with pipeline registry (`src/decision_agent/orchestrator/router.py`)
+   - Main entry point (`jobs/run_usecase.py`)
 
-- **Language**: Python 3.9+
-- **ML Libraries**: scikit-learn, pandas, numpy
-- **Data Storage**: Delta Lake, Parquet
-- **Feature Engineering**: PySpark (optional for scale)
-- **Bureau Integration**: Custom TUEF parser
-- **Deployment**: Batch scoring, daily pipeline
+4. **Data Generation**:
+   - Synthetic transaction data generator (`src/decision_agent/data/synthetic_data.py`)
 
----
-
-## 🚀 Quick Start
-
-### Rule-Based System (Recommended for First Time)
-
-```python
-from recovery_agent_practical import RecoveryAgentPipeline
-import pandas as pd
-
-# 1. Load your data
-features_df = pd.read_csv("your_features.csv")
-labels_df = pd.read_csv("historical_recoveries.csv")
-
-# 2. Initialize pipeline
-pipeline = RecoveryAgentPipeline(
-    scorecard_model_type="TWO_PART",
-    payment_threshold=500.0  # THB
-)
-
-# 3. Train (one-time)
-metrics = pipeline.train_scorecard(features_df, labels_df, val_split=0.2)
-print(f"Validation AUC: {metrics['val'].auc_roc:.3f}")
-
-# 4. Score daily batch
-daily_scores = pipeline.score_batch(
-    features_df=today_features,
-    score_date="2024-01-15",
-    write_outputs=True,
-    output_path="./outputs"
-)
-
-# 5. View results
-print(daily_scores[["account_id", "persona", "score_band",
-                     "recommended_action"]].head())
-```
-
-**Output**: Daily scoring table with persona, recovery score, recommended action, priority tier.
-
-### NPV-Driven System (For Advanced Use)
-
-```python
-from decision_agent.tdr import OfferGenerator, NPVEngine, AffordabilityEngine
-
-# Initialize engines
-npv_engine = NPVEngine(monthly_discount_rate=0.02)
-aff_engine = AffordabilityEngine()
-offer_gen = OfferGenerator(npv_engine, aff_engine)
-
-# Generate best offer for an account
-recommendation = offer_gen.generate(
-    account=account_series,
-    persona="SELECTIVE_DEFAULTER",
-    months_at_180plus=3
-)
-
-print(f"Best offer: {recommendation.offer_type}")
-print(f"NPV: {recommendation.npv:,.0f} THB")
-print(f"Haircut: {recommendation.haircut_pct:.1%}")
-```
-
-### Test with Synthetic Data
-
-```bash
-# Run working example with synthetic data
-PYTHONPATH=src:$PYTHONPATH python3 src/recovery_agent_practical/example_usage.py
-
-# Expected output:
-# ✓ Persona distribution
-# ✓ Score band distribution
-# ✓ Action distribution
-# ✓ Sample recommendations
-```
+5. **Testing**:
+   - Import verification ✓
+   - Dry-run execution ✓
+   - Full pipeline routing ✓
 
 ---
 
-## 📊 Systems
+## Quick Start
 
-### System 1: NPV-Driven TDR Engine
+### Prerequisites
 
-**Location**: `src/decision_agent/tdr/`
+- Python 3.10+
+- pip package manager
 
-**Read full documentation**: [NPV-Driven System Details](src/decision_agent/tdr/README.md)
-
-#### Key Components
-
-##### Bureau Parser
-- Parses NCB TUEF (Thai Union Exchange Format) JSON
-- Buddhist Era (BE) → Gregorian date conversion
-- Extracts: DSR, secured loans, delinquencies, installments
-
-##### Paydown Curves
-- **Curve A**: Natural recovery without offer
-- **Curve B**: Recovery with structured settlement
-- Persona-based calibration
-- NPV: `PV(Curve_B) - PV(Curve_A) - concession_cost`
-
-##### Affordability Engine
-**5-Tier Waterfall for Income Estimation:**
-1. Bureau DSR → implied income
-2. Bureau monthly installments
-3. Last payment amount
-4. Payment history average
-5. Segment median (fallback)
-
-##### NPV Engine
-Compares 4 paths: TDR, LEGAL, DEBT_SALE, HOLD
-
-##### Offer Generator
-- Haircut 30-70% candidates
-- Cheapest-first waiver ordering (charges → interest → principal)
-- Balance decomposition-aware
-
----
-
-### System 2: Rule-Based Recovery Agent
-
-**Location**: `src/recovery_agent_practical/`
-
-**Read full documentation**: [Rule-Based System README](src/recovery_agent_practical/README.md)
-
-#### Key Components
-
-##### 1. PersonaBuilder
-**4 Behavioral Axes** (0-100):
-- Payment behavior
-- Engagement
-- Capacity
-- Avoidance
-
-**5 Personas**:
-- ACTIVE_PAYER
-- SELECTIVE_DEFAULTER
-- LIQUIDITY_CONSTRAINED
-- STRATEGIC
-- DORMANT
-
-##### 2. RecoveryScorecard6M
-**Two Options**:
-- Two-part model (P(pay) × E(amount|paid))
-- Tweedie regression (single-stage)
-
-**Score Bands**: HOT/WARM/COLD/FROZEN
-
-##### 3. ActionOverlayRouter
-**5 Actions**:
-- SETTLEMENT_LUMP
-- SETTLEMENT_PLAN
-- AGENCY
-- LEGAL_REVIEW
-- HOLD
-
-**Routing**: `persona × stage × balance × staleness × score → action`
-
----
-
-## 📈 Feature Set
-
-### Stage-Wise Windows
-- 0-30 days (recent)
-- 31-90 days (short-term)
-- 91-180 days (medium-term)
-- 181-365 days (long-term)
-
-### 8 Feature Families
-
-1. **Delinquency Trajectory**: DPD trends, staleness
-2. **Balance & Utilization**: Principal/interest/charges decomposition
-3. **Internal Payments**: Frequency, amounts, recency
-4. **Actions & Engagement**: Call/SMS response rates, PTP
-5. **Transaction-Spend**: Spending patterns (optional)
-6. **Bureau Exposure**: Total debt, installments, secured loans
-7. **Bureau Delinquency**: Delinquencies at other lenders
-8. **Avoidance Flags**: Wrong number, disputes, lawyer
-
----
-
-## 🏦 Bureau Data Integration
-
-### NCB (Thai Credit Bureau) - TUEF Format
-
-#### Critical Bureau Fields
-
-| Field | Purpose | Priority |
-|-------|---------|----------|
-| `bureau_total_outstanding` | Affordability, Capacity scoring | **P0** |
-| `bureau_monthly_instalment` | DSR calculation | **P0** |
-| `bureau_secured_loan_flag` | Legal viability | **P0** |
-| `bureau_delinquent_other` | Strategic defaulter signal | P1 |
-| `bureau_active_loan_count` | Stress indicator | P1 |
-| `bureau_new_loan_12m` | Liquidity signal | P2 |
-
-#### TUEF JSON Example
-
-```json
-{
-  "accountSegment": [{
-    "accountNumber": "string",
-    "installmentAmount": 5000,
-    "outstandingBalance": 150000,
-    "dateOpened": "25661201",
-    "currentDPD": 90,
-    "securedLoanFlag": true
-  }],
-  "hss": [{
-    "totalOutstanding": 450000,
-    "totalMonthlyInstallment": 25000,
-    "totalActiveAccounts": 5
-  }]
-}
-```
-
-#### Integration
-
-```python
-from decision_agent.features import BureauFeatureExtractor
-
-extractor = BureauFeatureExtractor()
-bureau_features = extractor.extract_from_tuef(tuef_json)
-```
-
-### What We Need From You
-
-1. ✅ Sample TUEF JSON (anonymized 5-10 accounts)
-2. ✅ Field mapping doc (NCB → CardX names)
-3. ✅ BE date format confirmation
-4. ✅ Historical recovery data (6-12 months)
-
----
-
-## 💾 Installation
+### Installation
 
 ```bash
 # Clone repository
-git clone https://github.com/Sushil-tata/claude_DA2.git
-cd claude_DA2
+git clone <repository-url>
+cd claude
 
 # Install dependencies
 pip install -r requirements.txt
-
-# Optional: Install in development mode
-pip install -e .
 ```
 
-### Dependencies
+### Usage
 
-```
-pandas>=1.5.0
-numpy>=1.23.0
-scikit-learn>=1.2.0
-pyarrow>=10.0.0
-```
-
----
-
-## 📝 Usage Examples
-
-### Example 1: Rule-Based Daily Scoring
-
-```python
-from recovery_agent_practical import RecoveryAgentPipeline
-
-# Initialize
-pipeline = RecoveryAgentPipeline(scorecard_model_type="TWO_PART")
-
-# Train
-metrics = pipeline.train_scorecard(features_df, labels_df, val_split=0.2)
-
-# Score
-daily_scores = pipeline.score_batch(
-    features_df=features_df,
-    score_date="2024-01-15",
-    write_outputs=True,
-    output_path="./outputs"
-)
-
-print(f"Scored {len(daily_scores)} accounts")
-print(daily_scores['persona'].value_counts())
-```
-
-### Example 2: NPV-Driven Offers
-
-```python
-from decision_agent.tdr import OfferGenerator, NPVEngine, AffordabilityEngine
-
-# Initialize
-npv_engine = NPVEngine(monthly_discount_rate=0.02)
-aff_engine = AffordabilityEngine()
-offer_gen = OfferGenerator(npv_engine, aff_engine)
-
-# Generate offers
-for _, account in accounts_df.iterrows():
-    rec = offer_gen.generate(account, persona, months_at_180plus)
-    print(f"{account['account_id']}: {rec.offer_type}, NPV={rec.npv:,.0f}")
-```
-
-### Run Examples
+#### List Available Use Cases
 
 ```bash
-# Test with synthetic data (both systems)
-PYTHONPATH=src:$PYTHONPATH python3 src/recovery_agent_practical/example_usage.py
+python3 jobs/run_usecase.py --list-use-cases
 ```
 
----
-
-## 📤 Outputs
-
-### Daily Scoring Table
-
-**Partitioning**: `score_date` (daily)
-**Primary Key**: `(account_id, score_date)`
-
-**Key Columns**:
-- Persona + 4 axis scores
-- Score band (HOT/WARM/COLD/FROZEN)
-- P(recovery), expected amount
-- Recommended action
-- Priority tier (TIER_1/2/3)
-- Contact channel
-- Routing reasoning
-
-### Audit Log
-
-**Event Types**:
-- PERSONA_ASSIGNED
-- SCORED
-- ACTION_ROUTED
-- ACTION_EXECUTED
-- OUTCOME_OBSERVED
-
-Full audit trail for compliance.
-
----
-
-## 🚀 Deployment
-
-### Quick Win (2 weeks) - Rule-Based
-
-**Week 1**: Train scorecard on historical data
-**Week 2**: Deploy daily scoring pipeline
+#### Validate Configuration (Dry Run)
 
 ```bash
-# Daily cron
-0 6 * * * python3 run_daily_scoring.py --date $(date +\%Y-\%m-\%d)
+python3 jobs/run_usecase.py \
+  --config conf/use_cases/income_estimation.yaml \
+  --dry-run
 ```
 
-### Full Solution (6-8 weeks) - NPV-Driven
-
-**Weeks 1-2**: Data prep, recovery curve calibration
-**Weeks 3-4**: Model training, NPV tuning
-**Weeks 5-6**: Testing, validation
-**Weeks 7-8**: Production deployment
-
----
-
-## 📚 Documentation
-
-### Component Documentation
-
-- **Rule-Based System**: [`src/recovery_agent_practical/README.md`](src/recovery_agent_practical/README.md)
-- **Implementation Summary**: [`RECOVERY_AGENT_PRACTICAL_SUMMARY.md`](RECOVERY_AGENT_PRACTICAL_SUMMARY.md)
-- **Bureau Integration**: Inline docs in `bureau_features.py`
-- **Paydown Curves**: Inline docs in `paydown_curves.py`
-
-### Examples
-
-- **Complete Examples**: [`src/recovery_agent_practical/example_usage.py`](src/recovery_agent_practical/example_usage.py)
-- **Tested**: ✅ Both examples run successfully with synthetic data
-
----
-
-## 📊 Test Results
-
-### Synthetic Data (500 accounts)
-
-**Persona Distribution**:
-- SELECTIVE_DEFAULTER: 56.6%
-- DORMANT: 42.2%
-- STRATEGIC: 0.8%
-- ACTIVE_PAYER: 0.4%
-
-**Score Bands**:
-- HOT: 10.6%
-- WARM: 25.8%
-- COLD: 36.4%
-- FROZEN: 27.2%
-
-**Actions**:
-- AGENCY: 54.4%
-- SETTLEMENT_PLAN: 27.0%
-- SETTLEMENT_LUMP: 13.2%
-- LEGAL_REVIEW: 3.0%
-- HOLD: 2.4%
-
-**Performance**:
-- Validation AUC: 0.65
-- Training time: <5 seconds
-- Scoring time: <2 seconds
-- Expected recovery: 14,090 THB/account
-
----
-
-## 🤝 Contributing
+#### Execute Use Case
 
 ```bash
-# Development setup
-git clone https://github.com/Sushil-tata/claude_DA2.git
-pip install -e .
-
-# Run tests
-pytest tests/
-
-# Run examples
-PYTHONPATH=src:$PYTHONPATH python3 src/recovery_agent_practical/example_usage.py
+python3 jobs/run_usecase.py \
+  --config conf/use_cases/income_estimation.yaml
 ```
 
-### Branches
+---
 
-- `main`: Production code
-- `recovery_agent_practical`: Rule-based system ✅
-- Feature branches: `feature/your-feature`
+## Project Structure
+
+```
+claude/
+├── jobs/
+│   └── run_usecase.py              # Main entry point
+├── conf/
+│   └── use_cases/
+│       └── income_estimation.yaml  # MVP use case config
+├── src/decision_agent/
+│   ├── orchestrator/
+│   │   └── router.py               # Use case router
+│   ├── data/
+│   │   └── synthetic_data.py       # Synthetic data generator
+│   ├── utils/
+│   │   └── config_loader.py        # Config validation
+│   ├── features/                   # Phase 3 (to be implemented)
+│   ├── training/                   # Phase 4 (to be implemented)
+│   ├── validation/                 # Phase 5 (to be implemented)
+│   └── decisions/                  # Phase 6 (to be implemented)
+├── tests/
+│   ├── unit/                       # Unit tests (no Spark)
+│   └── integration/                # Integration tests (Databricks)
+├── databricks/
+│   └── workflows/                  # Databricks workflow DAGs
+├── schemas/
+│   └── config_schemas/
+│       └── use_case_config.schema.json
+└── requirements.txt
+```
 
 ---
 
-## 🎯 Quick Reference
+## MVP Use Case: Income Estimation
 
-| Task | System | Command |
-|------|--------|---------|
-| **Quick start** | Rule-Based | `python3 src/recovery_agent_practical/example_usage.py` |
-| **Train** | Rule-Based | `pipeline.train_scorecard(features_df, labels_df)` |
-| **Score** | Rule-Based | `pipeline.score_batch(features_df, score_date)` |
-| **Generate offer** | NPV | `offer_gen.generate(account, persona, months_at_180plus)` |
-| **Parse bureau** | Both | `extractor.extract_from_tuef(tuef_json)` |
+**Goal**: Estimate individual income levels from transaction patterns
 
----
+**Features**:
+- Rolling window aggregations (7d, 30d, 90d)
+- Transaction category features (salary, rent, groceries)
+- Tag PCA dimensionality reduction
+- Liquidity ratios (income/expense, average balance)
 
-## 🏆 Key Differentiators
+**Model**: Gradient Boosting Regressor
 
-✅ **Two Systems, One Platform**: Choose rule-based OR NPV-driven
-✅ **Bureau Integration**: NCB TUEF parser with BE dates
-✅ **Production-Ready**: Schemas, audit logs, monitoring
-✅ **Tested**: Example scripts run successfully
-✅ **Transparent**: Every decision explained
-✅ **Scalable**: 100 to 100,000 accounts
+**Output**: Decision table with predicted income + confidence bands
 
 ---
 
-## 📞 Next Steps
+## Implementation Roadmap
 
-**Please provide**:
-1. Sample NCB TUEF JSON (anonymized)
-2. Field mapping document
-3. Historical recovery data (6-12 months)
-4. Data warehouse access
+### ✅ Phase 1: Runnable Skeleton (Complete)
+- Directory structure
+- Config system with JSON schema validation
+- Use case router
+- Synthetic data generator
+- Main entry point with dry-run capability
 
-**We will**:
-1. Verify bureau parser
-2. Test on real CardX data
-3. Calibrate models and rules
-4. Deploy daily scoring pipeline
+### 🔜 Phase 2: Data Layer (Next)
+- Temporal train/val/test splits
+- Point-in-time safe as-of joins
+- Leakage prevention guards
+
+### 🔜 Phase 3: Feature Engineering
+- Rolling window aggregations
+- Transaction category encoding
+- Tag PCA
+- Liquidity features
+
+### 🔜 Phase 4: Training Harness
+- MLflow integration
+- Spark to pandas boundary
+- Model logging and registry
+
+### 🔜 Phase 5: Validation
+- Segment-based validation
+- Calibration evaluation
+- Quality gates
+
+### 🔜 Phase 6: Decision Output
+- Delta Lake writer
+- Audit trail
+- Metadata tracking
+
+### 🔜 Phase 7: End-to-End Integration
+- Wire all components
+- Databricks workflow DAG
+- CI/CD pipeline
 
 ---
 
-## 📄 License
+## Configuration Format
 
-Internal use only - CardX Collections Team
+### Example: Income Estimation Use Case
+
+```yaml
+use_case_id: income_estimation
+version: v1.0.0
+description: Estimate income levels from transaction patterns
+
+features:
+  snapshot_timestamp: "2024-01-31"
+  lookback_windows: [7, 30, 90]
+  feature_list:
+    - transaction_count_7d
+    - transaction_sum_30d
+    - salary_deposit_frequency
+    # ... more features
+  leakage_prevention: true
+
+model:
+  algorithm: gradient_boosting
+  hyperparameters:
+    n_estimators: 100
+    max_depth: 5
+    learning_rate: 0.1
+  target_variable: income_level
+
+validation:
+  segments:
+    - dimension: income_quartile
+      values: [Q1, Q2, Q3, Q4]
+  quality_gates:
+    min_r2: 0.6
+
+output:
+  table_name: decision_agent.income_decisions
+```
 
 ---
 
-**Ready to deploy!** 🚀
+## Testing
 
-For questions, contact the CardX Data Science Team.
+### Import Verification
+
+```bash
+python3 -c "
+import sys
+sys.path.insert(0, 'src')
+from decision_agent.utils.config_loader import ConfigLoader
+from decision_agent.orchestrator.router import route_use_case
+from decision_agent.data.synthetic_data import SyntheticDataGenerator
+print('✓ All imports successful')
+"
+```
+
+### Generate Synthetic Data
+
+```bash
+python3 -c "
+import sys
+sys.path.insert(0, 'src')
+from decision_agent.data.synthetic_data import SyntheticDataGenerator
+gen = SyntheticDataGenerator()
+df = gen.generate_transactions(n_customers=10, months_history=6)
+print(f'Generated {len(df)} transactions')
+print(df.head())
+"
+```
+
+---
+
+## Architecture Decisions
+
+### 1. Databricks-Native
+All data processing, training, and inference runs on Databricks. GitHub Actions limited to CI/CD only.
+
+### 2. Config-Driven
+All use cases defined in YAML with strict JSON schema validation. No hardcoded parameters.
+
+### 3. Delta Lake for Storage
+Features, decisions, and audit logs stored in Delta Lake for ACID transactions and time travel.
+
+### 4. Point-in-Time Safety
+Temporal validators and as-of joins prevent look-ahead bias in all feature computations.
+
+### 5. MLflow for Model Lifecycle
+Experiment tracking, model registry, and feature lineage managed through MLflow.
+
+---
+
+## Next Steps
+
+1. **Implement Phase 2**: Temporal splits and as-of joins
+2. **Implement Phase 3**: Feature engineering modules
+3. **Add unit tests**: Config loader, router logic
+4. **Create CI/CD pipeline**: GitHub Actions for tests and deployment
+
+---
+
+## Support
+
+For questions or issues, contact the Decision Agent Team.
+
+---
+
+**Built for production ML at scale on Databricks**
