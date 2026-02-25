@@ -1,7 +1,8 @@
 # Behavioral Feature Engineering (BFE) Repository
 
-**Version:** BFE_v1.0
-**Status:** Production-Ready MVP (Delinquency + Payment Modules)
+**Version:** BFE_v1.1
+**Status:** Production-Ready with RFM Framework
+**Latest Update:** Added RFM (Recency, Frequency, Monetary) framework - industry standard
 
 ---
 
@@ -22,12 +23,12 @@ The BFE Repository is a self-contained, versioned module that enriches Decision 
 
 ## 📦 What's Included
 
-### Feature Modules (v1.0)
+### Feature Modules (v1.1)
 
 | Module | Status | Features | Description |
 |--------|--------|----------|-------------|
-| **Delinquency** | ✅ Complete | 100+ | DPD statistics, bucket transitions, trajectories, regimes |
-| **Payment** | ✅ Complete | 80+ | Payment ratios, timing, consistency, elasticity, regimes |
+| **Delinquency** | ✅ Complete | 92 | DPD statistics, bucket transitions, trajectories, regimes |
+| **Payment** | ✅ Complete | 118 | **RFM framework**, payment ratios, timing, consistency, elasticity, regimes |
 | **Repayment (Term Loan)** | 🔜 Planned | 50+ | EMI adherence, prepayments, restructuring |
 | **Utilization (Revolving)** | 🔜 Planned | 40+ | Credit utilization, cash advances, transactor/revolver flags |
 | **Balance Exposure** | 🔜 Planned | 30+ | Balance trajectory, overdue interest, penalties |
