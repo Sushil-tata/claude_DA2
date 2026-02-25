@@ -36,9 +36,11 @@ from pathlib import Path
 
 from .modules import DelinquencyFeatureEngine, PaymentFeatureEngine
 from .modules import get_delinquency_metadata, get_payment_metadata
+from .modules.vintage import VintageFeatureEngine
+from .modules.interactions import InteractionFeatureEngine
 
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 __author__ = "Decision Engine Team"
 
 
@@ -50,12 +52,14 @@ class BehavioralFeatureEngine:
     Decision Engine integration.
     """
 
-    VERSION = "BFE_v1.0"
+    VERSION = "BFE_v1.2"
 
     # Available modules
     MODULES = {
         "delinquency": DelinquencyFeatureEngine,
-        "payment": PaymentFeatureEngine
+        "payment": PaymentFeatureEngine,
+        "vintage": VintageFeatureEngine,
+        "interactions": InteractionFeatureEngine
         # Future modules will be added here:
         # "repayment_term_loan": RepaymentTermLoanFeatureEngine,
         # "utilization_revolving": UtilizationRevolvingFeatureEngine,
@@ -146,9 +150,20 @@ class BehavioralFeatureEngine:
         # Compute features from each module
         all_features = {}
 
+        # Build schema mappings from account_history keys
+        schema_mappings = {
+            "delinquency": {"account_id": "account_id", "date": "date", "dpd": "dpd"},
+            "payment": {"account_id": "account_id", "date": "date",
+                       "payment_amount": "payment_amount", "amount_due": "amount_due"}
+        }
+
         for feature_set in feature_sets:
+            # Skip interactions - computed after all base modules
+            if feature_set == "interactions":
+                continue
+
             # Check if data is available for this module
-            if feature_set not in account_history:
+            if feature_set not in account_history and feature_set != "vintage":
                 print(f"⚠️  No data provided for '{feature_set}' module. Skipping...")
                 continue
 
@@ -157,11 +172,20 @@ class BehavioralFeatureEngine:
 
             # Compute features
             try:
-                module_features = module.compute_features(
-                    account_history=account_history[feature_set],
-                    account_id=account_id,
-                    as_of_date=as_of_date
-                )
+                # Vintage module needs special handling
+                if feature_set == "vintage":
+                    module_features = module.compute_features(
+                        account_history=account_history,
+                        account_id=account_id,
+                        as_of_date=as_of_date,
+                        schema_mappings=schema_mappings
+                    )
+                else:
+                    module_features = module.compute_features(
+                        account_history=account_history[feature_set],
+                        account_id=account_id,
+                        as_of_date=as_of_date
+                    )
 
                 # Add prefix to avoid name collisions
                 prefixed_features = {
@@ -176,6 +200,22 @@ class BehavioralFeatureEngine:
                 print(f"❌ Error computing {feature_set} features: {str(e)}")
                 # Continue with other modules rather than failing completely
                 continue
+
+        # Compute interactions last (needs all base features)
+        if "interactions" in feature_sets:
+            try:
+                module = self._get_module("interactions")
+                interaction_features = module.compute_features(all_features)
+
+                # Add prefix
+                prefixed_interactions = {
+                    f"interactions.{key}": value
+                    for key, value in interaction_features.items()
+                }
+
+                all_features.update(prefixed_interactions)
+            except Exception as e:
+                print(f"❌ Error computing interaction features: {str(e)}")
 
         # Add global metadata
         all_features["bfe_version"] = self.VERSION
