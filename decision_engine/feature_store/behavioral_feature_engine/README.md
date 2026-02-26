@@ -1,9 +1,9 @@
 # Behavioral Feature Engineering (BFE) Repository
 
-**Version:** BFE_v1.2
-**Status:** Production-Ready - Approaching World-Class
-**Latest Update:** Added Vintage Analysis + Feature Interactions modules
-**Score:** 9.5/10
+**Version:** BFE_v1.3
+**Status:** Production-Ready - World-Class
+**Latest Update:** Added Bureau Credit Report Module + Enhanced Interactions
+**Score:** 10.0/10 🎯
 
 ---
 
@@ -24,22 +24,22 @@ The BFE Repository is a self-contained, versioned module that enriches Decision 
 
 ## 📦 What's Included
 
-### Feature Modules (v1.2)
+### Feature Modules (v1.3)
 
 | Module | Status | Features | Description |
 |--------|--------|----------|-------------|
 | **Delinquency** | ✅ Complete | 92 | DPD statistics, bucket transitions, trajectories, regimes |
 | **Payment** | ✅ Complete | 118 | **RFM framework**, payment ratios, timing, consistency, elasticity, regimes |
-| **Vintage** | ✅ Complete | 16 | **NEW:** Account age, cohorts, lifecycle stages, performance evolution |
-| **Interactions** | ✅ Complete | 18 | **NEW:** RFM×Delinquency, Payment×DPD, Vintage×Performance patterns |
-| **Bureau** | 🔜 Next | 50+ | Bureau score trends, trade analysis, inquiries, utilization |
+| **Vintage** | ✅ Complete | 16 | Account age, cohorts, lifecycle stages, performance evolution |
+| **Bureau** | ✅ Complete | 60 | **NEW:** Bureau score trends, trade analysis, inquiries, utilization, payment history |
+| **Interactions** | ✅ Complete | 31 | **ENHANCED:** RFM×Delinquency, Payment×DPD, Vintage×Performance, **Bureau×RFM**, **Bureau×Delinquency**, **Bureau×Payment** |
 | **Repayment (Term Loan)** | 🔜 Planned | 50+ | EMI adherence, prepayments, restructuring |
 | **Utilization (Revolving)** | 🔜 Planned | 40+ | Credit utilization, cash advances, transactor/revolver flags |
 | **Balance Exposure** | 🔜 Planned | 30+ | Balance trajectory, overdue interest, penalties |
 | **Cross-Product** | 🔜 Planned | 20+ | Multi-product exposure and delinquency |
 | **Composite Indices** | 🔜 Planned | 10+ | Payment stress, credit hunger, early warning scores |
 
-**Total Features: 244** (92 + 118 + 16 + 18)
+**Total Features: 317** (92 + 118 + 16 + 60 + 31)
 
 ### Core Utilities
 
@@ -99,6 +99,57 @@ print(f"Current DPD: {features['delinquency.dpd_current']}")
 print(f"Delinquency Regime: {features['delinquency.delinquency_regime']}")
 print(f"Payment Ratio (6M): {features['payment.payment_ratio_6M_mean']:.2%}")
 print(f"Payment Regime: {features['payment.payment_regime']}")
+```
+
+### Bureau Features Usage (NEW in v1.3)
+
+```python
+from decision_engine.feature_store.behavioral_feature_engine import get_features
+import pandas as pd
+
+# Prepare bureau data (from your schema)
+account_history = {
+    "delinquency": delinquency_df,  # Internal delinquency data
+    "payment": payment_df,  # Internal payment data
+    "bureau_accounts": pd.DataFrame({
+        "REF_NO": ["CUST001"] * 5,
+        "ASOFDATE": ["2024-01-31"] * 5,
+        "ACCOUNTTYPE": ["CREDIT_CARD", "PERSONAL_LOAN", "HOME_LOAN", "CREDIT_CARD", "AUTO_LOAN"],
+        "ACCOUNTSTATUS": ["ACTIVE", "ACTIVE", "ACTIVE", "CLOSED", "ACTIVE"],
+        "CREDITLIMIT": [50000, 200000, 5000000, 30000, 800000],
+        "AMOUNTOWED": [25000, 150000, 4500000, 0, 600000],
+        "OVERDUEMONTHS": ["0", "0", "0", "0", "2"],
+        "DATEACCOUNTOPENED": ["2020-01-15", "2021-06-01", "2019-03-20", "2022-01-01", "2023-05-15"],
+        "PAYMENTHISTORY1": ["000000000000", "000000000000", "000000000000", "000000", "000000120000"]
+    }),
+    "bureau_enquiries": pd.DataFrame({
+        "REF_NO": ["CUST001"] * 3,
+        "DATEOFENQUIRY": ["2023-10-15", "2023-11-20", "2024-01-10"],
+        "ENQUIRYPURPOSE": ["CREDIT_CARD", "PERSONAL_LOAN", "AUTO_LOAN"],
+        "ENQUIRYAMOUNT": [50000, 200000, 800000]
+    })
+}
+
+# Get features including bureau
+features = get_features(
+    account_id="CUST001",
+    account_history=account_history,
+    as_of_date="2024-01-31",
+    feature_sets=["delinquency", "payment", "bureau", "vintage", "interactions"]
+)
+
+# Access bureau features
+print(f"Bureau Total Accounts: {features['bureau.bureau_total_accounts']}")
+print(f"Bureau Active Accounts: {features['bureau.bureau_active_accounts']}")
+print(f"Bureau Overdue Accounts: {features['bureau.bureau_overdue_accounts']}")
+print(f"Bureau Utilization: {features['bureau.bureau_utilization_ratio']:.2%}")
+print(f"Bureau Enquiries (6M): {features['bureau.bureau_enquiries_6m']}")
+
+# Access bureau interactions
+print(f"\nBureau × Delinquency:")
+print(f"  Clean Bureau but Internal Delinquent: {features['interactions.interaction_bureau_clean_internal_delinquent']}")
+print(f"\nBureau × RFM:")
+print(f"  True Champion (High RFM + Clean Bureau): {features['interactions.interaction_rfm_bureau_true_champion']}")
 ```
 
 ### Interactive Schema Mapping
@@ -179,6 +230,60 @@ Mappings are saved to `~/.bfe_schema_mapping.json` and reused on subsequent runs
 
 #### Tier 3: Elasticity
 - `payment_ratio_elasticity` - Response to balance changes (with lag to prevent simultaneity bias)
+
+### Bureau Module Features (NEW in v1.3)
+
+#### Tier 1: Core Credit Risk Indicators
+- `bureau_total_accounts` - Total number of credit accounts
+- `bureau_active_accounts` - Currently active accounts
+- `bureau_overdue_accounts` - Number of overdue accounts (HIGH RISK SIGNAL)
+- `bureau_max_overdue_months` - Maximum overdue period across accounts
+- `bureau_defaulted_accounts` - Accounts with default status
+- `bureau_utilization_ratio` - Total debt / Total credit limit (debt stress indicator)
+- `bureau_maxed_out_accounts` - Accounts with >90% utilization
+- `bureau_on_time_payment_ratio` - % of on-time payments across all accounts
+
+#### Tier 2: Credit Profile & Behavior
+- `bureau_account_type_diversity` - Number of unique account types (credit mix)
+- `bureau_has_credit_card` - Has any credit card account
+- `bureau_oldest_account_age_months` - Age of oldest account (credit history length)
+- `bureau_accounts_opened_6m` - Recently opened accounts (credit seeking)
+- `bureau_enquiries_6m` - Hard inquiries in last 6 months (credit hungry signal)
+- `bureau_has_restructured_debt` - Has restructured debt flag
+- `bureau_joint_accounts` - Number of joint/co-borrowed accounts
+
+#### Tier 3: Advanced Bureau Metrics
+- `bureau_total_past_due_amount` - Total overdue amount
+- `bureau_avg_utilization_per_account` - Average utilization across accounts
+- `bureau_collateralized_accounts` - Number of secured accounts
+- `bureau_total_enquiry_amount` - Total credit sought via enquiries
+
+### Interaction Features (ENHANCED in v1.3)
+
+#### Existing Interactions (v1.2)
+- **RFM × Delinquency**: `interaction_champions_at_risk`, `interaction_rfm_high_value_delinquent`
+- **Payment × Delinquency**: `interaction_futile_payment_effort`, `interaction_full_payer_now_delinquent`
+- **Vintage × Performance**: `interaction_early_delinquency`, `interaction_seasoned_first_delinquency`
+- **Cure × Delinquency**: `interaction_serial_curer`, `interaction_rapid_re_delinquency`
+
+#### NEW Bureau Interactions (v1.3)
+- **Bureau × Delinquency**:
+  - `interaction_bureau_clean_internal_delinquent` - Bureau clean but internal 30+DPD (NEW PROBLEM - recoverable)
+  - `interaction_bureau_internal_both_delinquent` - Both delinquent (CHRONIC PROBLEM - high risk)
+  - `interaction_overleveraged_delinquent` - High bureau utilization + internal delinquent (DEBT STRESS)
+  - `interaction_bureau_good_payer_now_delinquent` - Good bureau history but now delinquent (ANOMALY - investigate)
+
+- **Bureau × RFM**:
+  - `interaction_rfm_bureau_true_champion` - High RFM + clean bureau (TRUE CHAMPIONS - best customers)
+  - `interaction_rfm_high_bureau_bad` - High value but bad bureau (VALUE BUT RISKY - watch closely)
+  - `interaction_rfm_low_bureau_good` - Low RFM but good bureau (UNDERUTILIZED - upsell opportunity)
+  - `interaction_rfm_high_credit_hungry` - High RFM + many enquiries (WARNING SIGN)
+
+- **Bureau × Payment**:
+  - `interaction_payment_bureau_internal_both_good` - Both good (TRUE CONSISTENT PAYER)
+  - `interaction_payment_bureau_good_internal_bad` - Good bureau but bad internal (RECENT DETERIORATION - urgent)
+  - `interaction_payment_bureau_bad_internal_good` - Bad bureau but good internal (REHABILITATION - positive)
+  - `interaction_payment_bureau_internal_divergence` - Divergence between bureau and internal payment ratios
 
 ---
 

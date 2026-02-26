@@ -38,9 +38,10 @@ from .modules import DelinquencyFeatureEngine, PaymentFeatureEngine
 from .modules import get_delinquency_metadata, get_payment_metadata
 from .modules.vintage import VintageFeatureEngine
 from .modules.interactions import InteractionFeatureEngine
+from .modules.bureau import BureauFeatureEngine
 
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __author__ = "Decision Engine Team"
 
 
@@ -52,19 +53,19 @@ class BehavioralFeatureEngine:
     Decision Engine integration.
     """
 
-    VERSION = "BFE_v1.2"
+    VERSION = "BFE_v1.3"
 
     # Available modules
     MODULES = {
         "delinquency": DelinquencyFeatureEngine,
         "payment": PaymentFeatureEngine,
         "vintage": VintageFeatureEngine,
+        "bureau": BureauFeatureEngine,
         "interactions": InteractionFeatureEngine
         # Future modules will be added here:
         # "repayment_term_loan": RepaymentTermLoanFeatureEngine,
         # "utilization_revolving": UtilizationRevolvingFeatureEngine,
         # "balance_exposure": BalanceExposureFeatureEngine,
-        # "bureau": BureauFeatureEngine,
         # "cross_product": CrossProductFeatureEngine,
         # "composite_indices": CompositeIndicesFeatureEngine
     }
@@ -163,7 +164,7 @@ class BehavioralFeatureEngine:
                 continue
 
             # Check if data is available for this module
-            if feature_set not in account_history and feature_set != "vintage":
+            if feature_set not in account_history and feature_set not in ["vintage", "bureau"]:
                 print(f"⚠️  No data provided for '{feature_set}' module. Skipping...")
                 continue
 
@@ -172,8 +173,8 @@ class BehavioralFeatureEngine:
 
             # Compute features
             try:
-                # Vintage module needs special handling
-                if feature_set == "vintage":
+                # Vintage and Bureau modules need special handling (use schema_mappings)
+                if feature_set in ["vintage", "bureau"]:
                     module_features = module.compute_features(
                         account_history=account_history,
                         account_id=account_id,

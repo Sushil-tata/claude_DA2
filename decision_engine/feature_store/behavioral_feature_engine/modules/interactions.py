@@ -4,7 +4,7 @@ Feature Interactions Module - Non-Linear Behavioral Patterns
 Captures interactions between feature domains that reveal important patterns
 not visible when looking at features independently.
 
-Version: BFE_v1.2
+Version: BFE_v1.3
 Author: Behavioral Feature Engineering Team
 """
 
@@ -20,15 +20,18 @@ logger = logging.getLogger(__name__)
 class InteractionFeatureEngine:
     """
     Generate interaction features across behavioral domains.
-    
+
     Key interaction types:
     1. RFM × Delinquency: High-value customers behaving badly (anomalies)
     2. Payment × Delinquency: Payment effort vs delinquency outcomes
     3. Vintage × Performance: Early vs late delinquency patterns
     4. Cure × Delinquency: Recovery propensity patterns
+    5. Bureau × Delinquency: External vs internal credit behavior (NEW in v1.3)
+    6. Bureau × RFM: Credit profile vs customer value (NEW in v1.3)
+    7. Bureau × Payment: Bureau history vs internal payment behavior (NEW in v1.3)
     """
-    
-    VERSION = "BFE_v1.2"
+
+    VERSION = "BFE_v1.3"
     MODULE_NAME = "bfe.interactions"
     
     def __init__(self):
@@ -62,7 +65,16 @@ class InteractionFeatureEngine:
         
         # Cure × Delinquency interactions
         features.update(self._compute_cure_delinquency_interactions(base_features))
-        
+
+        # Bureau × Delinquency interactions (NEW in v1.3)
+        features.update(self._compute_bureau_delinquency_interactions(base_features))
+
+        # Bureau × RFM interactions (NEW in v1.3)
+        features.update(self._compute_bureau_rfm_interactions(base_features))
+
+        # Bureau × Payment interactions (NEW in v1.3)
+        features.update(self._compute_bureau_payment_interactions(base_features))
+
         return features
     
     def _compute_rfm_delinquency_interactions(
@@ -264,7 +276,165 @@ class InteractionFeatureEngine:
         ) if (cure_flag_12M is not np.nan and not np.isnan(dpd_current)) else np.nan
         
         return features
-    
+
+    def _compute_bureau_delinquency_interactions(
+        self,
+        base_features: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Compute Bureau × Delinquency interaction features.
+
+        Key insights:
+        - Bureau clean + Internal delinquent = New problem (high recovery potential)
+        - Bureau delinquent + Internal clean = Improving (positive sign)
+        - Both delinquent = Chronic problem (high risk)
+        - Bureau utilization high + Internal delinquent = Overleveraged
+        """
+        features = {}
+
+        # Get bureau features
+        bureau_overdue = base_features.get("bureau.bureau_overdue_accounts", 0)
+        bureau_utilization = base_features.get("bureau.bureau_utilization_ratio", np.nan)
+        bureau_on_time_ratio = base_features.get("bureau.bureau_on_time_payment_ratio", np.nan)
+
+        # Get internal delinquency features
+        dpd_current = base_features.get("delinquency.dpd_current", np.nan)
+        delinq_regime = base_features.get("delinquency.delinquency_regime", "UNKNOWN")
+
+        # Interaction 1: Bureau clean but internal delinquent (new problem - recoverable)
+        features["interaction_bureau_clean_internal_delinquent"] = (
+            bureau_overdue == 0 and dpd_current >= 30
+        ) if not np.isnan(dpd_current) else np.nan
+
+        # Interaction 2: Bureau delinquent but internal clean (improving)
+        features["interaction_bureau_bad_internal_clean"] = (
+            bureau_overdue > 0 and dpd_current < 30
+        ) if not np.isnan(dpd_current) else np.nan
+
+        # Interaction 3: Both delinquent (chronic problem - high risk)
+        features["interaction_bureau_internal_both_delinquent"] = (
+            bureau_overdue > 0 and dpd_current >= 30
+        ) if not np.isnan(dpd_current) else np.nan
+
+        # Interaction 4: High bureau utilization + Internal delinquent (overleveraged)
+        features["interaction_overleveraged_delinquent"] = (
+            bureau_utilization > 0.70 and dpd_current >= 30
+        ) if (not np.isnan(bureau_utilization) and not np.isnan(dpd_current)) else np.nan
+
+        # Interaction 5: Good bureau payment history but now internal delinquent (anomaly)
+        features["interaction_bureau_good_payer_now_delinquent"] = (
+            bureau_on_time_ratio >= 0.90 and dpd_current >= 30
+        ) if (not np.isnan(bureau_on_time_ratio) and not np.isnan(dpd_current)) else np.nan
+
+        return features
+
+    def _compute_bureau_rfm_interactions(
+        self,
+        base_features: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Compute Bureau × RFM interaction features.
+
+        Key insights:
+        - High RFM + Good bureau = Best customers (champions with clean credit)
+        - High RFM + Bad bureau = High value but risky (watch closely)
+        - Low RFM + Good bureau = Underutilized potential
+        - Low RFM + Bad bureau = Low value high risk (collections priority)
+        """
+        features = {}
+
+        # Get RFM features
+        rfm_score = base_features.get("payment.rfm_composite_score", np.nan)
+        rfm_segment = base_features.get("payment.rfm_segment", "UNKNOWN")
+
+        # Get bureau features
+        bureau_overdue = base_features.get("bureau.bureau_overdue_accounts", 0)
+        bureau_utilization = base_features.get("bureau.bureau_utilization_ratio", np.nan)
+        bureau_enquiries_6m = base_features.get("bureau.bureau_enquiries_6m", 0)
+
+        # Interaction 1: High RFM + Clean bureau (true champions)
+        features["interaction_rfm_bureau_true_champion"] = (
+            rfm_segment == "HIGH_VALUE" and bureau_overdue == 0
+        )
+
+        # Interaction 2: High RFM + Bad bureau (value but risky)
+        features["interaction_rfm_high_bureau_bad"] = (
+            rfm_segment == "HIGH_VALUE" and bureau_overdue > 0
+        )
+
+        # Interaction 3: Low RFM + Good bureau (underutilized - upsell opportunity)
+        features["interaction_rfm_low_bureau_good"] = (
+            rfm_segment in ["LOW_VALUE", "VERY_LOW_VALUE"] and bureau_overdue == 0
+        )
+
+        # Interaction 4: High RFM + High bureau utilization (overleveraged champion - risk)
+        features["interaction_rfm_high_overleveraged"] = (
+            rfm_score >= 12 and bureau_utilization > 0.80
+        ) if (not np.isnan(rfm_score) and not np.isnan(bureau_utilization)) else np.nan
+
+        # Interaction 5: High RFM + Credit hungry (many recent enquiries - warning sign)
+        features["interaction_rfm_high_credit_hungry"] = (
+            rfm_score >= 12 and bureau_enquiries_6m >= 3
+        ) if not np.isnan(rfm_score) else np.nan
+
+        return features
+
+    def _compute_bureau_payment_interactions(
+        self,
+        base_features: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Compute Bureau × Payment interaction features.
+
+        Key insights:
+        - Good bureau payment + Good internal payment = Consistent payer
+        - Good bureau + Bad internal payment = Recent deterioration (investigate)
+        - Bad bureau + Good internal payment = Rehabilitation (positive trend)
+        - Payment ratios diverging = Different behavior patterns
+        """
+        features = {}
+
+        # Get payment features
+        payment_ratio_6m = base_features.get("payment.payment_ratio_6M_mean", np.nan)
+        payment_regime = base_features.get("payment.payment_regime", "UNKNOWN")
+
+        # Get bureau payment features
+        bureau_on_time_ratio = base_features.get("bureau.bureau_on_time_payment_ratio", np.nan)
+        bureau_missed = base_features.get("bureau.bureau_missed_payment_count", 0)
+
+        # Interaction 1: Good bureau + Good internal (true consistent payer)
+        features["interaction_payment_bureau_internal_both_good"] = (
+            bureau_on_time_ratio >= 0.85 and payment_ratio_6m >= 0.85
+        ) if (not np.isnan(bureau_on_time_ratio) and not np.isnan(payment_ratio_6m)) else np.nan
+
+        # Interaction 2: Good bureau + Bad internal (recent deterioration - urgent)
+        features["interaction_payment_bureau_good_internal_bad"] = (
+            bureau_on_time_ratio >= 0.85 and payment_ratio_6m < 0.70
+        ) if (not np.isnan(bureau_on_time_ratio) and not np.isnan(payment_ratio_6m)) else np.nan
+
+        # Interaction 3: Bad bureau + Good internal (rehabilitation - positive)
+        features["interaction_payment_bureau_bad_internal_good"] = (
+            bureau_on_time_ratio < 0.70 and payment_ratio_6m >= 0.85
+        ) if (not np.isnan(bureau_on_time_ratio) and not np.isnan(payment_ratio_6m)) else np.nan
+
+        # Interaction 4: Full payer internally + Bureau missed payments (investigation needed)
+        features["interaction_payment_full_payer_bureau_missed"] = (
+            payment_regime == "CONSISTENT_FULL_PAYER" and bureau_missed > 0
+        )
+
+        # Interaction 5: Payment behavior divergence (bureau vs internal)
+        if not np.isnan(bureau_on_time_ratio) and not np.isnan(payment_ratio_6m):
+            divergence = abs(bureau_on_time_ratio - payment_ratio_6m)
+            features["interaction_payment_bureau_internal_divergence"] = divergence
+
+            # Flag significant divergence (> 20 percentage points)
+            features["interaction_payment_significant_divergence"] = (divergence > 0.20)
+        else:
+            features["interaction_payment_bureau_internal_divergence"] = np.nan
+            features["interaction_payment_significant_divergence"] = np.nan
+
+        return features
+
     @staticmethod
     def get_feature_metadata() -> Dict[str, Dict[str, Any]]:
         """
