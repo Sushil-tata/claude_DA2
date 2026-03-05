@@ -21,6 +21,9 @@ from .config import (
     QualityConfig
 )
 
+# Schema adapter
+from .bureau_schema_adapter import BureauSchemaAdapter
+
 # Feature engines
 from .state_builder import StateBuilder
 from .trajectory_engine import TrajectoryEngine
@@ -70,6 +73,9 @@ __all__ = [
     "WindowConfig",
     "ThresholdConfig",
     "QualityConfig",
+
+    # Schema Adapter
+    "BureauSchemaAdapter",
 
     # Engines
     "StateBuilder",
