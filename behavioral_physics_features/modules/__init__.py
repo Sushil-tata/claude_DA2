@@ -30,6 +30,9 @@ from .trajectory_engine import TrajectoryEngine
 from .lender_ecology import LenderEcologyEngine
 from .repayment_dynamics import RepaymentDynamicsEngine
 from .enquiries_engine import EnquiriesEngine
+from .cardx_bureau_interactions import CardXBureauInteractionsEngine
+from .legal_actions import LegalActionsEngine
+from .tdr_restructuring import TDRRestructuringEngine
 
 # Registry and orchestration
 from .feature_registry import (
@@ -48,18 +51,24 @@ MODULES = {
     "lender_ecology": LenderEcologyEngine,
     "repayment_dynamics": RepaymentDynamicsEngine,
     "enquiries_engine": EnquiriesEngine,
+    "cardx_bureau_interactions": CardXBureauInteractionsEngine,
+    "legal_actions": LegalActionsEngine,
+    "tdr_restructuring": TDRRestructuringEngine,
     "feature_registry": FeatureRegistry,
     "main_pipeline": BehavioralPhysicsPipeline
 }
 
 # Feature counts by module
 FEATURE_COUNTS = {
-    "state_builder": 8,           # State and regime assignments
-    "trajectory_engine": 60,      # Velocity, acceleration, transitions, entropy
-    "lender_ecology": 25,         # Cross-lender dynamics
-    "repayment_dynamics": 35,     # NORMAL/STRESSED/delta features
-    "enquiries_engine": 12,       # Enquiry patterns
-    "total": 140
+    "state_builder": 8,                    # State and regime assignments
+    "trajectory_engine": 60,               # Velocity, acceleration, transitions, entropy
+    "lender_ecology": 25,                  # Cross-lender dynamics
+    "repayment_dynamics": 35,              # NORMAL/STRESSED/delta features
+    "enquiries_engine": 12,                # Enquiry patterns
+    "cardx_bureau_interactions": 20,       # CardX-Bureau interactions
+    "legal_actions": 18,                   # Legal status and settlements
+    "tdr_restructuring": 22,               # TDR/restructuring dynamics
+    "total": 200
 }
 
 __all__ = [
@@ -83,6 +92,9 @@ __all__ = [
     "LenderEcologyEngine",
     "RepaymentDynamicsEngine",
     "EnquiriesEngine",
+    "CardXBureauInteractionsEngine",
+    "LegalActionsEngine",
+    "TDRRestructuringEngine",
 
     # Registry
     "FeatureRegistry",
