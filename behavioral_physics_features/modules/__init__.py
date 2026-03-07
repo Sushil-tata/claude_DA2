@@ -21,8 +21,9 @@ from .config import (
     QualityConfig
 )
 
-# Schema adapter
+# Schema adapters
 from .bureau_schema_adapter import BureauSchemaAdapter
+from .cardx_schema_adapter import CardXSchemaAdapter
 
 # Feature engines
 from .state_builder import StateBuilder
@@ -83,8 +84,9 @@ __all__ = [
     "ThresholdConfig",
     "QualityConfig",
 
-    # Schema Adapter
+    # Schema Adapters
     "BureauSchemaAdapter",
+    "CardXSchemaAdapter",
 
     # Engines
     "StateBuilder",

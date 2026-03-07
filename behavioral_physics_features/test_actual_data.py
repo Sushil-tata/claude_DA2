@@ -126,42 +126,54 @@ def test_actual_bureau_data():
         return
 
     # ========================================================================
-    # STEP 3: Load/Mock CardX Internal Data
+    # STEP 3: Load CardX Internal Data with Proper Joins
     # ========================================================================
     print("\n" + "="*80)
     print("STEP 3: Loading CardX Internal Data...")
     print("-" * 80)
 
     try:
-        # TODO: Replace with your actual CardX table
-        # cardx_internal = spark.table("your_catalog.cardx_internal_monthly")
+        # Import CardX adapter
+        from behavioral_physics_features.modules.cardx_schema_adapter import CardXSchemaAdapter
 
-        # For testing: Create mock CardX data based on bureau customers
-        print("Creating mock CardX data for testing...")
-        print("(Replace this with actual CardX table in production)")
+        # Initialize CardX adapter
+        cardx_adapter = CardXSchemaAdapter(spark)
 
-        # Get unique customers from bureau
-        customer_months = bureau_trade.select("cust_id", "as_of_month").distinct()
+        # Load and adapt CardX data with proper joins
+        print("Loading CardX with join logic:")
+        print("  spl_acct_mthly → spl_ln_orig → mnf_cra_rvw_id_dummy → REF_NO")
 
-        # Create mock CardX data
-        cardx_internal = customer_months.withColumn(
-            "cardx_dpd", F.lit(0)  # Mock: no delinquency
-        ).withColumn(
-            "cardx_balance", F.lit(5000)  # Mock: 5000 balance
-        ).withColumn(
-            "cardx_credit_limit", F.lit(10000)  # Mock: 10000 limit
-        )
+        cardx_internal = cardx_adapter.load_and_adapt_cardx(catalog="cdx_mdz_prd")
 
-        print(f"✓ CardX internal (mock): {cardx_internal.count():,} rows")
+        print(f"✓ CardX internal adapted: {cardx_internal.count():,} rows")
+        print(f"✓ CardX customers: {cardx_internal.select('cust_id').distinct().count():,}")
 
-        print("\n⚠️  NOTE: Using mock CardX data. Replace with actual table:")
-        print("   cardx_internal = spark.table('your_catalog.cardx_internal_monthly')")
+        # Show sample
+        print("\nSample CardX data:")
+        cardx_internal.select(
+            "cust_id", "as_of_month", "cardx_dpd", "cardx_balance", "cardx_credit_limit"
+        ).show(5)
 
     except Exception as e:
         print(f"❌ Error loading CardX data: {e}")
+        print("\nFalling back to mock CardX data for testing...")
+
+        # Fallback: Create mock CardX data based on bureau customers
+        customer_months = bureau_trade.select("cust_id", "as_of_month").distinct()
+
+        cardx_internal = customer_months.withColumn(
+            "cardx_dpd", F.lit(0)
+        ).withColumn(
+            "cardx_balance", F.lit(5000)
+        ).withColumn(
+            "cardx_credit_limit", F.lit(10000)
+        )
+
+        print(f"✓ CardX internal (mock): {cardx_internal.count():,} rows")
+        print("\n⚠️  NOTE: Using mock CardX data due to error above")
+
         import traceback
         traceback.print_exc()
-        return
 
     # ========================================================================
     # STEP 4: Select As-of Month for Testing
