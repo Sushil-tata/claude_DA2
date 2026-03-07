@@ -71,6 +71,7 @@ class StateConfig:
 class LenderTypeConfig:
     """Lender type mapping configuration"""
     # Thailand-specific lender classification
+    # Categories based on Thai financial institution types
     LENDER_TYPE_MAPPING: Dict[str, List[str]] = None
 
     # CardX identification
@@ -78,55 +79,134 @@ class LenderTypeConfig:
 
     def __post_init__(self):
         if self.LENDER_TYPE_MAPPING is None:
-            # Map raw lender names/patterns to types
+            # Map raw lender names/patterns to Thai financial institution types
             self.LENDER_TYPE_MAPPING = {
-                "PSU_BANK": [
+                "SFI": [
+                    # Specialized Financial Institutions (สถาบันการเงินเฉพาะกิจ)
+                    # State-owned financial institutions with specific mandates
                     "GOVERNMENT SAVINGS BANK",
+                    "GSB",
+                    "ธนาคารออมสิน",
                     "BANK FOR AGRICULTURE",
+                    "BAAC",
+                    "ธ.ก.ส",
                     "GOVERNMENT HOUSING BANK",
+                    "GH BANK",
+                    "ธนาคารอาคารสงเคราะห์",
                     "SME BANK",
-                    "EXIM BANK"
+                    "SME DEVELOPMENT BANK",
+                    "ธนาคารพัฒนาวิสาหกิจขนาดกลางและขนาดย่อม",
+                    "EXIM BANK",
+                    "EXPORT-IMPORT BANK"
                 ],
-                "PRIVATE_BANK": [
+                "COMMERCIAL_BANK": [
+                    # Commercial Banks (ธนาคารพาณิชย์)
+                    # Thai and foreign commercial banks
                     "BANGKOK BANK",
+                    "BBL",
+                    "ธนาคารกรุงเทพ",
                     "KASIKORN",
-                    "SCB",
                     "KBANK",
+                    "K-BANK",
+                    "ธนาคารกสิกรไทย",
+                    "SCB",
+                    "SIAM COMMERCIAL",
+                    "ธนาคารไทยพาณิชย์",
+                    "KRUNG THAI",
+                    "KTB",
+                    "ธนาคารกรุงไทย",
                     "TMB",
+                    "THANACHART",
+                    "TMB THANACHART",
+                    "TTBBANK",
+                    "ธนาคารทหารไทยธนชาต",
+                    "KRUNGSRI",
+                    "BAY",
+                    "ธนาคารกรุงศรีอยุธยา",
                     "CIMB",
+                    "CIMB THAI",
                     "UOB",
+                    "UNITED OVERSEAS BANK",
                     "CITIBANK",
+                    "CITI",
                     "HSBC",
-                    "STANDARD CHARTERED"
+                    "STANDARD CHARTERED",
+                    "SC",
+                    "TISCO",
+                    "ธนาคารทิสโก้"
+                ],
+                "PERSONAL_LOAN": [
+                    # Personal Loan Companies (บริษัทสินเชื่อส่วนบุคคล)
+                    # Non-bank personal loan providers
+                    "MUANG THAI",
+                    "MUANGTHAI",
+                    "มิวแทค",
+                    "EASY BUY",
+                    "อีซี่บาย",
+                    "KRUNGSRI CONSUMER",
+                    "FIRST CHOICE",
+                    "เฟิร์สช้อยส์",
+                    "MONEY TREE",
+                    "PROMISE",
+                    "พรอมิส",
+                    "ACOM",
+                    "AIFUL"
+                ],
+                "LEASING": [
+                    # Leasing & Hire Purchase (บริษัทลิสซิ่ง)
+                    # Auto leasing and hire purchase companies
+                    "GE CAPITAL",
+                    "TOYOTA LEASING",
+                    "HONDA LEASING",
+                    "NISSAN LEASING",
+                    "ISUZU LEASING",
+                    "KRUNGSRI AUTO",
+                    "KRUNGTHAI LEASING",
+                    "BANGKOK CAPITAL",
+                    "SIAM CITY LEASING",
+                    "THANACHART CAPITAL"
                 ],
                 "FINTECH": [
+                    # Fintech & Digital Lenders (ฟินเทค)
+                    # Digital lending platforms and BNPL
                     "RABBIT FINANCE",
+                    "RABBIT LENDING",
                     "AEON",
+                    "อิออน",
                     "MONIX",
                     "KREDIVO",
                     "ATOME",
                     "SHOPEE",
+                    "SPAYLATER",
                     "LAZADA",
-                    "GRAB"
-                ],
-                "CONSUMER_FINANCE": [
-                    "MUANG THAI",
-                    "EASY BUY",
-                    "KRUNGSRI CONSUMER",
-                    "GE CAPITAL",
-                    "TOYOTA LEASING"
+                    "LAZPAYLATER",
+                    "GRAB",
+                    "GRABPAY",
+                    "TRUEMONEY",
+                    "LINE BK",
+                    "SCBX",
+                    "FINNOMENA"
                 ]
             }
 
         if self.CARDX_LENDER_IDS is None:
-            # Replace with actual CardX lender IDs
+            # Replace with actual CardX lender IDs from your data
             self.CARDX_LENDER_IDS = ["CARDX", "CARDX_LENDER_ID"]
 
     def map_lender_type(self, lender_name_raw: str, lender_id: str) -> str:
         """
-        Map raw lender name to standard type.
+        Map raw lender name to Thai financial institution type.
 
-        Returns: PSU_BANK, PRIVATE_BANK, FINTECH, CONSUMER_FINANCE, CARDX, OTHER
+        Returns: SFI, COMMERCIAL_BANK, PERSONAL_LOAN, LEASING, FINTECH, CARDX, OTHER
+
+        Thai Categories:
+        - SFI: Specialized Financial Institutions (สถาบันการเงินเฉพาะกิจ)
+        - COMMERCIAL_BANK: Commercial Banks (ธนาคารพาณิชย์)
+        - PERSONAL_LOAN: Personal Loan Companies (บริษัทสินเชื่อส่วนบุคคล)
+        - LEASING: Leasing/Hire Purchase (บริษัทลิสซิ่ง)
+        - FINTECH: Fintech/Digital Lenders (ฟินเทค)
+        - CARDX: Internal CardX lender
+        - OTHER: Unclassified
         """
         # Check if CardX
         if lender_id in self.CARDX_LENDER_IDS:

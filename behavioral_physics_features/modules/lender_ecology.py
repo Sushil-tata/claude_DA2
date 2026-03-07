@@ -5,10 +5,18 @@ Lender Ecology Engine - Cross-Lender Dynamics & CardX Interactions
 Thailand-specific lender classification and diffusion analysis.
 
 Features:
-- Lender type exposure (PSU/Private/Fintech/Consumer Finance/CardX)
+- Lender type exposure (SFI/Commercial Bank/Personal Loan/Leasing/Fintech/CardX)
 - Lender concentration (HHI)
 - Cross-lender diffusion (synchronized delinquency)
 - CardX vs Others analysis
+
+Thai Financial Institution Categories:
+- SFI: Specialized Financial Institutions (สถาบันการเงินเฉพาะกิจ)
+- COMMERCIAL_BANK: Commercial Banks (ธนาคารพาณิชย์)
+- PERSONAL_LOAN: Personal Loan Companies (บริษัทสินเชื่อส่วนบุคคล)
+- LEASING: Leasing/Hire Purchase (บริษัทลิสซิ่ง)
+- FINTECH: Fintech/Digital Lenders (ฟินเทค)
+- CARDX: Internal CardX lender
 
 Author: Behavioral Physics Team
 Version: 1.0.0
@@ -98,15 +106,17 @@ class LenderEcologyEngine:
 
     def _compute_exposure_shares(self, typed_df: DataFrame) -> DataFrame:
         """
-        Exposure share by lender type.
+        Exposure share by lender type (Thai financial institution categories).
 
         Features:
-        - psu_bank_balance_share
-        - private_bank_balance_share
-        - fintech_balance_share
-        - consumer_finance_balance_share
-        - cardx_balance_share
-        - psu_bank_limit_share
+        - sfi_balance_share (Specialized Financial Institutions)
+        - commercial_bank_balance_share (Commercial Banks)
+        - personal_loan_balance_share (Personal Loan Companies)
+        - leasing_balance_share (Leasing/Hire Purchase)
+        - fintech_balance_share (Fintech/Digital Lenders)
+        - cardx_balance_share (CardX)
+        - sfi_limit_share
+        - commercial_bank_limit_share
         - fintech_limit_share
         - cardx_limit_share
         """
@@ -147,7 +157,8 @@ class LenderEcologyEngine:
         )
 
         # Calculate balance shares
-        lender_types = ["PSU_BANK", "PRIVATE_BANK", "FINTECH", "CONSUMER_FINANCE", "CARDX"]
+        # Thai financial institution types
+        lender_types = ["SFI", "COMMERCIAL_BANK", "PERSONAL_LOAN", "LEASING", "FINTECH", "CARDX"]
 
         for ltype in lender_types:
             # Balance share

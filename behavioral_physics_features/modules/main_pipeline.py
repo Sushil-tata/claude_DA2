@@ -179,8 +179,10 @@ class BehavioralPhysicsPipeline:
         Only use data available as of the as_of_month.
         """
         # Filter bureau trade
+        # Allow rows with null receive_dt (payment history) OR receive_dt <= as_of_month (history table)
         bureau_trade_filtered = bureau_trade_df.filter(
-            F.col("as_of_month") <= F.lit(as_of_month)
+            F.col("receive_dt").isNull() |
+            (F.col("receive_dt") <= F.last_day(F.to_date(F.lit(as_of_month), "yyyy-MM-dd")))
         )
 
         # Filter cardx internal

@@ -36,7 +36,7 @@ class BureauSchemaAdapter:
         "ACCOUNTNUMBER": "account_id",
         "ASOFDATE": "as_of_month",
         "MEMBERSHORTNAME": "lender_name",
-        "MEMBERCODE": "lender_code",
+        "MEMBERCODE": "lender_id",  # Changed from lender_code to lender_id
         "ACCOUNTTYPE": "account_type",
         "CREDITLIMIT": "credit_limit",
         "AMOUNTOWED": "balance",
@@ -57,6 +57,8 @@ class BureauSchemaAdapter:
     HISTORY_SCHEMA_MAP = {
         "REF_NO": "cust_id",
         "ASOFDATE": "as_of_month",
+        "RECEIVE_DT": "receive_dt",
+        "DL_DATA_DT": "dl_data_dt",
         "CREDITLIMIT": "credit_limit",
         "AMOUNTOWED": "balance",
         "OVERDUEMONTHS": "dpd_bucket",
@@ -69,10 +71,10 @@ class BureauSchemaAdapter:
         "ENQUIRYPURPOSE": "enquiry_purpose",
         "ENQUIRYAMOUNT": "enquiry_amount",
         "MEMBERSHORTNAME": "lender_name",
-        "MEMBERCODE": "lender_code",
+        "MEMBERCODE": "lender_id",  # Changed from lender_code to lender_id
     }
 
-    # DPD bucket to numeric mapping
+    # DPD bucket to numeric mapping (for behavioral physics features)
     DPD_BUCKET_MAP = {
         "000": 0,
         "001": 15,   # 1-30 days → midpoint 15
@@ -86,6 +88,19 @@ class BureauSchemaAdapter:
         "SUB": 45,   # Substandard
         "DBT": 120,  # Doubtful
         "LSS": 270,  # Loss
+    }
+
+    # DPD bucket to ordinal mapping (for scorecard WOE binning)
+    # Preserves natural risk categories without midpoint conversion
+    DPD_BUCKET_ORDINAL_MAP = {
+        "000": 0,    # Current (0 DPD)
+        "001": 1,    # 1-30 DPD
+        "030": 2,    # 31-60 DPD
+        "060": 3,    # 61-90 DPD
+        "090": 4,    # 91-150 DPD
+        "150": 5,    # 151-180 DPD
+        "180": 6,    # 181+ DPD
+        # Note: "XXX" (not reported) maps to null, not 0
     }
 
     def __init__(self, spark: SparkSession):
@@ -127,7 +142,7 @@ class BureauSchemaAdapter:
         # Use history as primary source for monthly snapshots
         # Enrich with account master attributes
         account_static = account_mapped.select(
-            "cust_id", "account_id", "lender_name", "account_type",
+            "cust_id", "account_id", "lender_name", "lender_id", "account_type",
             "account_open_date", "account_close_date", "last_tdr_date",
             "emi_amount", "tenure_months"
         ).dropDuplicates(["cust_id", "account_id"])
@@ -168,9 +183,52 @@ class BureauSchemaAdapter:
                 F.col("has_tdr") == 1,
                 F.months_between(F.col("as_of_month"), F.col("last_tdr_date"))
             )
+        ).withColumn(
+            # Mark history table rows for differentiation
+            "source", F.lit("history_table")
+        ).withColumn(
+            # Reporting gap features (null for history table - only from payment history)
+            "has_reporting_gap", F.lit(None).cast("int")
+        ).withColumn(
+            "reporting_gap_count_12m", F.lit(None).cast("int")
         )
 
-        print(f"✓ Adapted bureau trade data: {bureau_trade.count()} rows")
+        # 9. Extend DPD time series with payment history (PAYMENTHISTORY1/2)
+        # This adds up to 48 months of historical DPD data for months
+        # not covered by the history table
+        try:
+            payment_history_snapshots = self.create_monthly_snapshots_from_payment_history(account_df)
+
+            # Get existing (cust_id, account_id, as_of_month) combinations from history
+            existing_months = bureau_trade.select("cust_id", "account_id", "as_of_month").distinct()
+
+            # Filter payment history to only NEW months (extend backwards)
+            # Use anti-join to exclude months already in history table
+            extended_months = payment_history_snapshots.join(
+                existing_months,
+                on=["cust_id", "account_id", "as_of_month"],
+                how="left_anti"
+            )
+
+            extended_rows = extended_months.count()
+
+            if extended_rows > 0:
+                # Union with existing bureau_trade
+                # Align schemas by adding missing columns with nulls
+                bureau_trade = bureau_trade.unionByName(
+                    extended_months,
+                    allowMissingColumns=True
+                )
+
+                print(f"✓ Extended DPD time series: added {extended_rows:,} payment history rows")
+            else:
+                print(f"✓ No additional payment history months to add (history table has full coverage)")
+
+        except Exception as e:
+            print(f"⚠️  Warning: Could not parse payment history: {e}")
+            print(f"   Continuing with history table only ({bureau_trade.count():,} rows)")
+
+        print(f"✓ Adapted bureau trade data: {bureau_trade.count():,} rows")
 
         return bureau_trade
 
@@ -217,30 +275,54 @@ class BureauSchemaAdapter:
         # Add unmapped columns that might be useful
         for col in df.columns:
             if col not in schema_map and col not in ["SEGMENT", "TAG", "CHECK_D",
-                                                       "CHECK_T", "RECEIVE_DT",
-                                                       "DL_LOAD_TS", "DL_DATA_DT"]:
+                                                       "CHECK_T", "DL_LOAD_TS"]:
                 select_expr.append(F.col(col))
 
         return df.select(*select_expr)
 
     def _convert_dpd_bucket(self, df: DataFrame) -> DataFrame:
         """
-        Convert DPD bucket (e.g., '030', '060') to numeric DPD.
+        Convert DPD bucket to both numeric DPD and ordinal category.
+
+        Creates two columns:
+        - dpd: Numeric midpoint (for behavioral physics features)
+        - dpd_bucket_ordinal: Ordinal 0-6 (for scorecard WOE binning)
 
         OVERDUEMONTHS format: '030' = 31-60 days, '060' = 61-90 days, etc.
+
+        Special handling:
+        - "XXX" (not reported) → null for both dpd and dpd_bucket_ordinal
+        - null → 0 (assume current if no data)
         """
-        # Create mapping UDF
-        dpd_map_expr = F.when(F.col("dpd_bucket").isNull(), 0)
+        # Create numeric DPD mapping (midpoints for velocity/acceleration)
+        # "XXX" (not reported) should map to null, not 0
+        dpd_map_expr = F.when(F.col("dpd_bucket") == "XXX", F.lit(None).cast("int"))
+        dpd_map_expr = dpd_map_expr.when(F.col("dpd_bucket").isNull(), 0)
 
         for bucket, dpd_value in self.DPD_BUCKET_MAP.items():
             dpd_map_expr = dpd_map_expr.when(
                 F.col("dpd_bucket") == bucket, dpd_value
             )
 
-        # Default to 0 if bucket not recognized
+        # Default to 0 if bucket not recognized (but not XXX)
         dpd_map_expr = dpd_map_expr.otherwise(0)
 
         df = df.withColumn("dpd", dpd_map_expr)
+
+        # Create ordinal DPD mapping (0-6 categories for WOE binning)
+        # "XXX" (not reported) should map to null, not 0
+        dpd_ordinal_expr = F.when(F.col("dpd_bucket") == "XXX", F.lit(None).cast("int"))
+        dpd_ordinal_expr = dpd_ordinal_expr.when(F.col("dpd_bucket").isNull(), 0)
+
+        for bucket, ordinal_value in self.DPD_BUCKET_ORDINAL_MAP.items():
+            dpd_ordinal_expr = dpd_ordinal_expr.when(
+                F.col("dpd_bucket") == bucket, ordinal_value
+            )
+
+        # Default to 0 if bucket not recognized (but not XXX)
+        dpd_ordinal_expr = dpd_ordinal_expr.otherwise(0)
+
+        df = df.withColumn("dpd_bucket_ordinal", dpd_ordinal_expr)
 
         return df
 
@@ -324,6 +406,39 @@ class BureauSchemaAdapter:
             parse_udf(F.col("payment_history_1"))
         )
 
+        # Add reporting gap features (account-level)
+        # has_reporting_gap = 1 if "XXX" exists anywhere in payment history
+        df = df.withColumn(
+            "has_reporting_gap",
+            F.when(
+                F.col("payment_history_1").contains("XXX"),
+                1
+            ).otherwise(0)
+        )
+
+        # reporting_gap_count_12m = count of "XXX" in last 12 positions (most recent 12 months)
+        # UDF to count "XXX" in last 12 positions
+        def count_xxx_in_last_12_udf(payment_history_str):
+            """Count 'XXX' in last 12 3-char segments (most recent 12 months)"""
+            if not payment_history_str or len(payment_history_str) < 3:
+                return 0
+
+            # Get last 36 characters (12 segments * 3 chars each)
+            last_12_months = payment_history_str[-36:] if len(payment_history_str) >= 36 else payment_history_str
+
+            # Split into 3-character chunks
+            chunks = [last_12_months[i:i+3] for i in range(0, len(last_12_months), 3)]
+
+            # Count "XXX" occurrences
+            return sum(1 for chunk in chunks if chunk == "XXX")
+
+        count_xxx_udf = F.udf(count_xxx_in_last_12_udf, "int")
+
+        df = df.withColumn(
+            "reporting_gap_count_12m",
+            count_xxx_udf(F.col("payment_history_1"))
+        )
+
         # Explode array with position (month offset)
         df = df.withColumn(
             "month_data",
@@ -343,19 +458,30 @@ class BureauSchemaAdapter:
             )
         )
 
-        # Convert DPD bucket to numeric
+        # Convert DPD bucket to numeric and ordinal
         df = self._convert_dpd_bucket(df)
 
-        # Select relevant columns
+        # Select relevant columns (DPD-only - no balance/credit_limit from payment strings)
         monthly_snapshots = df.select(
             "cust_id", "account_id", "as_of_month",
-            "lender_name", "account_type",
-            "dpd_bucket", "dpd",
-            "credit_limit", "balance",
-            "account_open_date", "last_tdr_date"
+            "lender_name", "lender_id", "account_type",
+            "dpd_bucket", "dpd", "dpd_bucket_ordinal",
+            "account_open_date", "last_tdr_date",
+            "has_reporting_gap",           # Account-level: 1 if any XXX in payment history
+            "reporting_gap_count_12m"      # Account-level: count of XXX in last 12 months
+        ).withColumn(
+            # Mark as payment history source (for debugging/validation)
+            "source", F.lit("payment_history")
+        ).withColumn(
+            # Nulls for balance/credit_limit (not available in payment strings)
+            "balance", F.lit(None).cast("double")
+        ).withColumn(
+            "credit_limit", F.lit(None).cast("double")
+        ).withColumn(
+            "utilization", F.lit(None).cast("double")
         )
 
-        print(f"✓ Created {monthly_snapshots.count()} monthly snapshots from payment history")
+        print(f"✓ Created {monthly_snapshots.count()} monthly DPD snapshots from payment history")
 
         return monthly_snapshots
 
@@ -427,13 +553,13 @@ if __name__ == "__main__":
     bureau_trade = adapter.adapt_bureau_trade_data(account_df, history_df)
     bureau_trade.select(
         "cust_id", "as_of_month", "dpd", "balance", "credit_limit",
-        "utilization", "lender_name"
+        "utilization", "lender_name", "lender_id"
     ).show()
 
     print("\n2. Testing Enquiry Adaptation:")
     bureau_enquiry = adapter.adapt_bureau_enquiry_data(enquiry_df)
     bureau_enquiry.select(
-        "cust_id", "enquiry_date", "enquiry_purpose", "lender_name"
+        "cust_id", "enquiry_date", "enquiry_purpose", "lender_name", "lender_id"
     ).show()
 
     print("\n3. Testing Payment History Parsing:")
@@ -450,5 +576,6 @@ if __name__ == "__main__":
     print("  - AMOUNTOWED → balance")
     print("  - CREDITLIMIT → credit_limit")
     print("  - MEMBERSHORTNAME → lender_name")
+    print("  - MEMBERCODE → lender_id")
 
     spark.stop()
