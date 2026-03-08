@@ -74,33 +74,46 @@ class BureauSchemaAdapter:
         "MEMBERCODE": "lender_id",  # Changed from lender_code to lender_id
     }
 
-    # DPD bucket to numeric mapping (for behavioral physics features)
+    # DPD bucket to numeric mapping (Thai classification only)
+    # Maps Thai DPD buckets to their midpoint values for feature engineering
     DPD_BUCKET_MAP = {
-        "000": 0,
-        "001": 15,   # 1-30 days → midpoint 15
-        "030": 45,   # 31-60 days → midpoint 45
-        "060": 75,   # 61-90 days → midpoint 75
-        "090": 120,  # 91-150 days → midpoint 120
-        "150": 165,  # 151-180 days → midpoint 165
-        "180": 270,  # 181+ days → 270
-        "XXX": 0,    # No data
-        "STD": 0,    # Standard (no overdue)
-        "SUB": 45,   # Substandard
-        "DBT": 120,  # Doubtful
-        "LSS": 270,  # Loss
+        "000": 0,      # 0 DPD (Current)
+        "001": 15,     # 1-30 days → midpoint 15
+        "030": 45,     # 31-60 days → midpoint 45
+        "060": 75,     # 61-90 days → midpoint 75
+        "090": 105,    # 91-120 days → midpoint 105
+        "120": 135,    # 121-150 days → midpoint 135
+        "150": 165,    # 151-180 days → midpoint 165
+        "180": 270,    # 181+ days → 270
+        "XXX": None,   # Not reported → null (not 0)
     }
 
-    # DPD bucket to ordinal mapping (for scorecard WOE binning)
-    # Preserves natural risk categories without midpoint conversion
+    # DPD bucket to ordinal mapping (Thai classification for scorecard WOE binning)
+    # Maps to ordinal values preserving natural risk ordering
     DPD_BUCKET_ORDINAL_MAP = {
-        "000": 0,    # Current (0 DPD)
+        "000": 0,    # 0 DPD (Current)
         "001": 1,    # 1-30 DPD
         "030": 2,    # 31-60 DPD
         "060": 3,    # 61-90 DPD
-        "090": 4,    # 91-150 DPD
-        "150": 5,    # 151-180 DPD
-        "180": 6,    # 181+ DPD
-        # Note: "XXX" (not reported) maps to null, not 0
+        "090": 4,    # 91-120 DPD
+        "120": 5,    # 121-150 DPD
+        "150": 6,    # 151-180 DPD
+        "180": 7,    # 181+ DPD
+        "XXX": None, # Not reported → null
+    }
+
+    # Simplified classification mapping (for business reporting)
+    # Maps Thai buckets to simplified categories: CURRENT, SM, NPL, CHARGE_OFF
+    SIMPLIFIED_DPD_MAP = {
+        "000": "CURRENT",      # 0 DPD
+        "001": "CURRENT",      # 1-30 DPD (still current)
+        "030": "SM",           # 31-60 DPD (Special Mention)
+        "060": "SM",           # 61-90 DPD (Special Mention)
+        "090": "NPL",          # 91-120 DPD (Non-Performing Loan)
+        "120": "NPL",          # 121-150 DPD (Non-Performing Loan)
+        "150": "NPL",          # 151-180 DPD (Non-Performing Loan)
+        "180": "CHARGE_OFF",   # 181+ DPD (Charge-off / Loss)
+        "XXX": None,           # Not reported → null
     }
 
     def __init__(self, spark: SparkSession):
@@ -108,18 +121,22 @@ class BureauSchemaAdapter:
 
     def adapt_bureau_trade_data(
         self,
-        account_df: DataFrame,
-        history_df: DataFrame
+        bureau_account_df: DataFrame,
+        bureau_history_df: DataFrame,
+        bridge_df: DataFrame,
+        as_of_month: str
     ) -> DataFrame:
         """
         Adapt bureau account + history tables to behavioral physics schema.
 
         Creates monthly snapshots at (cust_id, account_id, as_of_month) grain
-        with DPD extracted from history table.
+        with DPD extracted from history table and RECEIVE_DT from bridge.
 
         Args:
-            account_df: mnf_cra_rvw_s_account (account master)
-            history_df: mnf_cra_rvw_s_history (monthly snapshots)
+            bureau_account_df: mnf_cra_rvw_s_account (account master)
+            bureau_history_df: mnf_cra_rvw_s_history (monthly snapshots)
+            bridge_df: Point-in-time bridge with RECEIVE_DT (from build_bridge_df)
+            as_of_month: Observation month (YYYY-MM-DD format)
 
         Returns:
             DataFrame with expected schema for behavioral physics
@@ -127,23 +144,44 @@ class BureauSchemaAdapter:
         print("📊 Adapting bureau schema to behavioral physics format...")
 
         # 1. Map history table (monthly snapshots)
-        history_mapped = self._map_columns(history_df, self.HISTORY_SCHEMA_MAP)
+        history_mapped = self._map_columns(bureau_history_df, self.HISTORY_SCHEMA_MAP)
 
         # 2. Convert DPD bucket to numeric
         history_mapped = self._convert_dpd_bucket(history_mapped)
 
-        # 3. Map account table
-        account_mapped = self._map_columns(account_df, self.ACCOUNT_SCHEMA_MAP)
+        # 3. Wire RECEIVE_DT from bridge (Bug Fix #2)
+        # RECEIVE_DT exists in bridge (from mnf_cra_rvw_id_dummy), NOT in history table
+        # Join bridge to attach RECEIVE_DT and DL_DATA_DT to each history row
+        bridge_recv = bridge_df.select(
+            F.col("REF_NO").alias("cust_id"),
+            "RECEIVE_DT",
+            "DL_DATA_DT"
+        ).distinct()
 
-        # 3a. Create lender_id from lender_name if MEMBERCODE doesn't exist in source data
+        history_mapped = history_mapped.join(
+            bridge_recv,
+            on="cust_id",
+            how="left"
+        )
+
+        # Map RECEIVE_DT and DL_DATA_DT to internal schema
+        history_mapped = history_mapped.withColumnRenamed("RECEIVE_DT", "receive_dt")
+        history_mapped = history_mapped.withColumnRenamed("DL_DATA_DT", "dl_data_dt")
+
+        print(f"✓ Wired RECEIVE_DT from bridge to {history_mapped.count():,} history rows")
+
+        # 4. Map account table
+        account_mapped = self._map_columns(bureau_account_df, self.ACCOUNT_SCHEMA_MAP)
+
+        # 4a. Create lender_id from lender_name if MEMBERCODE doesn't exist in source data
         if "lender_id" not in account_mapped.columns:
             print("⚠️  MEMBERCODE not found in source data, using MEMBERSHORTNAME for lender_id")
             account_mapped = account_mapped.withColumn("lender_id", F.col("lender_name"))
 
-        # 4. Parse payment history strings to get monthly DPD
+        # 5. Parse payment history strings to get monthly DPD
         account_with_dpd = self._parse_payment_history(account_mapped)
 
-        # 5. Join account master with history
+        # 6. Join account master with history
         # Use history as primary source for monthly snapshots
         # Enrich with account master attributes
         account_static = account_mapped.select(
@@ -161,7 +199,7 @@ class BureauSchemaAdapter:
             how="left"
         )
 
-        # 6. Calculate utilization
+        # 7. Calculate utilization
         bureau_trade = bureau_trade.withColumn(
             "utilization",
             F.when(
@@ -170,13 +208,13 @@ class BureauSchemaAdapter:
             ).otherwise(0.0)
         )
 
-        # 7. Add derived fields
+        # 8. Add derived fields
         bureau_trade = bureau_trade.withColumn(
             "account_age_months",
             F.months_between(F.col("as_of_month"), F.col("account_open_date"))
         )
 
-        # 8. TDR flag
+        # 9. TDR flag
         bureau_trade = bureau_trade.withColumn(
             "has_tdr",
             F.col("last_tdr_date").isNotNull().cast("int")
@@ -198,11 +236,11 @@ class BureauSchemaAdapter:
             "reporting_gap_count_12m", F.lit(None).cast("int")
         )
 
-        # 9. Extend DPD time series with payment history (PAYMENTHISTORY1/2)
+        # 10. Extend DPD time series with payment history (PAYMENTHISTORY1/2)
         # This adds up to 48 months of historical DPD data for months
         # not covered by the history table
         try:
-            payment_history_snapshots = self.create_monthly_snapshots_from_payment_history(account_df)
+            payment_history_snapshots = self.create_monthly_snapshots_from_payment_history(bureau_account_df)
 
             # Get existing (cust_id, account_id, as_of_month) combinations from history
             existing_months = bureau_trade.select("cust_id", "account_id", "as_of_month").distinct()
@@ -239,13 +277,13 @@ class BureauSchemaAdapter:
 
     def adapt_bureau_enquiry_data(
         self,
-        enquiry_df: DataFrame
+        bureau_enquiry_df: DataFrame
     ) -> DataFrame:
         """
         Adapt bureau enquiry table to behavioral physics schema.
 
         Args:
-            enquiry_df: mnf_cra_rvw_s_enquiry
+            bureau_enquiry_df: mnf_cra_rvw_s_enquiry
 
         Returns:
             DataFrame with expected schema
@@ -253,7 +291,7 @@ class BureauSchemaAdapter:
         print("📊 Adapting enquiry schema...")
 
         # Map columns
-        enquiry_mapped = self._map_columns(enquiry_df, self.ENQUIRY_SCHEMA_MAP)
+        enquiry_mapped = self._map_columns(bureau_enquiry_df, self.ENQUIRY_SCHEMA_MAP)
 
         # Create lender_id from lender_name if MEMBERCODE doesn't exist in source data
         if "lender_id" not in enquiry_mapped.columns:

@@ -19,14 +19,13 @@ from .config import get_config
 
 class StateBuilder:
     """
-    Assigns monthly states (S0-S4) based on DPD levels.
+    Assigns monthly states based on DPD levels (Thai simplified classification).
 
-    State Framework:
-    - S0: 0 DPD (CLEAN)
-    - S1: 1-30 DPD (EARLY STRESS)
-    - S2: 31-90 DPD (SUB-STANDARD)
-    - S3: 91-180 DPD (DOUBTFUL)
-    - S4: 181+ DPD (LOSS)
+    State Framework (Thai regulatory categories):
+    - CURRENT: 0-30 DPD (Current accounts)
+    - SM: 31-90 DPD (Special Mention)
+    - NPL: 91-180 DPD (Non-Performing Loan)
+    - CHARGE_OFF: 181+ DPD (Charge-off / Loss)
     """
 
     def __init__(self, spark: SparkSession):

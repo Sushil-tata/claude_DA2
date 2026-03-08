@@ -145,9 +145,11 @@ class BehavioralPhysicsPipeline:
         print(f"✓ Loaded bureau_enquiry: {bureau_enquiry.count():,} rows")
 
         # Adapt bureau trade data (combines account + history + payment history expansion)
+        # Pass bridge_df to wire RECEIVE_DT from bridge (not from history table)
         bureau_trade_df = bureau_adapter.adapt_bureau_trade_data(
             bureau_account_df=bureau_account,
             bureau_history_df=bureau_history,
+            bridge_df=bridge_df,
             as_of_month=as_of_month
         )
 

@@ -27,8 +27,9 @@ class WindowConfig:
 
 @dataclass
 class StateConfig:
-    """DPD state definitions"""
-    # State boundaries (DPD ranges)
+    """DPD state definitions (Thai simplified classification)"""
+    # Simplified state boundaries (Thai regulatory classification)
+    # CURRENT: 0-30 DPD, SM: 31-90 DPD, NPL: 91-180 DPD, CHARGE_OFF: 181+ DPD
     STATE_BOUNDARIES: Dict[str, Tuple[int, int]] = None
 
     # Regime definitions
@@ -37,19 +38,19 @@ class StateConfig:
 
     def __post_init__(self):
         if self.STATE_BOUNDARIES is None:
+            # Thai simplified classification only
             self.STATE_BOUNDARIES = {
-                "S0": (0, 0),         # CLEAN
-                "S1": (1, 30),        # EARLY STRESS
-                "S2": (31, 90),       # SUB-STANDARD
-                "S3": (91, 180),      # DOUBTFUL
-                "S4": (181, 99999)    # LOSS
+                "CURRENT": (0, 30),       # Current (0-30 DPD)
+                "SM": (31, 90),           # Special Mention (31-90 DPD)
+                "NPL": (91, 180),         # Non-Performing Loan (91-180 DPD)
+                "CHARGE_OFF": (181, 99999)  # Charge-off / Loss (181+ DPD)
             }
 
         if self.NORMAL_STATES is None:
-            self.NORMAL_STATES = ["S0", "S1"]
+            self.NORMAL_STATES = ["CURRENT"]
 
         if self.STRESSED_STATES is None:
-            self.STRESSED_STATES = ["S2", "S3", "S4"]
+            self.STRESSED_STATES = ["SM", "NPL", "CHARGE_OFF"]
 
     def get_state_from_dpd(self, dpd: int) -> str:
         """Map DPD value to state"""
