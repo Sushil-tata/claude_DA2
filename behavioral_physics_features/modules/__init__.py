@@ -23,7 +23,7 @@ from .config import (
 
 # Schema adapters
 from .bureau_schema_adapter import BureauSchemaAdapter
-from .cardx_schema_adapter import CardXSchemaAdapter
+from .cardx_schema_adapter import CardXSchemaAdapter, build_bridge_df
 
 # Feature engines
 from .state_builder import StateBuilder
@@ -87,6 +87,7 @@ __all__ = [
     # Schema Adapters
     "BureauSchemaAdapter",
     "CardXSchemaAdapter",
+    "build_bridge_df",
 
     # Engines
     "StateBuilder",

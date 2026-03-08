@@ -21,6 +21,8 @@ import json
 
 from .config import get_config
 from .feature_registry import FeatureRegistry
+from .bureau_schema_adapter import BureauSchemaAdapter
+from .cardx_schema_adapter import CardXSchemaAdapter, build_bridge_df
 
 
 class BehavioralPhysicsPipeline:
@@ -48,6 +50,142 @@ class BehavioralPhysicsPipeline:
         # Audit log
         self.audit_log = []
 
+    def run_from_raw_tables(
+        self,
+        as_of_month: str,
+        catalog: str = "cdx_mdz_prd",
+        output_table: Optional[str] = None
+    ) -> Tuple[DataFrame, DataFrame, Dict[str, Any]]:
+        """
+        Execute full pipeline starting from raw tables with point-in-time bridge.
+
+        This method:
+        1. Builds point-in-time bridge (CardX ACCT_NUM → Bureau REF_NO)
+        2. Loads and adapts CardX data using bridge
+        3. Loads and adapts bureau data
+        4. Calls run() with prepared DataFrames
+
+        Args:
+            as_of_month: As-of date for point-in-time filtering (YYYY-MM-DD)
+            catalog: Databricks catalog name
+            output_table: Optional Delta table name for output
+
+        Returns:
+            Tuple of (features_df, audit_log_df, qa_summary_dict)
+        """
+        print(f"\n{'='*80}")
+        print(f"LOADING DATA FROM RAW TABLES")
+        print(f"As-of Month: {as_of_month}")
+        print(f"Catalog: {catalog}")
+        print(f"{'='*80}\n")
+
+        # ========================================================================
+        # STEP 1: Build Point-in-Time Bridge (CardX → Bureau)
+        # ========================================================================
+        print("Step 1/4: Building Point-in-Time Bridge")
+        print("-" * 80)
+
+        bridge_df = build_bridge_df(self.spark, as_of_month)
+
+        self._log_audit("BRIDGE_BUILD", {
+            "as_of_month": as_of_month,
+            "bridge_rows": bridge_df.count(),
+            "unique_accounts": bridge_df.select("ACCT_NUM").distinct().count(),
+            "unique_customers": bridge_df.select("REF_NO").distinct().count()
+        })
+
+        print("✓ Bridge built successfully\n")
+
+        # ========================================================================
+        # STEP 2: Load and Adapt CardX Data Using Bridge
+        # ========================================================================
+        print("Step 2/4: Loading and Adapting CardX Data")
+        print("-" * 80)
+
+        cardx_adapter = CardXSchemaAdapter(self.spark)
+
+        # Load CardX monthly data
+        cardx_monthly = self.spark.table(f"{catalog}.cdx_curated_spl_acl_db.spl_acct_mthly")
+
+        # Filter to observation month
+        month_end = F.last_day(F.to_date(F.lit(as_of_month), "yyyy-MM-dd"))
+        cardx_monthly = cardx_monthly.filter(F.col("DL_DATA_DT") == month_end)
+
+        print(f"✓ Loaded CardX monthly (month={as_of_month}): {cardx_monthly.count():,} rows")
+
+        # Adapt using bridge
+        cardx_internal_df = cardx_adapter.adapt_cardx_monthly_data(
+            cardx_monthly_df=cardx_monthly,
+            bridge_df=bridge_df
+        )
+
+        self._log_audit("CARDX_ADAPT", {
+            "as_of_month": as_of_month,
+            "cardx_rows": cardx_internal_df.count(),
+            "cardx_customers": cardx_internal_df.select("cust_id").distinct().count()
+        })
+
+        print("✓ CardX data adapted successfully\n")
+
+        # ========================================================================
+        # STEP 3: Load and Adapt Bureau Data
+        # ========================================================================
+        print("Step 3/4: Loading and Adapting Bureau Data")
+        print("-" * 80)
+
+        bureau_adapter = BureauSchemaAdapter(self.spark)
+
+        # Load bureau tables
+        bureau_account = self.spark.table(f"{catalog}.cdx_persist_mnf_res_db.mnf_cra_rvw_s_account")
+        bureau_history = self.spark.table(f"{catalog}.cdx_persist_mnf_res_db.mnf_cra_rvw_s_history")
+        bureau_enquiry = self.spark.table(f"{catalog}.cdx_persist_mnf_res_db.mnf_cra_rvw_s_enquiry")
+
+        print(f"✓ Loaded bureau_account: {bureau_account.count():,} rows")
+        print(f"✓ Loaded bureau_history: {bureau_history.count():,} rows")
+        print(f"✓ Loaded bureau_enquiry: {bureau_enquiry.count():,} rows")
+
+        # Adapt bureau trade data (combines account + history + payment history expansion)
+        bureau_trade_df = bureau_adapter.adapt_bureau_trade_data(
+            bureau_account_df=bureau_account,
+            bureau_history_df=bureau_history,
+            as_of_month=as_of_month
+        )
+
+        print(f"✓ Bureau trade adapted: {bureau_trade_df.count():,} rows")
+
+        # Adapt bureau enquiry data
+        bureau_enquiry_df = bureau_adapter.adapt_bureau_enquiry_data(
+            bureau_enquiry_df=bureau_enquiry
+        )
+
+        print(f"✓ Bureau enquiry adapted: {bureau_enquiry_df.count():,} rows")
+
+        self._log_audit("BUREAU_ADAPT", {
+            "as_of_month": as_of_month,
+            "bureau_trade_rows": bureau_trade_df.count(),
+            "bureau_enquiry_rows": bureau_enquiry_df.count(),
+            "bureau_customers": bureau_trade_df.select("cust_id").distinct().count()
+        })
+
+        print("✓ Bureau data adapted successfully\n")
+
+        # ========================================================================
+        # STEP 4: Run Feature Pipeline
+        # ========================================================================
+        print("Step 4/4: Running Feature Pipeline")
+        print("-" * 80)
+
+        # Call existing run() method with prepared DataFrames
+        features_df, audit_log_df, qa_summary = self.run(
+            bureau_trade_df=bureau_trade_df,
+            bureau_enquiry_df=bureau_enquiry_df,
+            cardx_internal_df=cardx_internal_df,
+            as_of_month=as_of_month,
+            output_table=output_table
+        )
+
+        return features_df, audit_log_df, qa_summary
+
     def run(
         self,
         bureau_trade_df: DataFrame,
@@ -57,12 +195,22 @@ class BehavioralPhysicsPipeline:
         output_table: Optional[str] = None
     ) -> Tuple[DataFrame, DataFrame, Dict[str, Any]]:
         """
-        Execute full behavioral physics feature pipeline.
+        Execute full behavioral physics feature pipeline with pre-prepared DataFrames.
+
+        NOTE: For production use, prefer run_from_raw_tables() which handles:
+        - Point-in-time bridge building (CardX → Bureau)
+        - Data loading and adaptation from raw tables
+        - Proper point-in-time filtering
+
+        This method is useful when:
+        - You have already built the bridge and adapted the data
+        - You're running tests with sample DataFrames
+        - You want fine-grained control over data preparation
 
         Args:
-            bureau_trade_df: Bureau trade monthly data
-            bureau_enquiry_df: Bureau enquiry data
-            cardx_internal_df: CardX internal monthly data
+            bureau_trade_df: Adapted bureau trade monthly data (must have: cust_id, as_of_month, receive_dt)
+            bureau_enquiry_df: Adapted bureau enquiry data (must have: cust_id)
+            cardx_internal_df: Adapted CardX data (must have: cust_id, as_of_month)
             as_of_month: As-of date for point-in-time filtering (YYYY-MM-DD)
             output_table: Optional Delta table name for output
 
@@ -472,7 +620,53 @@ if __name__ == "__main__":
     print("BEHAVIORAL PHYSICS PIPELINE - END-TO-END TEST")
     print("="*80)
 
-    # Create sample data
+    # ========================================================================
+    # OPTION 1: Production Usage - Load from Raw Tables (RECOMMENDED)
+    # ========================================================================
+    print("\n--- Option 1: Production Usage with Bridge ---\n")
+
+    # This method handles:
+    # 1. Building point-in-time bridge (CardX → Bureau)
+    # 2. Loading and adapting all data
+    # 3. Running feature pipeline
+
+    try:
+        pipeline = BehavioralPhysicsPipeline(spark)
+
+        as_of_month = "2024-12-31"
+
+        features_df, audit_log_df, qa_summary = pipeline.run_from_raw_tables(
+            as_of_month=as_of_month,
+            catalog="cdx_mdz_prd",
+            output_table=None  # Set to table name to write output
+        )
+
+        print("\n✅ Production pipeline test complete")
+        print(f"   Features: {len(features_df.columns) - 2}")
+        print(f"   Customers: {features_df.count():,}")
+
+        # Show sample
+        print("\n📊 Sample Features:")
+        sample_cols = ["cust_id", "as_of_month"] + [
+            col for col in features_df.columns
+            if col not in ["cust_id", "as_of_month"]
+        ][:3]
+        features_df.select(*sample_cols).show(5)
+
+        print("\n📝 Audit Log:")
+        audit_log_df.show(10, truncate=False)
+
+    except Exception as e:
+        print(f"\n⚠️  Production test failed (expected if not in Databricks):")
+        print(f"   {str(e)}")
+        print("\n   To run in Databricks, execute this script in a Databricks notebook")
+
+    # ========================================================================
+    # OPTION 2: Testing with Sample Data
+    # ========================================================================
+    print("\n\n--- Option 2: Testing with Sample DataFrames ---\n")
+
+    # Create sample data for testing
     base_date = date(2024, 1, 1)
 
     # Sample bureau trade data
@@ -480,13 +674,13 @@ if __name__ == "__main__":
     for month_offset in range(12):
         as_of = base_date + timedelta(days=30 * month_offset)
         trade_data.extend([
-            ("CUST001", "ACC001", as_of, 10000 + month_offset * 1000, month_offset * 5, 50000),
-            ("CUST002", "ACC002", as_of, 20000 + month_offset * 2000, month_offset * 10, 100000),
+            ("CUST001", "ACC001", as_of, 10000 + month_offset * 1000, month_offset * 5, 50000, as_of),
+            ("CUST002", "ACC002", as_of, 20000 + month_offset * 2000, month_offset * 10, 100000, as_of),
         ])
 
     bureau_trade_df = spark.createDataFrame(
         trade_data,
-        ["cust_id", "account_id", "as_of_month", "balance", "dpd", "credit_limit"]
+        ["cust_id", "account_id", "as_of_month", "balance", "dpd", "credit_limit", "receive_dt"]
     )
 
     # Sample enquiry data
@@ -515,7 +709,7 @@ if __name__ == "__main__":
         ["cust_id", "as_of_month", "cardx_dpd", "cardx_balance"]
     )
 
-    # Run pipeline
+    # Run pipeline with sample data
     pipeline = BehavioralPhysicsPipeline(spark)
 
     as_of_month = "2024-06-30"
@@ -540,6 +734,6 @@ if __name__ == "__main__":
     print("\n📋 QA Summary:")
     print(json.dumps(qa_summary, indent=2, default=str))
 
-    print("\n✅ Pipeline test complete")
+    print("\n✅ Sample data pipeline test complete")
 
     spark.stop()
