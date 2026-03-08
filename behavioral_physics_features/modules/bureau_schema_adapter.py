@@ -440,14 +440,11 @@ class BureauSchemaAdapter:
         )
 
         # Explode array with position (month offset)
-        df = df.withColumn(
-            "month_data",
-            F.posexplode(F.col("payment_history_array"))
+        # Use selectExpr with posexplode to properly extract pos and value
+        df = df.selectExpr(
+            "*",
+            "posexplode(payment_history_array) as (months_back, dpd_bucket)"
         )
-
-        # Extract position (months back from end date) and DPD bucket
-        df = df.withColumn("months_back", F.col("month_data.pos"))
-        df = df.withColumn("dpd_bucket", F.col("month_data.col"))
 
         # Calculate as_of_month by subtracting months from payment_history_end
         df = df.withColumn(
