@@ -36,7 +36,7 @@ class BureauSchemaAdapter:
         "ACCOUNTNUMBER": "account_id",
         "ASOFDATE": "as_of_month",
         "MEMBERSHORTNAME": "lender_name",
-        "MEMBERCODE": "lender_id",  # Changed from lender_code to lender_id
+        # MEMBERCODE mapped below - will use MEMBERSHORTNAME if MEMBERCODE doesn't exist
         "ACCOUNTTYPE": "account_type",
         "CREDITLIMIT": "credit_limit",
         "AMOUNTOWED": "balance",
@@ -134,6 +134,11 @@ class BureauSchemaAdapter:
 
         # 3. Map account table
         account_mapped = self._map_columns(account_df, self.ACCOUNT_SCHEMA_MAP)
+
+        # 3a. Create lender_id from lender_name if MEMBERCODE doesn't exist in source data
+        if "lender_id" not in account_mapped.columns:
+            print("⚠️  MEMBERCODE not found in source data, using MEMBERSHORTNAME for lender_id")
+            account_mapped = account_mapped.withColumn("lender_id", F.col("lender_name"))
 
         # 4. Parse payment history strings to get monthly DPD
         account_with_dpd = self._parse_payment_history(account_mapped)
@@ -249,6 +254,11 @@ class BureauSchemaAdapter:
 
         # Map columns
         enquiry_mapped = self._map_columns(enquiry_df, self.ENQUIRY_SCHEMA_MAP)
+
+        # Create lender_id from lender_name if MEMBERCODE doesn't exist in source data
+        if "lender_id" not in enquiry_mapped.columns:
+            print("⚠️  MEMBERCODE not found in enquiry data, using MEMBERSHORTNAME for lender_id")
+            enquiry_mapped = enquiry_mapped.withColumn("lender_id", F.col("lender_name"))
 
         # Parse enquiry date (ensure it's date type)
         enquiry_mapped = enquiry_mapped.withColumn(
