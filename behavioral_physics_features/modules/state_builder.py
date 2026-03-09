@@ -42,7 +42,7 @@ class StateBuilder:
 
         Args:
             bureau_trade_monthly_df: Bureau trade lines
-                Required columns: cust_id, as_of_month, lender_id, dpd
+                Required columns: cust_id, as_of_month, lender_name, dpd
             cardx_internal_monthly_df: CardX internal data (optional)
                 Required columns: cust_id, as_of_month, cardx_dpd
 
@@ -90,7 +90,7 @@ class StateBuilder:
         # Aggregate to customer-month level (max DPD)
         bureau_agg = bureau_trade_df.groupBy("cust_id", "as_of_month").agg(
             F.max("dpd").alias("bureau_max_dpd"),
-            F.count("lender_id").alias("bureau_account_count")
+            F.count("lender_name").alias("bureau_account_count")
         )
 
         # Map DPD to state using UDF
@@ -334,7 +334,7 @@ if __name__ == "__main__":
 
     bureau_df = spark.createDataFrame(
         bureau_data,
-        ["cust_id", "as_of_month", "lender_id", "dpd"]
+        ["cust_id", "as_of_month", "lender_name", "dpd"]
     )
 
     # Create sample CardX data

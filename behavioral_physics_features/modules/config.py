@@ -75,8 +75,8 @@ class LenderTypeConfig:
     # Categories based on Thai financial institution types
     LENDER_TYPE_MAPPING: Dict[str, List[str]] = None
 
-    # CardX identification
-    CARDX_LENDER_IDS: List[str] = None
+    # CardX identification (using lender_name, not lender_id)
+    CARDX_LENDER_NAMES: List[str] = None
 
     def __post_init__(self):
         if self.LENDER_TYPE_MAPPING is None:
@@ -190,15 +190,18 @@ class LenderTypeConfig:
                 ]
             }
 
-        if self.CARDX_LENDER_IDS is None:
-            # Replace with actual CardX lender IDs from your data
-            self.CARDX_LENDER_IDS = ["CARDX", "CARDX_LENDER_ID"]
+        if self.CARDX_LENDER_NAMES is None:
+            # Replace with actual CardX lender names from MEMBERSHORTNAME
+            self.CARDX_LENDER_NAMES = ["CARDX", "CARDX_INTERNAL"]
 
-    def map_lender_type(self, lender_name_raw: str, lender_id: str) -> str:
+    def map_lender_type(self, lender_name_raw: str) -> str:
         """
         Map raw lender name to Thai financial institution type.
 
         Returns: SFI, COMMERCIAL_BANK, PERSONAL_LOAN, LEASING, FINTECH, CARDX, OTHER
+
+        Args:
+            lender_name_raw: Raw lender name from MEMBERSHORTNAME
 
         Thai Categories:
         - SFI: Specialized Financial Institutions (สถาบันการเงินเฉพาะกิจ)
@@ -209,12 +212,12 @@ class LenderTypeConfig:
         - CARDX: Internal CardX lender
         - OTHER: Unclassified
         """
-        # Check if CardX
-        if lender_id in self.CARDX_LENDER_IDS:
-            return "CARDX"
-
         # Normalize lender name
         lender_upper = str(lender_name_raw).upper()
+
+        # Check if CardX
+        if lender_upper in self.CARDX_LENDER_NAMES:
+            return "CARDX"
 
         # Check against mapping
         for lender_type, patterns in self.LENDER_TYPE_MAPPING.items():
@@ -320,9 +323,9 @@ def get_config() -> BehavioralPhysicsConfig:
     return CONFIG
 
 
-def update_cardx_lender_ids(lender_ids: List[str]):
-    """Update CardX lender IDs (for production deployment)"""
-    CONFIG.lender_types.CARDX_LENDER_IDS = lender_ids
+def update_cardx_lender_names(lender_names: List[str]):
+    """Update CardX lender names from MEMBERSHORTNAME (for production deployment)"""
+    CONFIG.lender_types.CARDX_LENDER_NAMES = lender_names
 
 
 def add_window(window_months: int):
@@ -374,6 +377,6 @@ if __name__ == "__main__":
         ("CARDX", "CARDX"),
         ("UNKNOWN LENDER", "UNK001")
     ]
-    for lender_name, lender_id in test_lenders:
-        lender_type = config.lender_types.map_lender_type(lender_name, lender_id)
+    for lender_name, _ in test_lenders:
+        lender_type = config.lender_types.map_lender_type(lender_name)
         print(f"  {lender_name:20s} → {lender_type}")

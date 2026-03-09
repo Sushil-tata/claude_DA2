@@ -89,19 +89,14 @@ class LenderEcologyEngine:
 
         Returns: PSU_BANK, PRIVATE_BANK, FINTECH, CONSUMER_FINANCE, CARDX, OTHER
         """
-        # UDF for lender type mapping
+        # UDF for lender type mapping (uses only lender_name from MEMBERSHORTNAME)
         map_type_udf = F.udf(
-            lambda name, id: self.config.lender_types.map_lender_type(
-                name or "", id or ""
-            )
+            lambda name: self.config.lender_types.map_lender_type(name or "")
         )
 
         return bureau_df.withColumn(
             "lender_type",
-            map_type_udf(
-                F.col("lender_name"),
-                F.col("lender_name")
-            )
+            map_type_udf(F.col("lender_name"))
         )
 
     def _compute_exposure_shares(self, typed_df: DataFrame) -> DataFrame:
