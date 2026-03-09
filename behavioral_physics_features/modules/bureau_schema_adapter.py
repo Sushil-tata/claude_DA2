@@ -33,8 +33,8 @@ class BureauSchemaAdapter:
 
     # Schema mappings: Bureau column → Expected column
     ACCOUNT_SCHEMA_MAP = {
-        "REF_NO": "cust_id",
-        "SEQ_TL": "seq_tl",  # Tradeline sequence number (unique per customer)
+        "REF_NO": "ref_no",  # Keep original REF_NO (bureau report reference)
+        "SEQ_TL": "seq_tl",  # Tradeline sequence number (unique per report)
         "ACCOUNTNUMBER": "account_id",
         "ASOFDATE": "as_of_month",
         "MEMBERSHORTNAME": "lender_name",
@@ -57,8 +57,8 @@ class BureauSchemaAdapter:
     }
 
     HISTORY_SCHEMA_MAP = {
-        "REF_NO": "cust_id",
-        "SEQ_TL": "seq_tl",  # Tradeline sequence number (unique per customer)
+        "REF_NO": "ref_no",  # Keep original REF_NO (bureau report reference)
+        "SEQ_TL": "seq_tl",  # Tradeline sequence number (unique per report)
         "ASOFDATE": "as_of_month",
         "RECEIVE_DT": "receive_dt",
         "DL_DATA_DT": "dl_data_dt",
@@ -68,7 +68,7 @@ class BureauSchemaAdapter:
     }
 
     ENQUIRY_SCHEMA_MAP = {
-        "REF_NO": "cust_id",
+        "REF_NO": "ref_no",  # Keep original REF_NO (bureau report reference)
         "DATEOFENQUIRY": "enquiry_date",
         "ENQUIRYPURPOSE": "enquiry_purpose",
         "ENQUIRYAMOUNT": "enquiry_amount",
@@ -111,6 +111,9 @@ class BureauSchemaAdapter:
         # 1. Map history table (monthly snapshots)
         history_mapped = self._map_columns(bureau_history_df, self.HISTORY_SCHEMA_MAP)
 
+        # Add cust_id as alias for ref_no (for downstream compatibility)
+        history_mapped = history_mapped.withColumn("cust_id", F.col("ref_no"))
+
         # 2. Parse OVERDUEMONTHS to DPD days
         # The dpd_bucket column contains OVERDUEMONTHS values (months overdue)
         history_mapped = history_mapped.withColumn(
@@ -121,15 +124,16 @@ class BureauSchemaAdapter:
         # 3. Wire RECEIVE_DT from bridge (Bug Fix #2)
         # RECEIVE_DT exists in bridge (from mnf_cra_rvw_id_dummy), NOT in history table
         # Join bridge to attach RECEIVE_DT and DL_DATA_DT to each history row
+        # Join on ref_no (normalized from REF_NO) to avoid silent type mismatches
         bridge_recv = bridge_df.select(
-            F.col("REF_NO").alias("cust_id"),
+            F.col("REF_NO").alias("ref_no"),  # Normalize to lowercase for join
             "RECEIVE_DT",
             "DL_DATA_DT"
         ).distinct()
 
         history_mapped = history_mapped.join(
             bridge_recv,
-            on="cust_id",
+            on="ref_no",  # Explicit ref_no join (REF_NO on both sides)
             how="left"
         )
 
@@ -142,6 +146,9 @@ class BureauSchemaAdapter:
         # 4. Map account table
         account_mapped = self._map_columns(bureau_account_df, self.ACCOUNT_SCHEMA_MAP)
 
+        # Add cust_id as alias for ref_no (for downstream compatibility)
+        account_mapped = account_mapped.withColumn("cust_id", F.col("ref_no"))
+
         # Note: Only lender_name (from MEMBERSHORTNAME) is used
         # No lender_id column created
 
@@ -151,18 +158,18 @@ class BureauSchemaAdapter:
         # 6. Join account master with history
         # Use history as primary source for monthly snapshots
         # Enrich with account master attributes
-        # Unique tradeline identifier: (cust_id, seq_tl) = (REF_NO, SEQ_TL)
+        # Unique tradeline identifier: (ref_no, seq_tl) = (REF_NO, SEQ_TL)
         account_static = account_mapped.select(
-            "cust_id", "seq_tl", "account_id", "lender_name", "account_type",
+            "ref_no", "seq_tl", "cust_id", "account_id", "lender_name", "account_type",
             "account_open_date", "account_close_date", "last_tdr_date",
             "emi_amount", "tenure_months"
-        ).dropDuplicates(["cust_id", "seq_tl"])
+        ).dropDuplicates(["ref_no", "seq_tl"])
 
         # Join history with account attributes on unique tradeline key
-        # Both tables have REF_NO (cust_id) and SEQ_TL (seq_tl)
+        # Explicit REF_NO join to ensure tradeline uniqueness
         bureau_trade = history_mapped.join(
             account_static,
-            on=["cust_id", "seq_tl"],
+            on=["ref_no", "seq_tl"],  # Unique tradeline = (REF_NO, SEQ_TL)
             how="left"
         )
 
@@ -259,6 +266,9 @@ class BureauSchemaAdapter:
 
         # Map columns
         enquiry_mapped = self._map_columns(bureau_enquiry_df, self.ENQUIRY_SCHEMA_MAP)
+
+        # Add cust_id as alias for ref_no (for downstream compatibility)
+        enquiry_mapped = enquiry_mapped.withColumn("cust_id", F.col("ref_no"))
 
         # Note: Only lender_name (from MEMBERSHORTNAME) is used
         # No lender_id column created
