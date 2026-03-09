@@ -34,10 +34,11 @@ class BureauSchemaAdapter:
     # Schema mappings: Bureau column → Expected column
     ACCOUNT_SCHEMA_MAP = {
         "REF_NO": "cust_id",
+        "SEQ_TL": "seq_tl",  # Tradeline sequence number (unique per customer)
         "ACCOUNTNUMBER": "account_id",
         "ASOFDATE": "as_of_month",
         "MEMBERSHORTNAME": "lender_name",
-        # MEMBERCODE mapped below - will use MEMBERSHORTNAME if MEMBERCODE doesn't exist
+        # MEMBERCODE removed - only MEMBERSHORTNAME used
         "ACCOUNTTYPE": "account_type",
         "CREDITLIMIT": "credit_limit",
         "AMOUNTOWED": "balance",
@@ -57,13 +58,13 @@ class BureauSchemaAdapter:
 
     HISTORY_SCHEMA_MAP = {
         "REF_NO": "cust_id",
+        "SEQ_TL": "seq_tl",  # Tradeline sequence number (unique per customer)
         "ASOFDATE": "as_of_month",
         "RECEIVE_DT": "receive_dt",
         "DL_DATA_DT": "dl_data_dt",
         "CREDITLIMIT": "credit_limit",
         "AMOUNTOWED": "balance",
         "OVERDUEMONTHS": "dpd_bucket",
-        "SEQ_TL": "account_seq",
     }
 
     ENQUIRY_SCHEMA_MAP = {
@@ -72,7 +73,7 @@ class BureauSchemaAdapter:
         "ENQUIRYPURPOSE": "enquiry_purpose",
         "ENQUIRYAMOUNT": "enquiry_amount",
         "MEMBERSHORTNAME": "lender_name",
-        "MEMBERCODE": "lender_id",  # Changed from lender_code to lender_id
+        # MEMBERCODE removed - only MEMBERSHORTNAME (lender_name) used
     }
 
     # OVERDUEMONTHS to DPD conversion
@@ -141,10 +142,8 @@ class BureauSchemaAdapter:
         # 4. Map account table
         account_mapped = self._map_columns(bureau_account_df, self.ACCOUNT_SCHEMA_MAP)
 
-        # 4a. Create lender_id from lender_name if MEMBERCODE doesn't exist in source data
-        if "lender_id" not in account_mapped.columns:
-            print("⚠️  MEMBERCODE not found in source data, using MEMBERSHORTNAME for lender_id")
-            account_mapped = account_mapped.withColumn("lender_id", F.col("lender_name"))
+        # Note: Only lender_name (from MEMBERSHORTNAME) is used
+        # No lender_id column created
 
         # 5. Parse payment history strings to get monthly DPD
         account_with_dpd = self._parse_payment_history(account_mapped)
@@ -152,18 +151,18 @@ class BureauSchemaAdapter:
         # 6. Join account master with history
         # Use history as primary source for monthly snapshots
         # Enrich with account master attributes
+        # Unique tradeline identifier: (cust_id, seq_tl) = (REF_NO, SEQ_TL)
         account_static = account_mapped.select(
-            "cust_id", "account_id", "lender_name", "lender_id", "account_type",
+            "cust_id", "seq_tl", "account_id", "lender_name", "account_type",
             "account_open_date", "account_close_date", "last_tdr_date",
             "emi_amount", "tenure_months"
-        ).dropDuplicates(["cust_id", "account_id"])
+        ).dropDuplicates(["cust_id", "seq_tl"])
 
-        # Join history with account attributes
-        # Note: history table has account_seq instead of account_id
-        # We'll need to join by (cust_id, as_of_month) and use seq to match
+        # Join history with account attributes on unique tradeline key
+        # Both tables have REF_NO (cust_id) and SEQ_TL (seq_tl)
         bureau_trade = history_mapped.join(
             account_static,
-            on=["cust_id"],
+            on=["cust_id", "seq_tl"],
             how="left"
         )
 
@@ -261,10 +260,8 @@ class BureauSchemaAdapter:
         # Map columns
         enquiry_mapped = self._map_columns(bureau_enquiry_df, self.ENQUIRY_SCHEMA_MAP)
 
-        # Create lender_id from lender_name if MEMBERCODE doesn't exist in source data
-        if "lender_id" not in enquiry_mapped.columns:
-            print("⚠️  MEMBERCODE not found in enquiry data, using MEMBERSHORTNAME for lender_id")
-            enquiry_mapped = enquiry_mapped.withColumn("lender_id", F.col("lender_name"))
+        # Note: Only lender_name (from MEMBERSHORTNAME) is used
+        # No lender_id column created
 
         # Parse enquiry date (ensure it's date type)
         enquiry_mapped = enquiry_mapped.withColumn(
@@ -513,7 +510,7 @@ class BureauSchemaAdapter:
         # Select relevant columns (DPD-only - no balance/credit_limit from payment strings)
         monthly_snapshots = df.select(
             "cust_id", "account_id", "as_of_month",
-            "lender_name", "lender_id", "account_type",
+            "lender_name", "account_type",
             "dpd_bucket", "dpd",
             "account_open_date", "last_tdr_date",
             "has_reporting_gap",           # Account-level: 1 if any XXX in payment history
@@ -602,13 +599,13 @@ if __name__ == "__main__":
     bureau_trade = adapter.adapt_bureau_trade_data(account_df, history_df)
     bureau_trade.select(
         "cust_id", "as_of_month", "dpd", "balance", "credit_limit",
-        "utilization", "lender_name", "lender_id"
+        "utilization", "lender_name"
     ).show()
 
     print("\n2. Testing Enquiry Adaptation:")
     bureau_enquiry = adapter.adapt_bureau_enquiry_data(enquiry_df)
     bureau_enquiry.select(
-        "cust_id", "enquiry_date", "enquiry_purpose", "lender_name", "lender_id"
+        "cust_id", "enquiry_date", "enquiry_purpose", "lender_name"
     ).show()
 
     print("\n3. Testing Payment History Parsing:")
@@ -621,10 +618,9 @@ if __name__ == "__main__":
     print("\nColumn Mappings:")
     print("  - REF_NO → cust_id")
     print("  - ASOFDATE → as_of_month")
-    print("  - OVERDUEMONTHS → dpd (converted from bucket)")
+    print("  - OVERDUEMONTHS → dpd (converted to days)")
     print("  - AMOUNTOWED → balance")
     print("  - CREDITLIMIT → credit_limit")
     print("  - MEMBERSHORTNAME → lender_name")
-    print("  - MEMBERCODE → lender_id")
 
     spark.stop()

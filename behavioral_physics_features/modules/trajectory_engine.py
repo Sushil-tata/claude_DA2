@@ -78,6 +78,9 @@ class TrajectoryEngine:
         - util_velocity_3m: Utilization rate of change
         - balance_velocity_6m: Balance trajectory
         """
+        # Repartition by cust_id before heavy window operations to avoid data skew
+        state_df = state_df.repartition("cust_id")
+
         windows = self.config.windows.WINDOWS_MONTHS
 
         for window in windows:
@@ -110,6 +113,9 @@ class TrajectoryEngine:
             on=["cust_id", "as_of_month"],
             how="left"
         )
+
+        # Repartition again after join (may have reshuffled)
+        state_df = state_df.repartition("cust_id")
 
         # Utilization velocity
         for window in [3, 6]:
