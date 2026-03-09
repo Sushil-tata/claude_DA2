@@ -186,27 +186,9 @@ class TrajectoryEngine:
         w_12m = Window.partitionBy("cust_id").orderBy("as_of_month") \
             .rowsBetween(-11, 0)
 
-        # Count transitions by type in last 12 months
-        df = df.withColumn(
-            "s0_to_s2_count_12m",
-            F.sum(
-                F.when(F.col("transition_type") == "S0_to_S2", 1).otherwise(0)
-            ).over(w_12m)
-        )
-
-        df = df.withColumn(
-            "s2_to_s0_count_12m",
-            F.sum(
-                F.when(F.col("transition_type") == "S2_to_S0", 1).otherwise(0)
-            ).over(w_12m)
-        )
-
-        df = df.withColumn(
-            "normal_to_stressed_count_12m",
-            F.sum(
-                F.when(F.col("regime_transition_type") == "NORMAL_to_STRESSED", 1).otherwise(0)
-            ).over(w_12m)
-        )
+        # NOTE: transition_type columns removed
+        # Production code uses state_changed, deteriorate_flag_m, improve_flag_m instead
+        # See production_pipeline.py for reference
 
         # Transition speed (avg months between transitions)
         df = df.withColumn(
@@ -335,18 +317,18 @@ if __name__ == "__main__":
 
     # Create sample state data (from StateBuilder output)
     state_data = [
-        ("CUST001", date(2024, 1, 31), 0, "S0", "NORMAL", False, "NO_CHANGE"),
-        ("CUST001", date(2024, 2, 29), 15, "S1", "NORMAL", True, "S0_to_S1"),
-        ("CUST001", date(2024, 3, 31), 45, "S2", "STRESSED", True, "S1_to_S2"),
-        ("CUST001", date(2024, 4, 30), 75, "S2", "STRESSED", False, "NO_CHANGE"),
-        ("CUST001", date(2024, 5, 31), 30, "S1", "NORMAL", True, "S2_to_S1"),
-        ("CUST001", date(2024, 6, 30), 60, "S2", "STRESSED", True, "S1_to_S2"),
+        ("CUST001", date(2024, 1, 31), 0, "S0", "NORMAL", False),
+        ("CUST001", date(2024, 2, 29), 15, "S1", "NORMAL", True),
+        ("CUST001", date(2024, 3, 31), 45, "S2", "STRESSED", True),
+        ("CUST001", date(2024, 4, 30), 75, "S2", "STRESSED", False),
+        ("CUST001", date(2024, 5, 31), 30, "S1", "NORMAL", True),
+        ("CUST001", date(2024, 6, 30), 60, "S2", "STRESSED", True),
     ]
 
     state_df = spark.createDataFrame(
         state_data,
         ["cust_id", "as_of_month", "bureau_max_dpd", "consolidated_state",
-         "consolidated_regime", "state_changed", "transition_type"]
+         "consolidated_regime", "state_changed"]
     )
 
     # Create sample bureau trade data

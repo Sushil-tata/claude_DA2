@@ -213,7 +213,9 @@ class StateBuilder:
         - prev_month_regime
         - state_changed (boolean)
         - regime_changed (boolean)
-        - transition_type (e.g., "S0_to_S2", "NORMAL_to_STRESSED")
+
+        NOTE: transition_type removed - production code uses state_changed,
+        deteriorate_flag_m, improve_flag_m instead.
         """
         # Window partitioned by customer, ordered by month
         window_spec = Window.partitionBy("cust_id").orderBy("as_of_month")
@@ -234,32 +236,6 @@ class StateBuilder:
         ).withColumn(
             "regime_changed",
             F.col("consolidated_regime") != F.col("prev_month_regime")
-        )
-
-        # Transition type
-        state_df = state_df.withColumn(
-            "transition_type",
-            F.when(
-                F.col("state_changed"),
-                F.concat(
-                    F.col("prev_month_state"),
-                    F.lit("_to_"),
-                    F.col("consolidated_state")
-                )
-            ).otherwise(F.lit("NO_CHANGE"))
-        )
-
-        # Regime transition type
-        state_df = state_df.withColumn(
-            "regime_transition_type",
-            F.when(
-                F.col("regime_changed"),
-                F.concat(
-                    F.col("prev_month_regime"),
-                    F.lit("_to_"),
-                    F.col("consolidated_regime")
-                )
-            ).otherwise(F.lit("NO_CHANGE"))
         )
 
         return state_df
@@ -371,7 +347,7 @@ if __name__ == "__main__":
     states_df.select(
         "cust_id", "as_of_month",
         "prev_month_state", "consolidated_state",
-        "state_changed", "transition_type"
+        "state_changed"
     ).orderBy("cust_id", "as_of_month").show(truncate=False)
 
     print("\n✅ State Builder test complete")
