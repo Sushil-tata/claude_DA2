@@ -15,6 +15,7 @@ Version: 1.0.0
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
+from pyspark.sql.types import ArrayType, StringType
 from typing import Dict, Optional
 import re
 
@@ -74,47 +75,10 @@ class BureauSchemaAdapter:
         "MEMBERCODE": "lender_id",  # Changed from lender_code to lender_id
     }
 
-    # DPD bucket to numeric mapping (Thai classification only)
-    # Maps Thai DPD buckets to their midpoint values for feature engineering
-    DPD_BUCKET_MAP = {
-        "000": 0,      # 0 DPD (Current)
-        "001": 15,     # 1-30 days → midpoint 15
-        "030": 45,     # 31-60 days → midpoint 45
-        "060": 75,     # 61-90 days → midpoint 75
-        "090": 105,    # 91-120 days → midpoint 105
-        "120": 135,    # 121-150 days → midpoint 135
-        "150": 165,    # 151-180 days → midpoint 165
-        "180": 270,    # 181+ days → 270
-        "XXX": None,   # Not reported → null (not 0)
-    }
-
-    # DPD bucket to ordinal mapping (Thai classification for scorecard WOE binning)
-    # Maps to ordinal values preserving natural risk ordering
-    DPD_BUCKET_ORDINAL_MAP = {
-        "000": 0,    # 0 DPD (Current)
-        "001": 1,    # 1-30 DPD
-        "030": 2,    # 31-60 DPD
-        "060": 3,    # 61-90 DPD
-        "090": 4,    # 91-120 DPD
-        "120": 5,    # 121-150 DPD
-        "150": 6,    # 151-180 DPD
-        "180": 7,    # 181+ DPD
-        "XXX": None, # Not reported → null
-    }
-
-    # Simplified classification mapping (for business reporting)
-    # Maps Thai buckets to simplified categories: CURRENT, SM, NPL, CHARGE_OFF
-    SIMPLIFIED_DPD_MAP = {
-        "000": "CURRENT",      # 0 DPD
-        "001": "CURRENT",      # 1-30 DPD (still current)
-        "030": "SM",           # 31-60 DPD (Special Mention)
-        "060": "SM",           # 61-90 DPD (Special Mention)
-        "090": "NPL",          # 91-120 DPD (Non-Performing Loan)
-        "120": "NPL",          # 121-150 DPD (Non-Performing Loan)
-        "150": "NPL",          # 151-180 DPD (Non-Performing Loan)
-        "180": "CHARGE_OFF",   # 181+ DPD (Charge-off / Loss)
-        "XXX": None,           # Not reported → null
-    }
+    # OVERDUEMONTHS to DPD conversion
+    # NCB Thailand uses OVERDUEMONTHS field (integer months overdue)
+    # Convert to DPD by multiplying by 30 days/month
+    ODM_TO_DPD_MULTIPLIER = 30
 
     def __init__(self, spark: SparkSession):
         self.spark = spark
@@ -146,8 +110,12 @@ class BureauSchemaAdapter:
         # 1. Map history table (monthly snapshots)
         history_mapped = self._map_columns(bureau_history_df, self.HISTORY_SCHEMA_MAP)
 
-        # 2. Convert DPD bucket to numeric
-        history_mapped = self._convert_dpd_bucket(history_mapped)
+        # 2. Parse OVERDUEMONTHS to DPD days
+        # The dpd_bucket column contains OVERDUEMONTHS values (months overdue)
+        history_mapped = history_mapped.withColumn(
+            "dpd",
+            self._parse_overduemonths_to_dpd(F.col("dpd_bucket"))
+        )
 
         # 3. Wire RECEIVE_DT from bridge (Bug Fix #2)
         # RECEIVE_DT exists in bridge (from mnf_cra_rvw_id_dummy), NOT in history table
@@ -328,51 +296,74 @@ class BureauSchemaAdapter:
 
         return df.select(*select_expr)
 
-    def _convert_dpd_bucket(self, df: DataFrame) -> DataFrame:
+    @staticmethod
+    def _parse_overduemonths_to_dpd(odm_col):
         """
-        Convert DPD bucket to both numeric DPD and ordinal category.
+        Parse OVERDUEMONTHS field to DPD days.
 
-        Creates two columns:
-        - dpd: Numeric midpoint (for behavioral physics features)
-        - dpd_bucket_ordinal: Ordinal 0-6 (for scorecard WOE binning)
+        OVERDUEMONTHS is an integer representing months overdue.
+        Convert to DPD by multiplying by 30 days/month.
 
-        OVERDUEMONTHS format: '030' = 31-60 days, '060' = 61-90 days, etc.
+        Args:
+            odm_col: Column with OVERDUEMONTHS values (can be int or string)
 
-        Special handling:
-        - "XXX" (not reported) → null for both dpd and dpd_bucket_ordinal
-        - null → 0 (assume current if no data)
+        Returns:
+            Column with DPD days (int), null if invalid
         """
-        # Create numeric DPD mapping (midpoints for velocity/acceleration)
-        # "XXX" (not reported) should map to null, not 0
-        dpd_map_expr = F.when(F.col("dpd_bucket") == "XXX", F.lit(None).cast("int"))
-        dpd_map_expr = dpd_map_expr.when(F.col("dpd_bucket").isNull(), 0)
+        # Extract numeric digits from the column (handles both int and string)
+        digits = F.regexp_extract(odm_col.cast("string"), r"(-?\d+)", 1)
+        months_i = F.when(digits == "", F.lit(None)).otherwise(digits.cast("int"))
 
-        for bucket, dpd_value in self.DPD_BUCKET_MAP.items():
-            dpd_map_expr = dpd_map_expr.when(
-                F.col("dpd_bucket") == bucket, dpd_value
-            )
+        # Convert months to DPD days (months * 30)
+        # Use greatest(0, ...) to ensure non-negative DPD
+        return (
+            F.when(months_i.isNull(), F.lit(None).cast("int"))
+             .otherwise(F.greatest(F.lit(0), months_i * F.lit(30)))
+        )
 
-        # Default to 0 if bucket not recognized (but not XXX)
-        dpd_map_expr = dpd_map_expr.otherwise(0)
+    @staticmethod
+    def ph_code_to_dpd(col_code):
+        """
+        Convert NCB Thailand payment history code to DPD days.
 
-        df = df.withColumn("dpd", dpd_map_expr)
+        NCB uses numeric codes for payment history:
+        - "000" = 0 DPD (current)
+        - "001" = 1-30 DPD → 30
+        - "002" = 31-60 DPD → 60
+        - "003" = 61-90 DPD → 90
+        - "004" = 91-120 DPD → 120
+        - "005" = 121-150 DPD → 150
+        - "006" = 151-180 DPD → 180
+        - "007" = 181-210 DPD → 210
+        - "008" = 211-240 DPD → 240
+        - "009" = 241-270 DPD → 270
+        - Codes ending with "F" = Foreclosure → 300
+        - "Y", "N" = Yes/No indicators → null
+        - null/empty = null
 
-        # Create ordinal DPD mapping (0-6 categories for WOE binning)
-        # "XXX" (not reported) should map to null, not 0
-        dpd_ordinal_expr = F.when(F.col("dpd_bucket") == "XXX", F.lit(None).cast("int"))
-        dpd_ordinal_expr = dpd_ordinal_expr.when(F.col("dpd_bucket").isNull(), 0)
+        Args:
+            col_code: Column with payment history codes (3-char strings)
 
-        for bucket, ordinal_value in self.DPD_BUCKET_ORDINAL_MAP.items():
-            dpd_ordinal_expr = dpd_ordinal_expr.when(
-                F.col("dpd_bucket") == bucket, ordinal_value
-            )
-
-        # Default to 0 if bucket not recognized (but not XXX)
-        dpd_ordinal_expr = dpd_ordinal_expr.otherwise(0)
-
-        df = df.withColumn("dpd_bucket_ordinal", dpd_ordinal_expr)
-
-        return df
+        Returns:
+            Column with DPD days (int), null if invalid
+        """
+        c = F.upper(F.trim(col_code))
+        return (
+            F.when((c.isNull()) | (c == ""), F.lit(None).cast("int"))
+             .when(c.isin("Y", "N"), F.lit(None).cast("int"))
+             .when(c.endswith("F"), F.lit(300))
+             .when(c == "000", F.lit(0))
+             .when(c == "001", F.lit(30))
+             .when(c == "002", F.lit(60))
+             .when(c == "003", F.lit(90))
+             .when(c == "004", F.lit(120))
+             .when(c == "005", F.lit(150))
+             .when(c == "006", F.lit(180))
+             .when(c == "007", F.lit(210))
+             .when(c == "008", F.lit(240))
+             .when(c == "009", F.lit(270))
+             .otherwise(F.lit(None).cast("int"))
+        )
 
     def _parse_payment_history(self, df: DataFrame) -> DataFrame:
         """
@@ -436,22 +427,31 @@ class BureauSchemaAdapter:
         # Map schema first
         df = self._map_columns(account_df, self.ACCOUNT_SCHEMA_MAP)
 
-        # UDF to parse payment history string into array of monthly buckets
-        def parse_payment_history_udf(payment_history_str):
-            """Parse '000030060090' -> ['000', '030', '060', '090']"""
-            if not payment_history_str:
+        # UDF to parse payment history string into array of 3-char monthly codes
+        def split_string_into_3_chars(input_string):
+            """
+            Parse payment history string into 3-character chunks.
+            Example: '000030060090' -> ['000', '030', '060', '090']
+
+            Handles:
+            - Null/empty strings → []
+            - Zero-width spaces and regular spaces (strip them)
+            """
+            if input_string is None:
                 return []
-
+            # Remove zero-width spaces and regular spaces
+            s = str(input_string).replace("\u200b", "").replace(" ", "")
+            if len(s) == 0:
+                return []
             # Split into 3-character chunks
-            chunks = [payment_history_str[i:i+3] for i in range(0, len(payment_history_str), 3)]
-            return chunks
+            return [s[i:i+3] for i in range(0, len(s), 3)]
 
-        parse_udf = F.udf(parse_payment_history_udf, "array<string>")
+        split_string_udf = F.udf(split_string_into_3_chars, ArrayType(StringType()))
 
         # Parse payment history into array
         df = df.withColumn(
             "payment_history_array",
-            parse_udf(F.col("payment_history_1"))
+            split_string_udf(F.col("payment_history_1"))
         )
 
         # Add reporting gap features (account-level)
@@ -503,14 +503,18 @@ class BureauSchemaAdapter:
             )
         )
 
-        # Convert DPD bucket to numeric and ordinal
-        df = self._convert_dpd_bucket(df)
+        # Convert payment history code to DPD days
+        # dpd_bucket contains NCB payment history codes ("000", "001", "002", ...)
+        df = df.withColumn(
+            "dpd",
+            self.ph_code_to_dpd(F.col("dpd_bucket"))
+        )
 
         # Select relevant columns (DPD-only - no balance/credit_limit from payment strings)
         monthly_snapshots = df.select(
             "cust_id", "account_id", "as_of_month",
             "lender_name", "lender_id", "account_type",
-            "dpd_bucket", "dpd", "dpd_bucket_ordinal",
+            "dpd_bucket", "dpd",
             "account_open_date", "last_tdr_date",
             "has_reporting_gap",           # Account-level: 1 if any XXX in payment history
             "reporting_gap_count_12m"      # Account-level: count of XXX in last 12 months

@@ -99,8 +99,8 @@ class LenderEcologyEngine:
         return bureau_df.withColumn(
             "lender_type",
             map_type_udf(
-                F.col("lender_type_raw"),
-                F.col("lender_id")
+                F.col("lender_name"),
+                F.col("lender_name")
             )
         )
 
@@ -200,7 +200,7 @@ class LenderEcologyEngine:
         """
         # Balance by lender
         lender_balances = typed_df.groupBy(
-            "cust_id", "as_of_month", "lender_id"
+            "cust_id", "as_of_month", "lender_name"
         ).agg(
             F.sum("balance").alias("lender_balance")
         )
@@ -225,7 +225,7 @@ class LenderEcologyEngine:
         # HHI = sum of squared shares
         hhi = lender_shares.groupBy("cust_id", "as_of_month").agg(
             F.sum(F.pow(F.col("share"), 2)).alias("lender_hhi"),
-            F.count("lender_id").alias("num_lenders"),
+            F.count("lender_name").alias("num_lenders"),
             F.max("share").alias("max_lender_share")
         )
 
@@ -255,13 +255,13 @@ class LenderEcologyEngine:
         delinq_lenders = typed_df.filter(
             F.col("dpd") > 0
         ).groupBy("cust_id", "as_of_month").agg(
-            F.count("lender_id").alias("num_lenders_delinquent"),
+            F.count("lender_name").alias("num_lenders_delinquent"),
             F.collect_set("lender_type").alias("delinquent_lender_types")
         )
 
         # Total lenders
         total_lenders = typed_df.groupBy("cust_id", "as_of_month").agg(
-            F.countDistinct("lender_id").alias("total_lenders")
+            F.countDistinct("lender_name").alias("total_lenders")
         )
 
         # Join
@@ -459,7 +459,7 @@ if __name__ == "__main__":
 
     bureau_df = spark.createDataFrame(
         bureau_data,
-        ["cust_id", "as_of_month", "lender_id", "lender_type_raw",
+        ["cust_id", "as_of_month", "lender_name", "lender_name",
          "lender_type", "balance", "credit_limit", "dpd"]
     )
 
