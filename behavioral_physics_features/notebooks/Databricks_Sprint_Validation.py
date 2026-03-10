@@ -33,12 +33,25 @@ print(f"   Sample: {TEST_CUSTOMER_SAMPLE} customers")
 # COMMAND ----------
 
 # DBTITLE 1,Import Pipeline
-import sys
-sys.path.append("/Workspace/behavioral_physics_features")
+import sys, importlib
 
-from modules import BehavioralPhysicsPipeline
-from modules.cardx_schema_adapter import CardXSchemaAdapter
+# Clear any stale cached module versions
+for mod_name in list(sys.modules.keys()):
+    if mod_name == 'modules' or mod_name.startswith('modules.'):
+        del sys.modules[mod_name]
+
+# Set correct path
+MODULES_BASE = "/Workspace/Users/sushil@cardx.co.th/claude_DA2/behavioral_physics_features"
+if MODULES_BASE not in sys.path:
+    sys.path.insert(0, MODULES_BASE)
+
+# Import directly from individual modules (bypass __init__.py cache issues)
+from modules.main_pipeline import BehavioralPhysicsPipeline
+from modules.cardx_schema_adapter import CardXSchemaAdapter, build_bridge_df
 from modules.bureau_schema_adapter import BureauSchemaAdapter
+from modules.state_builder import StateBuilder
+from modules.lender_ecology import LenderEcologyEngine
+from modules.config import get_config
 from pyspark.sql import functions as F
 
 print("✅ Imports successful")
