@@ -1,11 +1,55 @@
 # ============================================================
 # NCB Behavioral Feature Factory (PySpark) - PRODUCTION
+# THREE-BUCKET + 7 PHYSICS FAMILIES ARCHITECTURE (377 features total)
+#
 # Runs one DL_DATA_DT at a time (oldest -> newest), writes to OUTPUT_TABLE, then moves to next month.
 # Dedup key: (cust_id, as_of_month). Keep the latest load (by dl_data_dt, tie-breaker created_ts).
 #
-# CHANGES FROM ORIGINAL:
+# FEATURE ARCHITECTURE:
+#   BUCKET A (Original Engines): 128 features
+#     - StateBuilder: 7 features (transition metadata)
+#     - TrajectoryEngine: 60 features (velocity, acceleration, entropy)
+#     - LenderEcology: 15 features (HHI, Gini, diversity)
+#     - EnquiriesEngine: 2 features (diversity, secured share)
+#     - CardXBureauInteractions: 15 features (Lead-Lag, Divergence, Spread)
+#     - LegalActions: 18 features
+#     - TDRRestructuring: 22 features
+#
+#   BUCKET B (Template): 121 features (+1 from dpd_accel_1m)
+#     - Base state features (12)
+#     - Bureau aggregations (14)
+#     - Lender type counts (8 with Thai classification)
+#     - Trajectory features (21: dpd_ols_slope, dpd_accel_1m, shock, deteriorate, improve, stress_frac)
+#     - Enquiry features (25)
+#     - Repayment dynamics (22)
+#     - CardX triggers (10)
+#     - Exposure dynamics (15)
+#
+#   BUCKET C (Advanced Physics): 87 features
+#     - Momentum & Inertia (15)
+#     - Energy Dynamics (14)
+#     - Thermodynamics (7)
+#     - Wave Mechanics (4)
+#     - Stress Tensor (14)
+#     - Chaos & Attractors (2)
+#     - Network Topology (15)
+#     - Field Theory (7)
+#     - Phase Transitions (4)
+#     - Relativity (0 - rejected)
+#
+#   7 PHYSICS FAMILIES (User-Specified): 41 features
+#     - Family 1: Inertia & Momentum (7)
+#     - Family 2: Critical Slowing (6)
+#     - Family 3: Phase Boundary (7)
+#     - Family 4: Hysteresis (6)
+#     - Family 5: Lender Ecology Topology (5)
+#     - Family 6: Enquiry Physics (5)
+#     - Family 7: Utilization Physics (5)
+#
+# CHANGES FROM ORIGINAL TEMPLATE:
 #   - CHANGE 1: CHECK_D → RECEIVE_DT in latest_ref_per_cif()
 #   - CHANGE 2: Thai lender patterns added to classification
+#   - CHANGE 3: Integrated all 3 buckets with deduplication
 #
 # Optimizations included:
 #   - Column pruning on reads (reduce IO)
@@ -22,6 +66,25 @@ from pyspark.sql import Window
 from pyspark.sql.types import ArrayType, StringType
 from pyspark.storagelevel import StorageLevel
 from delta.tables import DeltaTable
+
+# Import advanced behavioral physics features (Bucket C - 87 features)
+from advanced_behavioral_physics import add_advanced_behavioral_physics_features
+
+# Import 7 physics families (41 features)
+from physics_families import add_all_physics_families
+
+# Import original behavioral physics engines (Bucket A - 128 features)
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'modules'))
+
+from modules.state_builder import StateBuilder
+from modules.trajectory_engine import TrajectoryEngine
+from modules.lender_ecology import LenderEcologyEngine
+from modules.enquiries_engine import EnquiriesEngine
+from modules.cardx_bureau_interactions import CardXBureauInteractions
+from modules.legal_actions import LegalActionsEngine
+from modules.tdr_restructuring import TDRRestructuringEngine
 
 # -------------------------
 # OUTPUT / INPUT TABLES
@@ -436,7 +499,7 @@ def add_trajectory_features(panel: DataFrame) -> DataFrame:
         panel = panel.withColumn(f"ty_sum_{m}m", ty)
 
         panel = panel.withColumn(
-            f"dpd_slope_{m}m",
+            f"dpd_ols_slope_{m}m",
             F.when(F.lit(m) >= 2,
                    (F.col(f"ty_sum_{m}m") - (F.lit(t_sum) * F.col(f"y_sum_{m}m") / F.lit(float(m)))) / F.lit(float(var_t))
             ).otherwise(F.lit(None))
@@ -447,6 +510,12 @@ def add_trajectory_features(panel: DataFrame) -> DataFrame:
                    + F.lag(F.col("bureau_max_dpd").cast("double"), 2).over(w))
         panel = panel.withColumn(f"dpd_accel_mean_{m}m", F.avg(secdiff).over(ww))
         panel = panel.withColumn(f"stress_frac_{m}m", F.avg("is_stressed_m").over(ww))
+
+    # Single-month acceleration (not averaged) for jerk computation
+    secdiff_1m = (F.col("bureau_max_dpd").cast("double")
+                  - 2*F.lag(F.col("bureau_max_dpd").cast("double"), 1).over(w)
+                  + F.lag(F.col("bureau_max_dpd").cast("double"), 2).over(w))
+    panel = panel.withColumn("dpd_accel_1m", secdiff_1m)
 
     w12 = Window.partitionBy("cust_id").orderBy("as_of_month").rowsBetween(-11, 0)
     panel = (panel
@@ -570,7 +639,7 @@ def build_audit_log(panel: DataFrame) -> DataFrame:
     dup = panel.groupBy("cust_id", "as_of_month").count().where(F.col("count") > 1)
     dup_cnt = dup.count()
 
-    cols_check = ["bureau_max_dpd","state","dpd_slope_6m","state_entropy_12m","stress_frac_12m"]
+    cols_check = ["bureau_max_dpd","state","dpd_ols_slope_6m","state_entropy_12m","stress_frac_12m"]
     miss_exprs = [(F.sum(F.when(F.col(c).isNull(), 1).otherwise(0)) / F.count(F.lit(1))).alias(f"nullrate__{c}") for c in cols_check]
     miss_df = panel.agg(*miss_exprs)
 
@@ -596,7 +665,10 @@ def build_ncb_behavioral_feature_store(
     run_audit: bool = False,
 ) -> Tuple[DataFrame, DataFrame, Optional[DataFrame]]:
 
-    panel_base, hist_joined_df, _ = build_monthly_panel_from_ncb(
+    # Get SparkSession for initializing engines
+    spark = id_dummy_df.sql_ctx.sparkSession
+
+    panel_base, hist_joined_df, enq_m = build_monthly_panel_from_ncb(
         id_dummy_df=id_dummy_df,
         s_account_df=s_account_df,
         s_history_df=s_history_df,
@@ -609,6 +681,9 @@ def build_ncb_behavioral_feature_store(
     panel_base = panel_base.persist(StorageLevel.MEMORY_AND_DISK)
     panel_base.count()
 
+    # ========================================================================
+    # BUCKET B: TEMPLATE FEATURES (120 features after dedup)
+    # ========================================================================
     panel = add_trajectory_features(panel_base)
     panel = add_enquiry_roll_features(panel)
     panel = add_repayment_dynamics_from_ncb(panel)
@@ -631,6 +706,153 @@ def build_ncb_behavioral_feature_store(
             .withColumn(f"util_avg_{m}m", F.avg("bureau_util").over(ww))
             .withColumn(f"util_vol_{m}m", F.stddev_pop("bureau_util").over(ww))
         )
+
+    # ========================================================================
+    # BUCKET A: ORIGINAL ENGINE FEATURES (128 features after dedup)
+    # Adds unique features not present in template
+    # ========================================================================
+    print("\n" + "="*80)
+    print("INTEGRATING BUCKET A: ORIGINAL BEHAVIORAL PHYSICS ENGINES")
+    print("="*80)
+
+    # Initialize engines
+    state_builder = StateBuilder(spark)
+    trajectory_engine = TrajectoryEngine(spark)
+    lender_ecology = LenderEcologyEngine(spark)
+    enquiries_engine = EnquiriesEngine(spark)
+    cardx_interactions = CardXBureauInteractions(spark)
+    legal_actions = LegalActionsEngine(spark)
+    tdr_restructuring = TDRRestructuringEngine(spark)
+
+    # 1. StateBuilder - 7 unique features (state transition metadata)
+    print("\n1/7: StateBuilder (7 features)...")
+    # StateBuilder needs hist_joined_df converted to trade format
+    # Most state features already in template, only get transition metadata
+    state_df = state_builder.compute_state_transitions(panel)
+    state_unique_cols = ["prev_month_state", "prev_month_regime", "current_state_streak",
+                        "max_s3_streak", "max_s4_streak", "state_change_indicator", "state_group"]
+    for col in state_unique_cols:
+        if col in state_df.columns and col not in panel.columns:
+            panel = panel.join(
+                state_df.select("cust_id", "as_of_month", col),
+                on=["cust_id", "as_of_month"],
+                how="left"
+            )
+    print("✓ StateBuilder features integrated")
+
+    # 2. TrajectoryEngine - 60 features (velocity, acceleration, transitions, entropy)
+    print("\n2/7: TrajectoryEngine (60 features)...")
+    # Reconstruct bureau_trade_df from hist_joined for trajectory engine
+    bureau_trade_for_traj = hist_joined_df.select(
+        "cust_id", "as_of_month", "dpd_proxy_final", "creditlimit_hs", "amountowed_hs"
+    ).withColumnRenamed("dpd_proxy_final", "dpd") \
+     .withColumnRenamed("creditlimit_hs", "credit_limit") \
+     .withColumnRenamed("amountowed_hs", "balance")
+
+    traj_df = trajectory_engine.compute_all_features(panel, bureau_trade_for_traj)
+    # Join trajectory features (exclude duplicates already in template)
+    traj_unique_cols = [c for c in traj_df.columns if c not in panel.columns
+                       and c not in ["cust_id", "as_of_month"]]
+    if traj_unique_cols:
+        panel = panel.join(
+            traj_df.select("cust_id", "as_of_month", *traj_unique_cols),
+            on=["cust_id", "as_of_month"],
+            how="left"
+        )
+    print(f"✓ TrajectoryEngine features integrated ({len(traj_unique_cols)} unique)")
+
+    # 3. LenderEcology - 15 specific features
+    print("\n3/7: LenderEcology (15 features)...")
+    lender_df = lender_ecology.compute_all_features(bureau_trade_for_traj, panel)
+    # Only keep the 15 user-specified features
+    lender_keep_cols = [
+        "hhi_lender_concentration", "gini_lender_concentration",
+        "shannon_entropy_lender_tiers", "network_degree_m",
+        "tier_downgrade_flag", "nano_entry_ever_flag", "nano_entry_3m_flag",
+        "new_lender_velocity_3m", "new_lender_velocity_6m",
+        "lender_age_mean", "lender_age_diversity",
+        "formal_to_informal_ratio", "top1_lender_balance_share",
+        "top3_lender_balance_share", "lender_tier_mix_index"
+    ]
+    lender_available = [c for c in lender_keep_cols if c in lender_df.columns]
+    if lender_available:
+        panel = panel.join(
+            lender_df.select("cust_id", "as_of_month", *lender_available),
+            on=["cust_id", "as_of_month"],
+            how="left"
+        )
+    print(f"✓ LenderEcology features integrated ({len(lender_available)} of 15)")
+
+    # 4. EnquiriesEngine - 2 unique features (diversity, secured share)
+    print("\n4/7: EnquiriesEngine (2 features)...")
+    # Reconstruct enquiry_df from enq_m
+    enq_df = enquiries_engine.compute_all_features(enq_m, bureau_trade_for_traj)
+    enq_unique_cols = ["enquiry_type_diversity", "secured_enquiry_share"]
+    enq_available = [c for c in enq_unique_cols if c in enq_df.columns]
+    if enq_available:
+        panel = panel.join(
+            enq_df.select("cust_id", "as_of_month", *enq_available),
+            on=["cust_id", "as_of_month"],
+            how="left"
+        )
+    print(f"✓ EnquiriesEngine features integrated ({len(enq_available)} of 2)")
+
+    # 5. CardXBureauInteractions - 15 unique features (Lead-Lag, Divergence, Util Spread)
+    print("\n5/7: CardXBureauInteractions (15 features)...")
+    # Needs bureau + cardx data - extract from panel
+    cardx_df = cardx_interactions.compute_all_features(bureau_trade_for_traj, panel, panel)
+    # Exclude trigger features (duplicates), keep Lead-Lag, Divergence, Util Spread
+    cardx_exclude = ["others_then_cardx_trigger", "cardx_then_others_trigger"]
+    cardx_unique_cols = [c for c in cardx_df.columns if c not in panel.columns
+                        and c not in cardx_exclude and c not in ["cust_id", "as_of_month"]]
+    if cardx_unique_cols:
+        panel = panel.join(
+            cardx_df.select("cust_id", "as_of_month", *cardx_unique_cols),
+            on=["cust_id", "as_of_month"],
+            how="left"
+        )
+    print(f"✓ CardXBureauInteractions features integrated ({len(cardx_unique_cols)} unique)")
+
+    # 6. LegalActions - 18 features
+    print("\n6/7: LegalActions (18 features)...")
+    legal_df = legal_actions.compute_all_features(bureau_trade_for_traj)
+    legal_cols = [c for c in legal_df.columns if c not in ["cust_id", "as_of_month"]]
+    if legal_cols:
+        panel = panel.join(
+            legal_df.select("cust_id", "as_of_month", *legal_cols),
+            on=["cust_id", "as_of_month"],
+            how="left"
+        )
+    print(f"✓ LegalActions features integrated ({len(legal_cols)} features)")
+
+    # 7. TDRRestructuring - 22 features
+    print("\n7/7: TDRRestructuring (22 features)...")
+    tdr_df = tdr_restructuring.compute_all_features(bureau_trade_for_traj)
+    tdr_cols = [c for c in tdr_df.columns if c not in ["cust_id", "as_of_month"]]
+    if tdr_cols:
+        panel = panel.join(
+            tdr_df.select("cust_id", "as_of_month", *tdr_cols),
+            on=["cust_id", "as_of_month"],
+            how="left"
+        )
+    print(f"✓ TDRRestructuring features integrated ({len(tdr_cols)} features)")
+
+    print("\n" + "="*80)
+    print("✅ BUCKET A INTEGRATION COMPLETE")
+    print("="*80 + "\n")
+
+    # ========================================================================
+    # BUCKET C: ADVANCED BEHAVIORAL PHYSICS FEATURES (87 features after review)
+    # Momentum, energy dynamics, thermodynamics, stress tensor, network topology,
+    # field theory, phase transitions - state-of-the-art physics features
+    # ========================================================================
+    panel = add_advanced_behavioral_physics_features(panel)
+
+    # ========================================================================
+    # 7 PHYSICS FAMILIES (41 features - user-specified)
+    # Additions to the 335 existing features (Buckets A+B+C)
+    # ========================================================================
+    panel = add_all_physics_families(panel, hist_joined_df)
 
     key_cols = ["cust_id", "as_of_month"]
     monthly_feature_df = panel.select(*key_cols, *[c for c in panel.columns if c not in key_cols]).repartition("cust_id")

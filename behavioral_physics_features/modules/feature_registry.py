@@ -24,6 +24,9 @@ from .trajectory_engine import TrajectoryEngine
 from .lender_ecology import LenderEcologyEngine
 from .repayment_dynamics import RepaymentDynamicsEngine
 from .enquiries_engine import EnquiriesEngine
+from .cardx_bureau_interactions import CardXBureauInteractions
+from .legal_actions import LegalActionsEngine
+from .tdr_restructuring import TDRRestructuringEngine
 
 
 class FeatureType(Enum):
@@ -86,6 +89,9 @@ class FeatureRegistry:
         self.lender_ecology = LenderEcologyEngine(spark)
         self.repayment_dynamics = RepaymentDynamicsEngine(spark)
         self.enquiries_engine = EnquiriesEngine(spark)
+        self.cardx_bureau_interactions = CardXBureauInteractions(spark)
+        self.legal_actions = LegalActionsEngine(spark)
+        self.tdr_restructuring = TDRRestructuringEngine(spark)
 
         # Build feature catalog
         self.feature_catalog = self._build_feature_catalog()
@@ -151,11 +157,32 @@ class FeatureRegistry:
         print(f"✓ Repayment dynamics features computed (35 features)")
 
         # 5. Enquiry Features
-        print("\nStep 5/5: Computing enquiry features...")
+        print("\nStep 5/8: Computing enquiry features...")
         enquiry_df = self.enquiries_engine.compute_all_features(
             bureau_enquiry_df, bureau_trade_df
         )
         print(f"✓ Enquiry features computed (12 features)")
+
+        # 6. CardX Bureau Interactions
+        print("\nStep 6/8: Computing CardX bureau interactions...")
+        cardx_interactions_df = self.cardx_bureau_interactions.compute_all_features(
+            bureau_trade_df, cardx_internal_df, state_df
+        )
+        print(f"✓ CardX interactions computed (20 features)")
+
+        # 7. Legal Actions
+        print("\nStep 7/8: Computing legal actions features...")
+        legal_df = self.legal_actions.compute_all_features(
+            bureau_trade_df
+        )
+        print(f"✓ Legal actions computed (18 features)")
+
+        # 8. TDR Restructuring
+        print("\nStep 8/8: Computing TDR restructuring features...")
+        tdr_df = self.tdr_restructuring.compute_all_features(
+            bureau_trade_df
+        )
+        print(f"✓ TDR restructuring computed (22 features)")
 
         # Combine all features
         print("\nCombining all features...")
@@ -175,6 +202,24 @@ class FeatureRegistry:
 
         features_df = features_df.join(
             enquiry_df,
+            on=["cust_id", "as_of_month"],
+            how="left"
+        )
+
+        features_df = features_df.join(
+            cardx_interactions_df,
+            on=["cust_id", "as_of_month"],
+            how="left"
+        )
+
+        features_df = features_df.join(
+            legal_df,
+            on=["cust_id", "as_of_month"],
+            how="left"
+        )
+
+        features_df = features_df.join(
+            tdr_df,
             on=["cust_id", "as_of_month"],
             how="left"
         )

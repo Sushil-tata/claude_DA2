@@ -73,8 +73,8 @@ class TrajectoryEngine:
         Compute velocity features (rate of change).
 
         Features:
-        - dpd_velocity_3m: Slope of max DPD over 3 months
-        - dpd_velocity_6m: Slope over 6 months
+        - dpd_diff_velocity_3m: Slope of max DPD over 3 months
+        - dpd_diff_velocity_6m: Slope over 6 months
         - util_velocity_3m: Utilization rate of change
         - balance_velocity_6m: Balance trajectory
         """
@@ -91,7 +91,7 @@ class TrajectoryEngine:
             # DPD velocity (linear regression slope)
             # Using (current - start) / months as approximation
             state_df = state_df.withColumn(
-                f"dpd_velocity_{window}m",
+                f"dpd_diff_velocity_{window}m",
                 (F.col("bureau_max_dpd") -
                  F.first("bureau_max_dpd").over(w)) / window
             )
@@ -153,8 +153,8 @@ class TrajectoryEngine:
             # Compute change in velocity (acceleration)
             df = df.withColumn(
                 f"dpd_acceleration_{window}m",
-                F.col(f"dpd_velocity_{window}m") -
-                F.lag(f"dpd_velocity_{window}m", 1).over(w)
+                F.col(f"dpd_diff_velocity_{window}m") -
+                F.lag(f"dpd_diff_velocity_{window}m", 1).over(w)
             )
 
             # Shock flag (sudden acceleration > threshold)
@@ -354,7 +354,7 @@ if __name__ == "__main__":
     print("\nVelocity Features:")
     features_df.select(
         "cust_id", "as_of_month", "bureau_max_dpd",
-        "dpd_velocity_3m", "util_velocity_3m"
+        "dpd_diff_velocity_3m", "util_velocity_3m"
     ).orderBy("cust_id", "as_of_month").show()
 
     print("\nAcceleration Features:")
