@@ -287,7 +287,7 @@ def explode_payment_history_monthly(acct_df: DataFrame) -> DataFrame:
         .withColumn("ph_code", F.element_at(F.col("ph_all"), F.col("idx") + 1))
         .withColumn("as_of_month", F.add_months(F.col("end_month"), -F.col("idx")))
         .withColumn("dpd_from_ph", ph_code_to_dpd(F.col("ph_code")))
-        .select("cust_id", "REF_NO", "seq_tl", "as_of_month", "dpd_from_ph")
+        .select("REF_NO", "seq_tl", "as_of_month", "dpd_from_ph")
     )
 
 # -------------------------
@@ -353,10 +353,12 @@ def build_monthly_panel_from_ncb(
     ph_monthly = explode_payment_history_monthly(acc)
 
     # ---- Join per tradeline-month
+    # FIX B: Use ref_no only (not cust_id + REF_NO) to prevent ambiguity
     hist_joined = (hs
-        .join(acc.select("cust_id","REF_NO","seq_tl","member_id","is_cardx","lender_type","acct_type","account_status","defaultdate"),
-              ["cust_id","REF_NO","seq_tl"], "left")
-        .join(ph_monthly, ["cust_id","REF_NO","seq_tl","as_of_month"], "left")
+        .join(acc.select("REF_NO","seq_tl","member_id","is_cardx","lender_type","acct_type","account_status","defaultdate"),
+              ["REF_NO","seq_tl"], "left")
+        .join(ph_monthly, ["REF_NO","seq_tl","as_of_month"], "left")
+        .dropDuplicates(["REF_NO", "seq_tl", "as_of_month"])  # FIX C: Dedup guard after join
         .withColumn(
             "default_active_m",
             F.when(
