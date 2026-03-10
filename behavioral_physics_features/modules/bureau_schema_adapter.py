@@ -111,9 +111,6 @@ class BureauSchemaAdapter:
         # 1. Map history table (monthly snapshots)
         history_mapped = self._map_columns(bureau_history_df, self.HISTORY_SCHEMA_MAP)
 
-        # Add cust_id as alias for ref_no (for downstream compatibility)
-        history_mapped = history_mapped.withColumn("cust_id", F.col("ref_no"))
-
         # 2. Parse OVERDUEMONTHS to DPD days
         # The dpd_bucket column contains OVERDUEMONTHS values (months overdue)
         history_mapped = history_mapped.withColumn(
@@ -141,13 +138,30 @@ class BureauSchemaAdapter:
         history_mapped = history_mapped.withColumnRenamed("RECEIVE_DT", "receive_dt")
         history_mapped = history_mapped.withColumnRenamed("DL_DATA_DT", "dl_data_dt")
 
+        # FIX 2: Create cust_id alias ONCE (after bridge join, before any other joins)
+        # PRINCIPLE: cust_id is created HERE and propagates to all downstream joins
+        # NO other DataFrame should create its own cust_id
+        history_mapped = history_mapped.select(
+            F.col("ref_no"),
+            F.col("ref_no").alias("cust_id"),   # Compatibility alias - ONE instance only
+            F.col("seq_tl"),
+            F.col("as_of_month"),
+            F.col("dpd"),
+            F.col("dpd_bucket"),
+            F.col("credit_limit"),
+            F.col("balance"),
+            F.col("receive_dt"),
+            F.col("dl_data_dt")
+        )
+
         print(f"✓ Wired RECEIVE_DT from bridge to {history_mapped.count():,} history rows")
+        print(f"✓ Created cust_id alias ONCE (single source of truth)")
 
         # 4. Map account table
         account_mapped = self._map_columns(bureau_account_df, self.ACCOUNT_SCHEMA_MAP)
 
-        # Add cust_id as alias for ref_no (for downstream compatibility)
-        account_mapped = account_mapped.withColumn("cust_id", F.col("ref_no"))
+        # FIX 2: DO NOT create cust_id here - it comes from history_mapped join
+        # account_mapped uses ref_no only
 
         # Note: Only lender_name (from MEMBERSHORTNAME) is used
         # No lender_id column created
@@ -159,14 +173,15 @@ class BureauSchemaAdapter:
         # Use history as primary source for monthly snapshots
         # Enrich with account master attributes
         # Unique tradeline identifier: (ref_no, seq_tl) = (REF_NO, SEQ_TL)
+        # FIX 2: DO NOT select cust_id from account_static (avoid duplicate column)
         account_static = account_mapped.select(
-            "ref_no", "seq_tl", "cust_id", "account_id", "lender_name", "account_type",
+            "ref_no", "seq_tl", "account_id", "lender_name", "account_type",
             "account_open_date", "account_close_date", "last_tdr_date",
             "emi_amount", "tenure_months"
         ).dropDuplicates(["ref_no", "seq_tl"])
 
         # Join history with account attributes on unique tradeline key
-        # Explicit REF_NO join to ensure tradeline uniqueness
+        # FIX 2: cust_id comes from history_mapped only (single source of truth)
         bureau_trade = history_mapped.join(
             account_static,
             on=["ref_no", "seq_tl"],  # Unique tradeline = (REF_NO, SEQ_TL)
@@ -267,8 +282,9 @@ class BureauSchemaAdapter:
         # Map columns
         enquiry_mapped = self._map_columns(bureau_enquiry_df, self.ENQUIRY_SCHEMA_MAP)
 
-        # Add cust_id as alias for ref_no (for downstream compatibility)
-        enquiry_mapped = enquiry_mapped.withColumn("cust_id", F.col("ref_no"))
+        # FIX 2: DO NOT create cust_id here
+        # When this gets joined to panel, cust_id comes from panel (which gets it from history_mapped)
+        # enquiry_mapped uses ref_no only for joins
 
         # Note: Only lender_name (from MEMBERSHORTNAME) is used
         # No lender_id column created
@@ -511,15 +527,19 @@ class BureauSchemaAdapter:
         )
 
         # Convert payment history code to DPD days
-        # dpd_bucket contains NCB payment history codes ("000", "001", "002", ...)
+        # dpd_bucket contains NCB payment history codes ("000", "001", "002", ...")
         df = df.withColumn(
             "dpd",
             self.ph_code_to_dpd(F.col("dpd_bucket"))
         )
 
+        # FIX 2: Create cust_id as alias of ref_no (for schema compatibility with bureau_trade)
+        # Payment history snapshots will be union'd with bureau_trade, which has cust_id
+        df = df.withColumn("cust_id", F.col("ref_no"))
+
         # Select relevant columns (DPD-only - no balance/credit_limit from payment strings)
         monthly_snapshots = df.select(
-            "cust_id", "account_id", "as_of_month",
+            "ref_no", "cust_id", "account_id", "as_of_month",
             "lender_name", "account_type",
             "dpd_bucket", "dpd",
             "account_open_date", "last_tdr_date",
