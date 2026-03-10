@@ -154,6 +154,10 @@ class BureauSchemaAdapter:
             F.col("dl_data_dt")
         )
 
+        # FIX: Deduplicate after bridge join to prevent fan-out
+        # If bridge has duplicate REF_NO (multiple reports), this prevents cartesian explosion
+        history_mapped = history_mapped.dropDuplicates(["ref_no", "seq_tl", "as_of_month"])
+
         print(f"✓ Wired RECEIVE_DT from bridge to {history_mapped.count():,} history rows")
         print(f"✓ Created cust_id alias ONCE (single source of truth)")
 

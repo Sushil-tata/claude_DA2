@@ -68,14 +68,8 @@ print("=" * 70)
 print("TEST 1: BRIDGE JOIN VALIDATION")
 print("=" * 70)
 
-cardx_adapter = CardXSchemaAdapter(spark)
-
-# Build bridge
-bridge_df = cardx_adapter.build_bridge_df(
-    spark=spark,
-    as_of_month=TEST_MONTH,
-    catalog=CATALOG
-)
+# Build bridge using module-level function (not a class method)
+bridge_df = build_bridge_df(spark, as_of_month=TEST_MONTH)
 
 print(f"\n📊 Bridge Statistics:")
 bridge_count = bridge_df.count()
