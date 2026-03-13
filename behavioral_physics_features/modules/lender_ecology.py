@@ -166,7 +166,7 @@ class LenderEcologyEngine:
             )
 
             # Limit share (for selected types)
-            if ltype in ["PSU_BANK", "FINTECH", "CARDX"]:
+            if ltype in ["SFI", "FINTECH", "CARDX"]:
                 shares = shares.withColumn(
                     f"{ltype.lower()}_limit_share",
                     F.when(
@@ -179,7 +179,7 @@ class LenderEcologyEngine:
         share_cols = ["cust_id", "as_of_month"]
         for ltype in lender_types:
             share_cols.append(f"{ltype.lower()}_balance_share")
-        for ltype in ["PSU_BANK", "FINTECH", "CARDX"]:
+        for ltype in ["SFI", "FINTECH", "CARDX"]:
             share_cols.append(f"{ltype.lower()}_limit_share")
 
         return shares.select(*share_cols)
@@ -297,10 +297,10 @@ class LenderEcologyEngine:
         )
 
         diffusion = diffusion.withColumn(
-            "psu_delinquent_flag",
+            "sfi_delinquent_flag",
             F.array_contains(
                 F.coalesce(F.col("delinquent_lender_types"), F.array()),
-                "PSU_BANK"
+                "SFI"
             ).cast("int")
         )
 
@@ -310,7 +310,7 @@ class LenderEcologyEngine:
             "synchronized_delinquency_flag",
             "diffusion_score",
             "fintech_delinquent_flag",
-            "psu_delinquent_flag"
+            "sfi_delinquent_flag"
         )
 
     def _compute_cardx_features(

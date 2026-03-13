@@ -191,6 +191,14 @@ class CardXSchemaAdapter:
 
         if total_rows != unique_accounts:
             print(f"⚠️  WARNING: Fan-out detected! {total_rows:,} rows vs {unique_accounts:,} unique")
+            # Defensive dedup: keep one row per (cust_id, as_of_month)
+            # Take max DPD / max balance to be conservative
+            cardx_mapped = cardx_mapped.groupBy("cust_id", "as_of_month").agg(
+                F.max("cardx_dpd").alias("cardx_dpd"),
+                F.max("cardx_balance").alias("cardx_balance"),
+                F.max("cardx_credit_limit").alias("cardx_credit_limit")
+            )
+            print(f"✓ Deduped to {cardx_mapped.count():,} rows")
         else:
             print(f"✓ No fan-out: {total_rows:,} rows = {unique_accounts:,} unique accounts")
 

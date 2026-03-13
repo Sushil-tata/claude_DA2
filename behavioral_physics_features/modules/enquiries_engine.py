@@ -355,7 +355,10 @@ class EnquiriesEngine:
         )
 
         # Get enquiry purpose/type (if available)
-        if "ENQUIRYPURPOSE" in bureau_enquiry_df.columns:
+        # After schema adaptation, column is 'enquiry_purpose' (lowercase)
+        if "enquiry_purpose" in bureau_enquiry_df.columns:
+            type_col = "enquiry_purpose"
+        elif "ENQUIRYPURPOSE" in bureau_enquiry_df.columns:
             type_col = "ENQUIRYPURPOSE"
         elif "PURPOSE" in bureau_enquiry_df.columns:
             type_col = "PURPOSE"

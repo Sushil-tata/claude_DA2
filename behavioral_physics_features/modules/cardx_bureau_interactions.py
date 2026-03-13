@@ -430,6 +430,15 @@ class CardXBureauInteractionsEngine:
             ).cast("int")
         )
 
+        # Compute cardx_early_warning_flag locally (CardX delinquent but bureau clean)
+        combined_df = combined_df.withColumn(
+            "cardx_early_warning_flag",
+            (
+                (F.col("cardx_delinquent_flag") == 1) &
+                (F.col("bureau_delinquent_flag") == 0)
+            ).cast("int")
+        )
+
         # Information value (how much CardX adds beyond bureau)
         combined_df = combined_df.withColumn(
             "cardx_information_value",

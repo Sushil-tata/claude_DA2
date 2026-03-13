@@ -24,7 +24,7 @@ from .trajectory_engine import TrajectoryEngine
 from .lender_ecology import LenderEcologyEngine
 from .repayment_dynamics import RepaymentDynamicsEngine
 from .enquiries_engine import EnquiriesEngine
-from .cardx_bureau_interactions import CardXBureauInteractions
+from .cardx_bureau_interactions import CardXBureauInteractionsEngine
 from .legal_actions import LegalActionsEngine
 from .tdr_restructuring import TDRRestructuringEngine
 
@@ -89,7 +89,7 @@ class FeatureRegistry:
         self.lender_ecology = LenderEcologyEngine(spark)
         self.repayment_dynamics = RepaymentDynamicsEngine(spark)
         self.enquiries_engine = EnquiriesEngine(spark)
-        self.cardx_bureau_interactions = CardXBureauInteractions(spark)
+        self.cardx_bureau_interactions = CardXBureauInteractionsEngine(spark)
         self.legal_actions = LegalActionsEngine(spark)
         self.tdr_restructuring = TDRRestructuringEngine(spark)
 
@@ -133,6 +133,8 @@ class FeatureRegistry:
         state_df = self.state_builder.build_states(
             bureau_trade_df, cardx_internal_df
         )
+        # Add state transitions (creates state_changed, regime_changed columns)
+        state_df = self.state_builder.compute_state_transitions(state_df)
         print(f"✓ States built for {state_df.select('cust_id').distinct().count()} customers")
 
         # 2. Trajectory Features
