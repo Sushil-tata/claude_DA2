@@ -128,8 +128,8 @@ def validate_lender_classification():
     print("-"*120)
 
     for i, result in enumerate(results[:30], 1):
-        lender_name = result["lender_name"][:48]  # Truncate long names
-        lender_id = result["lender_id"][:8]
+        lender_name = result["lender_name"][:48] if result["lender_name"] else "UNKNOWN"
+        lender_id = result["lender_id"][:8] if result["lender_id"] else "N/A"
         lender_type = result["lender_type"]
         customers = result["customer_count"]
         accounts = result["account_count"]
@@ -192,8 +192,8 @@ def validate_lender_classification():
         print("-"*90)
 
         for result in sorted(other_lenders, key=lambda x: x["customer_count"], reverse=True):
-            lender_name = result["lender_name"][:58]
-            lender_id = result["lender_id"][:8]
+            lender_name = result["lender_name"][:58] if result["lender_name"] else "UNKNOWN"
+            lender_id = result["lender_id"][:8] if result["lender_id"] else "N/A"
             customers = result["customer_count"]
             print(f"{lender_name:<60} {lender_id:<10} {customers:>12,}")
 
