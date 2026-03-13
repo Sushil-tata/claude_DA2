@@ -118,6 +118,20 @@ class BureauSchemaAdapter:
             self._parse_overduemonths_to_dpd(F.col("dpd_bucket"))
         )
 
+        # 2b. Create dpd_bucket_ordinal (0-6 ordinal for scorecard WOE binning)
+        # Null for XXX (dpd=null), otherwise map DPD to Thai regulatory buckets
+        history_mapped = history_mapped.withColumn(
+            "dpd_bucket_ordinal",
+            F.when(F.col("dpd").isNull(), None)  # XXX → null
+             .when(F.col("dpd") == 0, 0)          # CURRENT
+             .when(F.col("dpd") <= 30, 1)         # SM-1
+             .when(F.col("dpd") <= 60, 2)         # SM-2
+             .when(F.col("dpd") <= 90, 3)         # SM-3
+             .when(F.col("dpd") <= 120, 4)        # NPL-1
+             .when(F.col("dpd") <= 180, 5)        # NPL-2
+             .otherwise(6)                         # CHARGE_OFF (181+)
+        )
+
         # 3. Wire RECEIVE_DT from bridge (Bug Fix #2)
         # RECEIVE_DT exists in bridge (from mnf_cra_rvw_id_dummy), NOT in history table
         # Join bridge to attach RECEIVE_DT and DL_DATA_DT to each history row
@@ -148,6 +162,7 @@ class BureauSchemaAdapter:
             F.col("as_of_month"),
             F.col("dpd"),
             F.col("dpd_bucket"),
+            F.col("dpd_bucket_ordinal"),  # Ordinal 0-6 for scorecard binning
             F.col("credit_limit"),
             F.col("balance"),
             F.col("receive_dt"),
@@ -538,6 +553,20 @@ class BureauSchemaAdapter:
             self.ph_code_to_dpd(F.col("dpd_bucket"))
         )
 
+        # Create dpd_bucket_ordinal (0-6 ordinal for scorecard WOE binning)
+        # Null for XXX (dpd=null), otherwise map DPD to Thai regulatory buckets
+        df = df.withColumn(
+            "dpd_bucket_ordinal",
+            F.when(F.col("dpd").isNull(), None)  # XXX → null
+             .when(F.col("dpd") == 0, 0)          # CURRENT
+             .when(F.col("dpd") <= 30, 1)         # SM-1
+             .when(F.col("dpd") <= 60, 2)         # SM-2
+             .when(F.col("dpd") <= 90, 3)         # SM-3
+             .when(F.col("dpd") <= 120, 4)        # NPL-1
+             .when(F.col("dpd") <= 180, 5)        # NPL-2
+             .otherwise(6)                         # CHARGE_OFF (181+)
+        )
+
         # CRITICAL FIX: Create cust_id RIGHT BEFORE select (not before posexplode)
         # Spark's selectExpr("*", "posexplode(...)") can drop columns created earlier
         # Creating cust_id here ensures it exists when select statement executes
@@ -547,7 +576,7 @@ class BureauSchemaAdapter:
         monthly_snapshots = df.select(
             "ref_no", "cust_id", "account_id", "as_of_month",
             "lender_name", "account_type",
-            "dpd_bucket", "dpd",
+            "dpd_bucket", "dpd", "dpd_bucket_ordinal",
             "account_open_date", "last_tdr_date",
             "has_reporting_gap",           # Account-level: 1 if any XXX in payment history
             "reporting_gap_count_12m"      # Account-level: count of XXX in last 12 months
