@@ -108,8 +108,8 @@ def validate_lender_classification():
         customer_count = row["customer_count"]
         account_count = row["account_count"]
 
-        # Test classification
-        lender_type = config.map_lender_type(lender_name, lender_id)
+        # Test classification (only pass lender_name, not lender_id)
+        lender_type = config.map_lender_type(lender_name)
 
         results.append({
             "lender_name": lender_name,
