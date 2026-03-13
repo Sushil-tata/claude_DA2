@@ -181,7 +181,7 @@ class BureauSchemaAdapter:
         account_static = account_mapped.select(
             "ref_no", "seq_tl", "account_id", "lender_name", "account_type",
             "account_open_date", "account_close_date", "last_tdr_date",
-            "emi_amount", "tenure_months"
+            "emi_amount", "tenure_months", "account_status"
         ).dropDuplicates(["ref_no", "seq_tl"])
 
         # Join history with account attributes on unique tradeline key
@@ -286,9 +286,10 @@ class BureauSchemaAdapter:
         # Map columns
         enquiry_mapped = self._map_columns(bureau_enquiry_df, self.ENQUIRY_SCHEMA_MAP)
 
-        # FIX 2: DO NOT create cust_id here
-        # When this gets joined to panel, cust_id comes from panel (which gets it from history_mapped)
-        # enquiry_mapped uses ref_no only for joins
+        # Create cust_id as alias of ref_no
+        # Required by: _validate_inputs(), EnquiriesEngine (crossJoin on cust_id),
+        # and feature_registry joins on ["cust_id", "as_of_month"]
+        enquiry_mapped = enquiry_mapped.withColumn("cust_id", F.col("ref_no"))
 
         # Note: Only lender_name (from MEMBERSHORTNAME) is used
         # No lender_id column created
@@ -537,8 +538,9 @@ class BureauSchemaAdapter:
             self.ph_code_to_dpd(F.col("dpd_bucket"))
         )
 
-        # FIX 2: Create cust_id as alias of ref_no (for schema compatibility with bureau_trade)
-        # Payment history snapshots will be union'd with bureau_trade, which has cust_id
+        # CRITICAL FIX: Create cust_id RIGHT BEFORE select (not before posexplode)
+        # Spark's selectExpr("*", "posexplode(...)") can drop columns created earlier
+        # Creating cust_id here ensures it exists when select statement executes
         df = df.withColumn("cust_id", F.col("ref_no"))
 
         # Select relevant columns (DPD-only - no balance/credit_limit from payment strings)
