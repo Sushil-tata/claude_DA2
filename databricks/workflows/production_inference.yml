@@ -1,0 +1,96 @@
+name: production_inference_daily
+description: Daily production batch inference for income estimation
+
+# Schedule: Daily at 2 AM UTC
+schedule:
+  quartz_cron_expression: "0 0 2 * * ?"
+  timezone_id: "UTC"
+  pause_status: "UNPAUSED"
+
+# Email notifications
+email_notifications:
+  on_failure:
+    - ml-team@company.com
+  on_success:
+    - ml-team@company.com
+  no_alert_for_skipped_runs: true
+
+# Job cluster configuration
+job_clusters:
+  - job_cluster_key: inference_cluster
+    new_cluster:
+      spark_version: "13.3.x-scala2.12"
+      node_type_id: "i3.xlarge"
+      num_workers: 4
+      spark_conf:
+        "spark.databricks.delta.preview.enabled": "true"
+        "spark.databricks.delta.retentionDurationCheck.enabled": "false"
+      custom_tags:
+        job: "production_inference"
+        use_case: "income_estimation"
+
+# Tasks
+tasks:
+  # Task 1: Batch Inference
+  - task_key: batch_inference
+    job_cluster_key: inference_cluster
+    notebook_task:
+      notebook_path: "/Workspace/databricks/notebooks/inference/batch_inference"
+      base_parameters:
+        score_date: "{{ task.start_time }}"
+        enable_ab_testing: "true"  # Enable A/B testing
+        lookback_days: "1"
+    timeout_seconds: 3600  # 1 hour timeout
+    max_retries: 2
+    min_retry_interval_millis: 300000  # 5 minutes
+
+  # Task 2: Data Quality Check (runs after inference)
+  - task_key: data_quality_check
+    depends_on:
+      - task_key: batch_inference
+    job_cluster_key: inference_cluster
+    notebook_task:
+      notebook_path: "/Workspace/databricks/notebooks/validation/data_quality_check"
+      base_parameters:
+        table_name: "decision_agent.production_predictions"
+        date: "{{ task.start_time }}"
+    timeout_seconds: 600  # 10 minutes
+    max_retries: 1
+
+  # Task 3: Summary Report (runs after DQ check)
+  - task_key: summary_report
+    depends_on:
+      - task_key: data_quality_check
+    job_cluster_key: inference_cluster
+    notebook_task:
+      notebook_path: "/Workspace/databricks/notebooks/reporting/daily_summary"
+      base_parameters:
+        date: "{{ task.start_time }}"
+    timeout_seconds: 300  # 5 minutes
+    max_retries: 1
+
+# Webhook notifications (optional)
+webhook_notifications:
+  on_success:
+    - id: slack_success_webhook
+  on_failure:
+    - id: slack_failure_webhook
+
+# Access control
+access_control_list:
+  - user_name: "data-engineering@company.com"
+    permission_level: "CAN_MANAGE_RUN"
+  - group_name: "ml-team"
+    permission_level: "CAN_VIEW"
+
+# Tags
+tags:
+  environment: "production"
+  use_case: "income_estimation"
+  team: "ml-platform"
+
+# Max concurrent runs
+max_concurrent_runs: 1
+
+# Format version
+format: MULTI_TASK

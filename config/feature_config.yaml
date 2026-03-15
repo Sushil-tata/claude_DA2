@@ -1,0 +1,161 @@
+# Feature Engineering Configuration
+
+# Behavioral Features
+behavioral:
+  velocity_windows: [7, 14, 30, 60, 90]
+  momentum_windows: [7, 14, 30]
+  volatility_windows: [30, 60, 90]
+  stability_windows: [60, 90, 180]
+  
+  metrics:
+    - 'mean'
+    - 'median'
+    - 'std'
+    - 'cv'  # coefficient of variation
+    - 'skew'
+    - 'kurt'
+    - 'min'
+    - 'max'
+    - 'percentile_25'
+    - 'percentile_75'
+
+# Temporal Features
+temporal:
+  rolling_windows:
+    short_term: [7, 14]
+    medium_term: [30, 60]
+    long_term: [90, 180]
+  
+  lag_features: [1, 7, 14, 30]
+  lead_features: [7, 14, 30]
+  
+  overlapping_windows:
+    enabled: true
+    overlap_ratio: 0.5
+  
+  multi_resolution:
+    enabled: true
+    resolutions: ['daily', 'weekly', 'monthly']
+
+# Liquidity Features
+liquidity:
+  otb_metrics:
+    - 'otb_utilization'
+    - 'otb_velocity'
+    - 'otb_stability'
+    - 'otb_momentum'
+  
+  repayment_buffers:
+    - 'days_to_due'
+    - 'payment_cushion'
+    - 'min_payment_ratio'
+  
+  installment_lock:
+    - 'emi_burden'
+    - 'installment_volatility'
+    - 'payment_regularity'
+
+# Persona Features
+persona:
+  clustering:
+    method: 'kmeans'
+    n_clusters: [5, 10, 15, 20]
+    features:
+      - 'transaction_frequency'
+      - 'average_transaction_amount'
+      - 'merchant_diversity'
+      - 'category_concentration'
+  
+  merchant_segmentation:
+    enabled: true
+    methods:
+      - 'hierarchical'
+      - 'dbscan'
+      - 'gmm'
+  
+  nlp_features:
+    enabled: true
+    vectorization: 'tfidf'
+    max_features: 1000
+
+# Graph Features
+graph:
+  node_embeddings:
+    methods:
+      - 'node2vec'
+      - 'graphsage'
+      - 'deepwalk'
+    
+    node2vec:
+      dimensions: 128
+      walk_length: 80
+      num_walks: 10
+      p: 1.0
+      q: 1.0
+      workers: 4
+  
+  community_detection:
+    methods:
+      - 'louvain'
+      - 'label_propagation'
+      - 'infomap'
+  
+  centrality_measures:
+    - 'degree_centrality'
+    - 'betweenness_centrality'
+    - 'closeness_centrality'
+    - 'pagerank'
+    - 'eigenvector_centrality'
+  
+  risk_propagation:
+    enabled: true
+    iterations: 10
+    damping_factor: 0.85
+
+# Feature Store
+feature_store:
+  registry:
+    enabled: true
+    versioning: true
+    metadata_tracking: true
+  
+  leakage_detection:
+    enabled: true
+    methods:
+      - 'temporal_validation'
+      - 'target_correlation'
+      - 'adversarial_validation'
+    
+    thresholds:
+      correlation_threshold: 0.95
+      auc_threshold: 0.85
+  
+  importance_tracking:
+    enabled: true
+    methods:
+      - 'shap'
+      - 'permutation'
+      - 'gain'
+  
+  quality_checks:
+    missing_threshold: 0.5
+    cardinality_threshold: 0.95
+    variance_threshold: 0.01
+
+# Feature Selection
+feature_selection:
+  methods:
+    - 'correlation_filter'
+    - 'variance_filter'
+    - 'recursive_elimination'
+    - 'importance_based'
+  
+  correlation_filter:
+    threshold: 0.95
+  
+  variance_filter:
+    threshold: 0.01
+  
+  importance_based:
+    top_k: 100
+    method: 'shap'

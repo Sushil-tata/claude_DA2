@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["use_case_id", "version", "features", "model", "validation", "output"],
+  "properties": {
+    "use_case_id": {
+      "type": "string",
+      "description": "Unique identifier for the use case"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^v\\d+\\.\\d+\\.\\d+$",
+      "description": "Semantic version (e.g., v1.0.0)"
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of the use case"
+    },
+    "features": {
+      "type": "object",
+      "required": ["snapshot_timestamp", "lookback_windows", "feature_list"],
+      "properties": {
+        "snapshot_timestamp": {
+          "type": "string",
+          "description": "Timestamp for point-in-time features"
+        },
+        "lookback_windows": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 1},
+          "description": "Lookback windows in days"
+        },
+        "feature_list": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "List of features to compute"
+        },
+        "leakage_prevention": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "required": ["algorithm", "hyperparameters"],
+      "properties": {
+        "algorithm": {
+          "enum": ["gradient_boosting", "random_forest", "logistic_regression"],
+          "description": "ML algorithm"
+        },
+        "hyperparameters": {
+          "type": "object"
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "required": ["segments", "quality_gates"],
+      "properties": {
+        "segments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["dimension", "values"],
+            "properties": {
+              "dimension": {"type": "string"},
+              "values": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        },
+        "quality_gates": {
+          "type": "object"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "required": ["table_name"],
+      "properties": {
+        "table_name": {"type": "string"},
+        "decision_threshold": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5}
+      }
+    }
+  }
+}
