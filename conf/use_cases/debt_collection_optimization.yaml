@@ -419,3 +419,69 @@ reporting:
     - collections_manager
     - compliance_officer
     - analytics_team
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Recovery Amount Model (Two-Stage Beta Regression)
+# Model 6: E[Amount | Recovery, Segment]
+# ─────────────────────────────────────────────────────────────────────────────
+recovery_amount_model:
+  stage1:
+    n_estimators: 200
+    max_depth: 5
+    learning_rate: 0.05
+    subsample: 0.8
+    min_samples_leaf: 20
+  stage2:
+    n_estimators: 150
+    max_depth: 4
+    learning_rate: 0.05
+    subsample: 0.8
+    min_samples_leaf: 15
+  min_segment_samples: 200   # Min accounts per segment for dedicated Stage 2 model
+  calibrate_stage1: true     # Platt calibration on Stage 1 probabilities
+  mlflow:
+    experiment_name: "collection_recovery_models"
+    tracking_uri: "mlruns"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Discount Elasticity Model
+# Model 7: P(Recovery | Segment, d)
+# ─────────────────────────────────────────────────────────────────────────────
+discount_elasticity_model:
+  model:
+    n_estimators: 200
+    max_depth: 5
+    learning_rate: 0.05
+    subsample: 0.8
+    min_samples_leaf: 20
+  monotonicity_enforcement: true   # Apply isotonic regression post-hoc
+  calibrate: true
+  iv_reweighting:
+    enabled: false                 # Set true when randomised trial data available
+    iv_col: "offer_randomisation_flag"
+  mlflow:
+    experiment_name: "collection_recovery_models"
+    tracking_uri: "mlruns"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ERV Engine Configuration
+# Decision layer: assembles Models 6 + 7 into ERV(d) and finds d*
+# ─────────────────────────────────────────────────────────────────────────────
+erv_engine:
+  discount_grid: [0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+  erv_floor_threshold: 0.05      # ERV as fraction of balance — below this → DEFER
+  debt_sale_threshold: 0.02      # low_value + below this → SELL
+  max_discount_absolute: 0.70    # Hard cap on any discount offered
+
+  # Per-segment discount bounds [d_min, d_max]
+  per_segment_discount_bounds:
+    high_value_cooperative:  [0.00, 0.30]
+    high_value_unresponsive: [0.20, 0.60]
+    medium_value_willing:    [0.00, 0.40]
+    low_value_low_capacity:  [0.30, 0.60]
+    disputer:                [0.10, 0.50]
+    skip_tracer_needed:      [0.20, 0.60]
+
+  mlflow:
+    experiment_name: "collection_recovery_models"
+    tracking_uri: "mlruns"
