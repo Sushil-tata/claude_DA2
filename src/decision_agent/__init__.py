@@ -1,7 +1,9 @@
 """
-Decision Agent - Principal Data Science Decision Platform
+Decision Agent Platform - Principal Data Science Agent
 
-A production-grade, Databricks-native ML platform for end-to-end decision workflows.
+A Databricks-native ML platform for production decision workflows.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
+__author__ = "Decision Agent Team"
+

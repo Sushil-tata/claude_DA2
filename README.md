@@ -1,47 +1,61 @@
-# Principal Data Science Decision Agent Platform
+# Decision Agent Platform - Principal Data Science Agent
 
-A production-grade, Databricks-native ML platform for end-to-end decision workflows from data ingestion to production decisions.
+A production-grade, Databricks-native ML platform for end-to-end decision workflows.
+
+**Version:** 1.0.0-MVP  
+**Status:** Phase 1 Complete - Runnable Skeleton  
+**Branch:** copilot/create-principal-data-science-agent
+
+---
 
 ## Overview
 
-This platform provides a **configuration-driven architecture** for building and deploying machine learning decision systems on Databricks. It handles:
+The Decision Agent Platform is a configuration-driven ML platform designed for Databricks that handles:
+- Point-in-time safe feature engineering
+- MLflow-integrated model training
+- Segment-based validation and calibration
+- Production decision output to Delta Lake
+- Complete audit trail and lineage tracking
 
-- **Point-in-time safe feature engineering** with leakage prevention
-- **Distributed training** with MLflow experiment tracking
-- **Enhanced validation** with segment analysis and calibration
-- **Decision output** to Delta Lake with full audit trail
-- **End-to-end orchestration** via Databricks Workflows
+### Key Principles
 
-## Architecture
+- **Databricks-Native**: All processing on Databricks (PySpark, Delta Lake, MLflow)
+- **Config-Driven**: YAML configuration with JSON schema validation
+- **Point-in-Time Safe**: No look-ahead bias, as-of joins, temporal validation
+- **Production-Ready**: ACID transactions, versioning, audit logs
 
-### Core Components
+---
 
-1. **Orchestrator** - Routes use cases to appropriate pipelines
-2. **Spark Feature Pipelines** - PySpark-based distributed feature engineering
-   - Rolling window aggregations (7d, 30d, 90d)
-   - Tag-based features with PCA dimensionality reduction
-   - Liquidity ratio features
-   - Point-in-time safe as-of joins
-3. **MLflow Training Harness** - Model training with experiment tracking
-4. **Validation Suite** - Segment evaluation and calibration analysis
-5. **Decision Output** - Delta Lake tables with metadata and audit trail
-6. **YAML Config Schema** - Configuration-driven use case definitions
+## Current Status (Phase 1 Complete)
 
-### Technology Stack
+### ✅ Delivered Components
 
-- **Compute**: Databricks (PySpark)
-- **Storage**: Delta Lake
-- **Experiment Tracking**: MLflow
-- **Orchestration**: Databricks Workflows
-- **CI/CD**: GitHub Actions
+1. **Directory Structure** - Complete skeleton for all modules
+2. **Configuration System**:
+   - JSON schema for config validation (`schemas/config_schemas/use_case_config.schema.json`)
+   - MVP use case config (`conf/use_cases/income_estimation.yaml`)
+   - Config loader with validation (`src/decision_agent/utils/config_loader.py`)
+
+3. **Orchestration**:
+   - Use case router with pipeline registry (`src/decision_agent/orchestrator/router.py`)
+   - Main entry point (`jobs/run_usecase.py`)
+
+4. **Data Generation**:
+   - Synthetic transaction data generator (`src/decision_agent/data/synthetic_data.py`)
+
+5. **Testing**:
+   - Import verification ✓
+   - Dry-run execution ✓
+   - Full pipeline routing ✓
+
+---
 
 ## Quick Start
 
 ### Prerequisites
 
 - Python 3.10+
-- Databricks workspace (for production) or local PySpark (for development)
-- MLflow (optional for local development)
+- pip package manager
 
 ### Installation
 
@@ -50,419 +64,229 @@ This platform provides a **configuration-driven architecture** for building and 
 git clone <repository-url>
 cd claude
 
-# Install dependencies for local development (no Spark)
+# Install dependencies
 pip install -r requirements.txt
-
-# For Databricks development
-pip install -r requirements-databricks.txt
 ```
 
-### Running Locally
+### Usage
 
-#### 1. Run with Synthetic Data (No Databricks Required)
+#### List Available Use Cases
 
 ```bash
-# Dry run to validate configuration
-python jobs/run_usecase.py \
+python3 jobs/run_usecase.py --list-use-cases
+```
+
+#### Validate Configuration (Dry Run)
+
+```bash
+python3 jobs/run_usecase.py \
   --config conf/use_cases/income_estimation.yaml \
   --dry-run
-
-# Run pipeline with synthetic data (local mode)
-python jobs/run_usecase.py \
-  --config conf/use_cases/income_estimation.yaml \
-  --local
 ```
 
-#### 2. Run with Spark (Requires PySpark)
+#### Execute Use Case
 
 ```bash
-# Install PySpark locally
-pip install pyspark delta-spark
-
-# Run pipeline
-python jobs/run_usecase.py \
-  --config conf/use_cases/income_estimation.yaml \
-  --execution-date 2024-12-01
+python3 jobs/run_usecase.py \
+  --config conf/use_cases/income_estimation.yaml
 ```
 
-### Running on Databricks
-
-#### Deploy to Databricks
-
-```bash
-# Set Databricks credentials
-export DATABRICKS_HOST="https://your-workspace.cloud.databricks.com"
-export DATABRICKS_TOKEN="your-token"
-
-# Upload code to Databricks
-databricks workspace import_dir src/decision_agent /Workspace/decision_agent --overwrite
-databricks workspace import_dir conf /Workspace/conf --overwrite
-databricks workspace import jobs/run_usecase.py /Workspace/jobs/run_usecase --overwrite
-
-# Create workflow
-databricks jobs create --json-file databricks/workflows/decision_agent_workflow.yml
-```
-
-#### Run Workflow
-
-```bash
-# Trigger workflow manually
-databricks jobs run-now --job-id <job-id>
-
-# Monitor run
-databricks runs list --job-id <job-id>
-```
+---
 
 ## Project Structure
 
 ```
-.
-├── conf/
-│   └── use_cases/              # YAML configuration files
-│       └── income_estimation.yaml
+claude/
 ├── jobs/
-│   └── run_usecase.py          # Main entry point
+│   └── run_usecase.py              # Main entry point
+├── conf/
+│   └── use_cases/
+│       └── income_estimation.yaml  # MVP use case config
 ├── src/decision_agent/
-│   ├── orchestrator/           # Use case routing
-│   │   └── router.py
-│   ├── data/                   # Data loading and splitting
-│   │   ├── splits.py
-│   │   ├── asof_join.py
-│   │   └── synthetic_data.py
-│   ├── features/               # Feature engineering
-│   │   ├── windows.py          # Rolling window aggregations
-│   │   ├── tags.py             # Tag frequency features
-│   │   ├── tag_pca.py          # PCA dimensionality reduction
-│   │   ├── liquidity.py        # Liquidity ratios
-│   │   └── income_features.py  # Income feature pipeline
-│   ├── training/               # Model training
-│   │   └── training_harness.py
-│   ├── validation/             # Model validation
-│   │   ├── segment_eval.py
-│   │   └── calibration_eval.py
-│   ├── decisions/              # Decision output
-│   │   └── output_writer.py
-│   ├── config/                 # Configuration
-│   │   └── config_loader.py
-│   └── utils/                  # Utilities
-│       ├── spark_utils.py
-│       └── mlflow_utils.py
-├── databricks/
-│   └── workflows/              # Databricks workflow definitions
-│       └── decision_agent_workflow.yml
+│   ├── orchestrator/
+│   │   └── router.py               # Use case router
+│   ├── data/
+│   │   └── synthetic_data.py       # Synthetic data generator
+│   ├── utils/
+│   │   └── config_loader.py        # Config validation
+│   ├── features/                   # Phase 3 (to be implemented)
+│   ├── training/                   # Phase 4 (to be implemented)
+│   ├── validation/                 # Phase 5 (to be implemented)
+│   └── decisions/                  # Phase 6 (to be implemented)
 ├── tests/
-│   └── unit/                   # Unit tests (no Spark)
-│       ├── test_imports.py
-│       ├── test_config.py
-│       └── test_asof_join.py
+│   ├── unit/                       # Unit tests (no Spark)
+│   └── integration/                # Integration tests (Databricks)
+├── databricks/
+│   └── workflows/                  # Databricks workflow DAGs
 ├── schemas/
-│   └── config_schemas/         # JSON schemas for validation
+│   └── config_schemas/
 │       └── use_case_config.schema.json
-└── .github/workflows/          # CI/CD
-    └── ci-tests.yml
+└── requirements.txt
 ```
 
-## Use Cases
+---
 
-### Income Estimation (MVP)
+## MVP Use Case: Income Estimation
 
-Predict individual income levels based on transaction patterns.
+**Goal**: Estimate individual income levels from transaction patterns
 
-**Features:**
-- Rolling window aggregations (7d, 30d, 90d transaction counts/sums)
-- Tag frequency features (salary deposits, rent payments, etc.)
-- Tag PCA for dimensionality reduction
+**Features**:
+- Rolling window aggregations (7d, 30d, 90d)
+- Transaction category features (salary, rent, groceries)
+- Tag PCA dimensionality reduction
 - Liquidity ratios (income/expense, average balance)
 
-**Model:** Gradient Boosting Regressor
+**Model**: Gradient Boosting Regressor
 
-**Validation:** Segment evaluation by income quartile, calibration curves
+**Output**: Decision table with predicted income + confidence bands
 
-**Configuration:** `conf/use_cases/income_estimation.yaml`
+---
 
-**Run:**
-```bash
-python jobs/run_usecase.py --config conf/use_cases/income_estimation.yaml
-```
+## Implementation Roadmap
 
-### Adding New Use Cases
+### ✅ Phase 1: Runnable Skeleton (Complete)
+- Directory structure
+- Config system with JSON schema validation
+- Use case router
+- Synthetic data generator
+- Main entry point with dry-run capability
 
-1. **Create YAML configuration** in `conf/use_cases/your_use_case.yaml`
-2. **Implement pipeline function** in appropriate module
-3. **Register in router** at `src/decision_agent/orchestrator/router.py`:
-   ```python
-   def your_use_case_pipeline(config, spark=None):
-       # Implementation
-       pass
+### 🔜 Phase 2: Data Layer (Next)
+- Temporal train/val/test splits
+- Point-in-time safe as-of joins
+- Leakage prevention guards
 
-   PIPELINE_REGISTRY = {
-       "your_use_case": your_use_case_pipeline,
-       # ...
-   }
-   ```
-4. **Run:** `python jobs/run_usecase.py --config conf/use_cases/your_use_case.yaml`
+### 🔜 Phase 3: Feature Engineering
+- Rolling window aggregations
+- Transaction category encoding
+- Tag PCA
+- Liquidity features
 
-## Configuration
+### 🔜 Phase 4: Training Harness
+- MLflow integration
+- Spark to pandas boundary
+- Model logging and registry
 
-Use cases are defined via YAML configuration files following the schema in `schemas/config_schemas/use_case_config.schema.json`.
+### 🔜 Phase 5: Validation
+- Segment-based validation
+- Calibration evaluation
+- Quality gates
 
-### Example Configuration
+### 🔜 Phase 6: Decision Output
+- Delta Lake writer
+- Audit trail
+- Metadata tracking
+
+### 🔜 Phase 7: End-to-End Integration
+- Wire all components
+- Databricks workflow DAG
+- CI/CD pipeline
+
+---
+
+## Configuration Format
+
+### Example: Income Estimation Use Case
 
 ```yaml
 use_case_id: income_estimation
 version: v1.0.0
-description: Estimate individual income levels
-
-data:
-  use_synthetic: true
-  train_end_date: "2024-09-30"
-  val_end_date: "2024-11-30"
+description: Estimate income levels from transaction patterns
 
 features:
+  snapshot_timestamp: "2024-01-31"
   lookback_windows: [7, 30, 90]
-  feature_list: [...]
+  feature_list:
+    - transaction_count_7d
+    - transaction_sum_30d
+    - salary_deposit_frequency
+    # ... more features
   leakage_prevention: true
 
 model:
   algorithm: gradient_boosting
-  target_column: income_level
   hyperparameters:
     n_estimators: 100
     max_depth: 5
+    learning_rate: 0.1
+  target_variable: income_level
 
 validation:
   segments:
     - dimension: income_quartile
       values: [Q1, Q2, Q3, Q4]
+  quality_gates:
+    min_r2: 0.6
 
 output:
   table_name: decision_agent.income_decisions
 ```
 
-## MLflow Integration
+---
 
-All experiments are automatically tracked in MLflow:
+## Testing
 
-### View Experiments
-
-```bash
-# Start MLflow UI (local)
-mlflow ui
-
-# Navigate to http://localhost:5000
-```
-
-### In Databricks
-
-Navigate to **Machine Learning** → **Experiments** → `/decision_agent/experiments`
-
-## Decision Output
-
-Decisions are written to Delta Lake tables with full metadata:
-
-### Schema
-
-```
-customer_id          STRING
-predicted_value      DOUBLE
-run_id              STRING
-model_version       STRING
-as_of_dt            DATE
-use_case_id         STRING
-created_timestamp   TIMESTAMP
-```
-
-### Query Decisions
-
-```sql
--- View recent decisions
-SELECT * FROM decision_agent.income_decisions
-WHERE as_of_dt = '2024-12-01'
-LIMIT 10;
-
--- Aggregate by model version
-SELECT model_version, COUNT(*) as num_decisions
-FROM decision_agent.income_decisions
-GROUP BY model_version;
-
--- Time travel
-SELECT * FROM decision_agent.income_decisions
-TIMESTAMP AS OF '2024-11-01';
-```
-
-## Development
-
-### Running Tests
+### Import Verification
 
 ```bash
-# Run unit tests (no Spark required)
-pytest tests/unit/ -v
-
-# Run with coverage
-pytest tests/unit/ --cov=src/decision_agent --cov-report=html
-
-# View coverage report
-open htmlcov/index.html
+python3 -c "
+import sys
+sys.path.insert(0, 'src')
+from decision_agent.utils.config_loader import ConfigLoader
+from decision_agent.orchestrator.router import route_use_case
+from decision_agent.data.synthetic_data import SyntheticDataGenerator
+print('✓ All imports successful')
+"
 ```
 
-### Code Quality
+### Generate Synthetic Data
 
 ```bash
-# Format code
-black src/ tests/
-
-# Sort imports
-isort src/ tests/
-
-# Lint
-pylint src/decision_agent
-flake8 src/ tests/
+python3 -c "
+import sys
+sys.path.insert(0, 'src')
+from decision_agent.data.synthetic_data import SyntheticDataGenerator
+gen = SyntheticDataGenerator()
+df = gen.generate_transactions(n_customers=10, months_history=6)
+print(f'Generated {len(df)} transactions')
+print(df.head())
+"
 ```
-
-### CI/CD
-
-GitHub Actions automatically runs:
-- Unit tests (Python 3.10, 3.11)
-- Code formatting checks (black, isort)
-- Linting (flake8, pylint)
-- Import validation
-
-See `.github/workflows/ci-tests.yml`
-
-## Key Features
-
-### Point-in-Time Safe Feature Engineering
-
-All features use **as-of joins** to prevent data leakage:
-
-```python
-from decision_agent.data.asof_join import PointInTimeJoiner
-
-joiner = PointInTimeJoiner(spark)
-result = joiner.as_of_join(
-    left_df, right_df,
-    entity_key="customer_id",
-    left_timestamp="prediction_date",
-    right_timestamp="feature_date"
-)
-
-# Validate no leakage
-joiner.validate_no_leakage(features_df, labels_df, ...)
-```
-
-### Temporal Splits
-
-Prevent leakage with strict temporal boundaries:
-
-```python
-from decision_agent.data.splits import create_temporal_splits
-
-train, val, test = create_temporal_splits(
-    df,
-    date_col="transaction_timestamp",
-    train_end="2024-09-30",
-    val_end="2024-11-30"
-)
-```
-
-### Rolling Window Features
-
-Distributed rolling aggregations:
-
-```python
-from decision_agent.features.windows import compute_rolling_windows
-
-df_with_features = compute_rolling_windows(
-    df,
-    entity_key="customer_id",
-    timestamp_col="transaction_timestamp",
-    value_col="transaction_amount",
-    lookback_windows=[7, 30, 90],
-    aggregations=["sum", "avg", "count"]
-)
-```
-
-## Production Deployment
-
-### Databricks Workflow
-
-The platform uses Databricks Workflows for orchestration:
-
-1. **Load Data** - Load or generate transaction data
-2. **Compute Features** - Distributed feature engineering
-3. **Train Model** - MLflow-tracked training
-4. **Validate Model** - Segment and calibration validation
-5. **Score Batch** - Predictions on test set
-6. **Write Decisions** - Output to Delta Lake
-
-Workflow configuration: `databricks/workflows/decision_agent_workflow.yml`
-
-### Monitoring
-
-- **MLflow Experiments** - Track all training runs, metrics, parameters
-- **Delta Lake Audit** - Full history of decisions with time travel
-- **Databricks Workflow UI** - Task execution status and logs
-
-## Troubleshooting
-
-### PySpark not available locally
-
-```bash
-# Install PySpark for local development
-pip install pyspark delta-spark
-
-# Or run in local mode (pandas only)
-python jobs/run_usecase.py --config conf/use_cases/income_estimation.yaml --local
-```
-
-### MLflow connection issues
-
-```bash
-# Use local MLflow tracking
-export MLFLOW_TRACKING_URI="file:./mlruns"
-
-# Or disable MLflow
-# Edit training_harness.py to handle mlflow=None gracefully (already implemented)
-```
-
-### Import errors
-
-```bash
-# Ensure src is in PYTHONPATH
-export PYTHONPATH="${PYTHONPATH}:$(pwd)/src"
-
-# Or install in development mode
-pip install -e .
-```
-
-## Future Enhancements
-
-- **Real-time streaming** feature pipelines (Structured Streaming)
-- **Deep learning** support (PyTorch/TensorFlow on Databricks)
-- **AutoML** integration (Databricks AutoML)
-- **Advanced drift detection** and monitoring
-- **A/B testing framework** for model comparison
-- **Multi-model ensembles**
-- **Online feature computation**
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/your-feature`
-3. Run tests: `pytest tests/unit/`
-4. Format code: `black src/ tests/`
-5. Commit changes: `git commit -m "Add your feature"`
-6. Push to branch: `git push origin feature/your-feature`
-7. Create Pull Request
-
-## License
-
-[Add license information]
-
-## Contact
-
-For questions or support, contact the Data Science team.
 
 ---
 
-**Built with** ♥ **by the Data Science Team**
+## Architecture Decisions
+
+### 1. Databricks-Native
+All data processing, training, and inference runs on Databricks. GitHub Actions limited to CI/CD only.
+
+### 2. Config-Driven
+All use cases defined in YAML with strict JSON schema validation. No hardcoded parameters.
+
+### 3. Delta Lake for Storage
+Features, decisions, and audit logs stored in Delta Lake for ACID transactions and time travel.
+
+### 4. Point-in-Time Safety
+Temporal validators and as-of joins prevent look-ahead bias in all feature computations.
+
+### 5. MLflow for Model Lifecycle
+Experiment tracking, model registry, and feature lineage managed through MLflow.
+
+---
+
+## Next Steps
+
+1. **Implement Phase 2**: Temporal splits and as-of joins
+2. **Implement Phase 3**: Feature engineering modules
+3. **Add unit tests**: Config loader, router logic
+4. **Create CI/CD pipeline**: GitHub Actions for tests and deployment
+
+---
+
+## Support
+
+For questions or issues, contact the Decision Agent Team.
+
+---
+
+**Built for production ML at scale on Databricks**

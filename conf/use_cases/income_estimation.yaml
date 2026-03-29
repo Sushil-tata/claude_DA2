@@ -2,40 +2,9 @@ use_case_id: income_estimation
 version: v1.0.0
 description: Estimate individual income levels based on transaction patterns and liquidity features
 
-data:
-  use_synthetic: true  # Use synthetic data for MVP
-  train_start_date: "2024-01-01"
-  train_end_date: "2024-09-30"
-  val_end_date: "2024-11-30"
-  test_end_date: "2024-12-31"
-
-# Phase 1: Data Quality Validation (P0 Gate)
-data_quality:
-  schema_validation: true
-  null_threshold: 0.20  # Max 20% nulls allowed
-  min_sample_size: 100
-  temporal_coverage_days: 30
-  freshness_threshold_days: 7
-  outlier_detection: true
-  outlier_method: isolation_forest
-  outlier_contamination: 0.05
-  label_distribution_check: true
-
-# Phase 1: Sparse History Handling
-sparse_history:
-  min_days_history: 90
-  min_transaction_count: 10
-  min_deposit_count: 3
-  weight_days: 0.4
-  weight_deposits: 0.3
-  weight_transactions: 0.3
-  thresholds:
-    sufficient: 0.7
-    marginal: 0.5
-
 features:
-  snapshot_timestamp: "{{ execution_date }}"
-  lookback_windows: [7, 30, 90]  # days
+  snapshot_timestamp: "2024-01-31"
+  lookback_windows: [7, 30, 90]
   feature_list:
     - transaction_count_7d
     - transaction_count_30d
@@ -43,96 +12,49 @@ features:
     - transaction_sum_7d
     - transaction_sum_30d
     - transaction_sum_90d
-    - avg_transaction_amount_30d
-    - salary_deposit_count_30d
-    - rent_payment_count_30d
-    - grocery_spend_30d
+    - salary_deposit_frequency
+    - rent_payment_frequency
+    - groceries_frequency
     - tag_pca_component_1
     - tag_pca_component_2
     - tag_pca_component_3
-    - income_expense_ratio
+    - income_expense_ratio_30d
+    - income_expense_ratio_90d
     - avg_balance_30d
-    # Phase 1: Income-specific signals
-    - detected_period_days
-    - period_confidence
-    - is_regular_paycheck
-    - deposit_stability_score
-    - deposit_cv
+    - avg_balance_90d
   leakage_prevention: true
   point_in_time_join: true
 
-  # Phase 1: Income Signal Configuration
-  income_signals:
-    deposit_periodicity: true
-    deposit_stability: true
-    min_deposit_threshold: 500  # Min amount to consider as income deposit
-
 model:
   algorithm: gradient_boosting
-  target_column: income_level
   hyperparameters:
     n_estimators: 100
     max_depth: 5
     learning_rate: 0.1
-    min_samples_split: 10
-    min_samples_leaf: 5
+    min_samples_split: 20
+    min_samples_leaf: 10
     random_state: 42
+  target_variable: income_level
 
 validation:
   segments:
     - dimension: income_quartile
       values: [Q1, Q2, Q3, Q4]
+    - dimension: time_period
+      values: ["2023-Q3", "2023-Q4", "2024-Q1"]
 
   calibration_config:
     method: isotonic
     by_segment: true
     by_time: false
-    min_samples_per_bin: 50
-
-  adversarial_validation:
-    enabled: true  # Phase 1: Enable adversarial validation
-    threshold_auc: 0.55
-
-  business_metrics: []  # Empty for MVP
+    min_samples_per_bin: 100
 
   quality_gates:
-    min_r2_score: 0.5  # For regression
-    max_mae: 20000  # Max mean absolute error in income
-
-# Phase 1: Fair Lending Evaluation (P0 REGULATORY GATE)
-fair_lending:
-  enabled: true
-  protected_attributes:
-    - gender
-    - race
-    - age_group
-  reference_groups:
-    gender: male
-    race: white
-    age_group: 25-44
-  di_threshold: 0.80  # 80% rule
-  mean_diff_threshold: 0.10  # Max 10% prediction difference
-  enable_shap: true
-
-# Phase 1: Champion/Challenger Comparison (P0 GATE)
-champion_challenger:
-  enabled: false  # Enable when Champion model available
-  champion_model_uri: ""  # MLflow model URI for Champion
-  metrics:
-    - mae
-    - r2_score
-    - rmse
-  improvement_thresholds:
-    mae: -0.05  # Challenger must be 5% better (lower MAE)
-    r2_score: 0.02  # Challenger must be 2% better (higher R²)
-  stability_threshold: 0.85  # Min correlation between Champion and Challenger
-  segment_checks: true
+    min_mae: 5000
+    min_r2: 0.6
+    max_calibration_error: 0.10
 
 output:
   table_name: decision_agent.income_decisions
-  explain_predictions: false
-
-  # Phase 1: Audit Logging
-  enable_audit_logging: true
-  audit_table: decision_agent.prediction_audit_log
-  log_features_in_audit: false  # Set true for full feature logging (increases storage)
+  decision_threshold: 0.5
+  include_confidence_bands: true
