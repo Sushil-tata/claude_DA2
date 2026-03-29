@@ -11,12 +11,15 @@ Design principles:
     so agents can be unit-tested without a Databricks cluster
 
 Table registry:
-  recovery.model_scores       — written by recovery-engine-v2
-  recovery.feature_output     — written by FeatureAgent
+  recovery.model_scores         — written by recovery-engine-v2
+  recovery.feature_output       — written by FeatureAgent
+  recovery.model_agent_output   — written by ModelAgent
   recovery.constraint_overrides — written by ConstraintAgent
-  recovery.nba_decisions      — written by DecisionAgent
+  recovery.nba_decisions        — written by DecisionAgent
+  recovery.validation_results   — written by ValidationAgent
+  recovery.nba_explanations     — written by ExplainAgent
   recovery.data_quality_metrics — written by DataQualityAgent
-  recovery.agent_audit_log    — append-only, written by all agents via signal()
+  recovery.agent_audit_log      — append-only, written by all agents via signal()
 """
 
 import json
@@ -32,8 +35,11 @@ logger = logging.getLogger(__name__)
 TABLES = {
     "model_scores":          "recovery.model_scores",
     "feature_output":        "recovery.feature_output",
+    "model_agent_output":    "recovery.model_agent_output",
     "constraint_overrides":  "recovery.constraint_overrides",
     "nba_decisions":         "recovery.nba_decisions",
+    "validation_results":    "recovery.validation_results",
+    "nba_explanations":      "recovery.nba_explanations",
     "data_quality_metrics":  "recovery.data_quality_metrics",
     "agent_audit_log":       "recovery.agent_audit_log",
 }
