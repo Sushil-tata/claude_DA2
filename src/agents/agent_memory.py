@@ -36,6 +36,7 @@ TABLES = {
     "model_scores":          "recovery.model_scores",
     "feature_output":        "recovery.feature_output",
     "model_agent_output":    "recovery.model_agent_output",
+    "capacity_allocation":   "recovery.capacity_allocation",
     "constraint_overrides":  "recovery.constraint_overrides",
     "nba_decisions":         "recovery.nba_decisions",
     "validation_results":    "recovery.validation_results",

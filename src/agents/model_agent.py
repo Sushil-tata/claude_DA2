@@ -105,8 +105,6 @@ DEFAULT_ELASTICITY_ALPHA = {
 }
 
 # Minimum ERV uplift (THB) that LEGAL must offer over AGENCY before legal is chosen.
-# Reflects agency-first priority for charge-off accounts.
-# See CONFIGURATION INSTRUCTIONS above.
 DEFAULT_LEGAL_UPLIFT_THRESHOLD = 5_000.0
 
 # Actions eligible for discount optimisation (others use fixed d=0)
@@ -119,6 +117,53 @@ ACTION_TO_CHANNEL = {
     "AGENCY":        "AGENCY_REFERRAL",
     "LEGAL":         "LEGAL_QUEUE",
     "HOLD":          "HOLD",
+}
+
+# ── SIGNAL_SEGMENT strategy differentiation ──────────────────────────────────
+# Each segment has a distinct objective that modifies how ERV is optimised.
+# This is the operational expression of the segment — not just a feature.
+#
+# A (CardX + Bureau): Maximise recovery AMOUNT — customer has high signal quality,
+#    keep discount low, extract maximum value. Penalise high discounts.
+#
+# B (CardX only): Balanced — moderate discount acceptable if it raises P(pay).
+#    Standard ERV optimisation with no penalty.
+#
+# C (Bureau only): Reactivation — customer is known to bureau but disengaged
+#    from CardX. Accept higher discount to re-establish contact. Reward contact.
+#
+# D (No signal): Exploration — no reliable signal. Use low-cost actions only.
+#    Cap at DIGITAL_NUDGE or HOLD. High-cost actions (AGENT_CALL, LEGAL) suppressed.
+#
+# discount_penalty: multiplied against gross ERV to penalise high discounts.
+#   1.0 = no penalty, 0.7 = 30% ERV haircut per unit of discount offered.
+# allowed_actions: restricts which actions are evaluated for this segment.
+
+SEGMENT_STRATEGY = {
+    "A": {
+        "objective":        "maximise_amount",
+        "discount_penalty": 0.6,   # penalise high discounts — preserve recovery amount
+        "allowed_actions":  {"DIGITAL_NUDGE", "AGENT_CALL", "HOLD"},
+        "description":      "Optimise recovery amount — minimal discount",
+    },
+    "B": {
+        "objective":        "balanced",
+        "discount_penalty": 1.0,   # no penalty — standard ERV
+        "allowed_actions":  {"DIGITAL_NUDGE", "AGENT_CALL", "AGENCY", "HOLD"},
+        "description":      "Balanced ERV optimisation",
+    },
+    "C": {
+        "objective":        "reactivation",
+        "discount_penalty": 1.3,   # reward higher discounts — reactivation is the goal
+        "allowed_actions":  {"DIGITAL_NUDGE", "AGENT_CALL", "AGENCY", "HOLD"},
+        "description":      "Reactivation focus — accept higher discount to re-engage",
+    },
+    "D": {
+        "objective":        "exploration",
+        "discount_penalty": 1.0,
+        "allowed_actions":  {"DIGITAL_NUDGE", "HOLD"},  # low-cost only
+        "description":      "Exploration — low-cost actions, no agency/legal",
+    },
 }
 
 
@@ -274,57 +319,62 @@ class ModelAgent(BaseAgent):
         """
         # propensity_30d (P_1M) is the primary decisioning signal
         # propensity_180d (P_6M) used only for AGENCY/LEGAL (longer-horizon actions)
-        p30     = row.get("propensity_30d",    0.0) or 0.0
-        p180    = row.get("propensity_180d",   0.0) or 0.0
-        balance = row.get("erv_at_d_optimal",  0.0) or 0.0
-        seg     = row.get("signal_segment",    "D")
-        alpha   = self.action_alphas.get(seg, 2.5)
-        aid     = row.get("account_id")
+        p30          = row.get("propensity_30d",    0.0) or 0.0
+        p180         = row.get("propensity_180d",   0.0) or 0.0
+        balance      = row.get("erv_at_d_optimal",  0.0) or 0.0
+        seg          = row.get("signal_segment",    "D")
+        alpha        = self.action_alphas.get(seg, 2.5)
+        aid          = row.get("account_id")
+        strategy     = SEGMENT_STRATEGY.get(seg, SEGMENT_STRATEGY["B"])
+        allowed      = strategy["allowed_actions"]
+        disc_penalty = strategy["discount_penalty"]
 
-        # Use model-based elasticity curves if available for this account
         elast_curves = self._elasticity_curves.get(aid, {})
-
         erv_by_action = {}
 
-        # ── HOLD — no discount, no contact ────────────────────────────────────
+        # ── HOLD — always evaluated as baseline ───────────────────────────────
         erv_by_action["HOLD"] = {
             "erv_net": 0.0, "erv_gross": 0.0,
             "d_optimal": 0.0, "action_cost": 0,
         }
 
-        # ── DIGITAL_NUDGE — uses P_1M (primary signal) ───────────────────────
-        erv_by_action["DIGITAL_NUDGE"] = self._best_discounted_erv(
-            p_base=p30, balance=balance, alpha=alpha * 0.5,
-            action="DIGITAL_NUDGE", elast_curves=elast_curves,
-        )
+        # ── DIGITAL_NUDGE — P_1M primary, low-cost ───────────────────────────
+        if "DIGITAL_NUDGE" in allowed:
+            erv_by_action["DIGITAL_NUDGE"] = self._best_discounted_erv(
+                p_base=p30, balance=balance, alpha=alpha * 0.5,
+                action="DIGITAL_NUDGE", elast_curves=elast_curves,
+                discount_penalty=disc_penalty,
+            )
 
-        # ── AGENT_CALL — uses P_1M (primary signal) ───────────────────────────
-        erv_by_action["AGENT_CALL"] = self._best_discounted_erv(
-            p_base=p30, balance=balance, alpha=alpha,
-            action="AGENT_CALL", elast_curves=elast_curves,
-        )
+        # ── AGENT_CALL — P_1M primary ─────────────────────────────────────────
+        if "AGENT_CALL" in allowed:
+            erv_by_action["AGENT_CALL"] = self._best_discounted_erv(
+                p_base=p30, balance=balance, alpha=alpha,
+                action="AGENT_CALL", elast_curves=elast_curves,
+                discount_penalty=disc_penalty,
+            )
 
-        # ── AGENCY — uses P_6M (longer-horizon action) ───────────────────────
-        erv_by_action["AGENCY"] = self._best_discounted_erv(
-            p_base=p180 * 0.6,
-            balance=balance,
-            alpha=alpha * 1.2,
-            action="AGENCY", elast_curves=elast_curves,
-        )
+        # ── AGENCY — P_6M, evaluated before LEGAL ────────────────────────────
+        if "AGENCY" in allowed:
+            erv_by_action["AGENCY"] = self._best_discounted_erv(
+                p_base=p180 * 0.6, balance=balance, alpha=alpha * 1.2,
+                action="AGENCY", elast_curves=elast_curves,
+                discount_penalty=disc_penalty,
+            )
 
-        # ── LEGAL — uses P_6M, less elastic (escalation, not first choice) ───
-        erv_by_action["LEGAL"] = self._best_discounted_erv(
-            p_base=p180 * 0.4,
-            balance=balance,
-            alpha=0.5,
-            action="LEGAL", elast_curves=elast_curves,
-        )
+        # ── LEGAL — P_6M, escalation only ────────────────────────────────────
+        if "LEGAL" in allowed:
+            erv_by_action["LEGAL"] = self._best_discounted_erv(
+                p_base=p180 * 0.4, balance=balance, alpha=0.5,
+                action="LEGAL", elast_curves=elast_curves,
+                discount_penalty=disc_penalty,
+            )
 
-        # ── Agency-first rule: LEGAL must beat AGENCY by threshold ────────────
-        agency_erv = erv_by_action["AGENCY"]["erv_net"]
-        legal_erv  = erv_by_action["LEGAL"]["erv_net"]
-        if legal_erv <= agency_erv + self.legal_uplift_threshold:
-            erv_by_action["LEGAL"]["erv_net"] = -1.0  # suppress legal selection
+        # ── Agency-first: LEGAL must beat AGENCY by threshold ─────────────────
+        if "AGENCY" in erv_by_action and "LEGAL" in erv_by_action:
+            if erv_by_action["LEGAL"]["erv_net"] <= \
+               erv_by_action["AGENCY"]["erv_net"] + self.legal_uplift_threshold:
+                erv_by_action["LEGAL"]["erv_net"] = -1.0
 
         # ── Select action with highest net ERV ────────────────────────────────
         best_action = max(erv_by_action, key=lambda a: erv_by_action[a]["erv_net"])
@@ -349,6 +399,7 @@ class ModelAgent(BaseAgent):
         alpha: float,
         action: str,
         elast_curves: dict = None,
+        discount_penalty: float = 1.0,
     ) -> dict:
         """
         Finds d in DISCOUNT_GRID that maximises net ERV for a given action.
@@ -374,7 +425,10 @@ class ModelAgent(BaseAgent):
                 # Parametric alpha fallback
                 p_adj = 1.0 - (1.0 - p_base) * ((1.0 - d) ** alpha)
 
-            erv_gross = p_adj * balance * (1.0 - d)
+            # discount_penalty modifies how discount is valued per segment strategy
+            # Segment A: penalty < 1 → penalise high discounts (preserve amount)
+            # Segment C: penalty > 1 → reward higher discounts (reactivation)
+            erv_gross = p_adj * balance * (1.0 - d * discount_penalty)
             erv_net   = erv_gross - cost
             if erv_net > best_erv_net:
                 best_erv_net   = erv_net

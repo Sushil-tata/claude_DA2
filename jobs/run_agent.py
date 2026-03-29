@@ -40,6 +40,7 @@ AGENT_REGISTRY = {
     "data_quality": "agents.data_quality_agent.DataQualityAgent",
     "feature":      "agents.feature_agent.FeatureAgent",
     "model":        "agents.model_agent.ModelAgent",
+    "capacity":     "agents.capacity_agent.CapacityAllocationAgent",
     "constraint":   "agents.constraint_agent.ConstraintAgent",
     "decision":     "agents.decision_agent.DecisionAgent",
     "validation":   "agents.validation_agent.ValidationAgent",
