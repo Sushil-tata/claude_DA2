@@ -1,25 +1,32 @@
 """
 NPV Engine
 ===========
-FICO-inspired Loan NPV and Portfolio NPV computation for collections.
+Paydown-curve-driven Loan NPV and Portfolio NPV for collections.
 
-FICO terminology used throughout:
-  - Loan NPV            : NPV of a single TDR offer for one account
-  - Portfolio NPV       : Sum of loan NPVs across all accounts
-  - Take-up Probability : P(customer accepts the offered treatment)
-  - Re-default Probability : P(customer defaults again after accepting TDR)
-  - Collection Treatment Optimization : selecting best path per account
+NPV framework (replaces FICO take-up-weighted formula):
+  - No take-up probability assumed — offer NPV is grounded in empirical
+    paydown curves from historical cohort data.
+  - Curve A: natural recovery without any structured offer (baseline)
+  - Curve B: recovery with structured plan agreed (EFS = Y, TDR agreed)
 
-Three paths valued on same NPV basis:
-  PATH 1 — TDR (Term Debt Restructure)
-            Loan NPV = PV of survival-weighted cash flows − concession cost
+Three paths valued on the same absolute NPV basis:
+  PATH 1 — TDR (Term Debt Restructure / Settlement)
+            NPV_offer    = PV(Curve_B cashflows) − concession_cost
+            NPV_baseline = PV(Curve_A cashflows)
+            Incremental  = NPV_offer − NPV_baseline
+
   PATH 2 — Legal
             Legal NPV = P(success) × asset_value / (1+r)^months − legal_cost
+
   PATH 3 — Debt Sale
             Sale NPV = sale_price_pct × outstanding  (immediate, certain)
 
-Best path = argmax(tdr_npv, legal_npv, debt_sale_npv).
-Best offer = argmax(loan_npv) across all TDR offer structures.
+  PATH 4 — HOLD (do nothing)
+            Hold NPV = PV(Curve_A)  — natural recovery with no concession
+
+Best path = argmax(NPV_offer, legal_npv, debt_sale_npv, hold_npv).
+Best offer = argmax(incremental_npv) across all TDR offer structures
+             subject to instalment ≤ payment_capacity.
 """
 
 import logging
@@ -28,6 +35,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+from .paydown_curves import PaydownCurveEngine, PaydownNPVResult
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +55,8 @@ class NPVConfig:
     # ── Discount rate ─────────────────────────────────────────────────────────
     annual_discount_rate: float     = 0.12      # CardX cost of capital (12% pa)
 
-    # ── Re-default survival curve (FICO: "re-default probability") ────────────
-    # Industry defaults — REPLACE with trained model predictions (Q8-A data)
-    # Format: month → cumulative re-default rate
-    redefault_curve_by_stage: Dict[str, Dict[int, float]] = field(
-        default_factory=lambda: {
-            "SM":         {6: 0.15, 12: 0.25, 24: 0.35, 36: 0.42, 48: 0.48, 60: 0.52},
-            "NPL":        {6: 0.25, 12: 0.40, 24: 0.55, 36: 0.63, 48: 0.70, 60: 0.75},
-            "CHARGEOFF":  {6: 0.35, 12: 0.55, 24: 0.70, 36: 0.78, 48: 0.83, 60: 0.87},
-        }
-    )
+    # ── Paydown curve horizon ─────────────────────────────────────────────────
+    paydown_horizon_months: int     = 24        # months of recovery to evaluate
 
     # ── Legal parameters ──────────────────────────────────────────────────────
     legal_cost_fixed: float         = 15000.0   # THB — fixed legal filing cost
@@ -87,33 +88,44 @@ class NPVConfig:
 
 @dataclass
 class LoanNPV:
-    """FICO: Loan Net Present Value for one TDR offer."""
+    """Paydown-curve-driven Loan NPV for one TDR offer."""
     offer_id: str
     offer_type: str
     outstanding: float
-    take_up_probability: float          # FICO term: P(acceptance)
-    redefault_probability_12m: float    # FICO term
-    loan_npv: float                     # PV of cash flows − concession
-    concession_cost: float              # interest + fee waivers cost to CardX
-    expected_cashflow: float            # take_up_probability × loan_npv
+    persona: str                        # recovery persona driving curve selection
+    months_at_180plus: int              # account staleness (months at 180+ DPD)
+    pv_baseline: float                  # PV(Curve_A) — natural recovery without offer
+    pv_with_offer: float                # PV(Curve_B) — recovery with structured plan
+    loan_npv: float                     # PV(Curve_B) − concession_cost (absolute NPV)
+    incremental_npv: float              # loan_npv − pv_baseline (gain over doing nothing)
+    concession_cost: float              # waivers + processing cost to CardX
+    expected_cashflow: float            # same as loan_npv (no take_up_prob; kept for API compat)
     monthly_instalment: float
     tenor_months: int
     haircut_pct: float                  # % of outstanding waived
     is_affordable: bool                 # instalment ≤ payment_capacity
+    # Balance decomposition
+    principal_waived: float  = 0.0
+    interest_waived: float   = 0.0
+    charges_waived: float    = 0.0
 
 
 @dataclass
 class PathValuation:
-    """Full path comparison for one account. FICO: Collection Treatment Optimization."""
+    """Full path comparison for one account."""
     account_id: str
     outstanding: float
     stage: str
+    persona: str
 
-    # TDR path
+    # TDR path (paydown-curve NPV)
     best_tdr_offer_id: str
-    best_tdr_loan_npv: float
-    best_tdr_take_up_prob: float
-    best_tdr_expected_cashflow: float
+    best_tdr_loan_npv: float           # PV(Curve_B) − concession
+    best_tdr_incremental_npv: float    # gain over baseline
+    best_tdr_expected_cashflow: float  # same as best_tdr_loan_npv (API compat)
+
+    # HOLD path (do nothing — natural recovery)
+    hold_npv: float                    # PV(Curve_A) without concession
 
     # Legal path
     legal_npv: float
@@ -136,18 +148,22 @@ class PathValuation:
 
 class NPVEngine:
     """
-    FICO-inspired NPV computation for TDR, Legal, and Debt Sale paths.
+    Paydown-curve-driven NPV computation for TDR, Legal, and Debt Sale paths.
 
-    Key FICO concepts implemented:
-      - Loan NPV: PV of survival-weighted cash flows
-      - Portfolio NPV: sum across accounts (for capacity optimisation)
-      - Take-up probability: from OfferAcceptanceModel
-      - Re-default probability: from survival curve (rule-based now, trained later)
-      - Collection Treatment Optimization: path comparison
+    Key design:
+      - No take-up probability — NPV grounded in empirical recovery curves
+      - Curve A (baseline) vs Curve B (with offer) determine absolute NPVs
+      - Path selected by argmax over TDR, Legal, Debt Sale, Hold (Curve A)
+      - Balance decomposition: waivers applied cheapest-first
     """
 
-    def __init__(self, config: Optional[NPVConfig] = None):
-        self.config = config or NPVConfig()
+    def __init__(
+        self,
+        config: Optional[NPVConfig] = None,
+        curve_engine: Optional[PaydownCurveEngine] = None,
+    ):
+        self.config       = config or NPVConfig()
+        self.curve_engine = curve_engine or PaydownCurveEngine()
         self._monthly_rate = (1 + self.config.annual_discount_rate) ** (1/12) - 1
 
     # ── PUBLIC ────────────────────────────────────────────────────────────────
@@ -155,33 +171,38 @@ class NPVEngine:
     def compute_loan_npv(
         self,
         offer_params: Dict,
-        take_up_probability: float,
-        stage: str,
+        persona: str,
+        months_at_180plus: int,
         payment_capacity: float,
+        concession_cost: Optional[float] = None,
     ) -> LoanNPV:
         """
-        Compute Loan NPV for a single TDR offer.
-        FICO: "Loan Net Present Value"
+        Compute Loan NPV for a single TDR offer using paydown curves.
 
         Args:
             offer_params: dict with keys:
                 offer_id, offer_type, outstanding, haircut_pct,
-                interest_rate_pa, tenor_months, fee_waiver_amount
-            take_up_probability: FICO "take-up probability" — P(customer accepts)
-            stage: SM | NPL | CHARGEOFF
-            payment_capacity: monthly payment capacity from AffordabilityEngine
+                interest_rate_pa, tenor_months,
+                principal_waived, interest_waived, charges_waived
+            persona: recovery persona (drives curve selection)
+            months_at_180plus: account staleness at 180+ DPD
+            payment_capacity: monthly ATP from AffordabilityEngine
+            concession_cost: override total cost (if balance decomposition computed
+                             externally by OfferGenerator); auto-computed if None.
         """
         cfg         = self.config
         outstanding = float(offer_params["outstanding"])
         haircut_pct = float(offer_params.get("haircut_pct", 0.0))
         tenor       = int(offer_params.get("tenor_months", 24))
         rate_pa     = float(offer_params.get("interest_rate_pa", 0.0))
-        fee_waiver  = float(offer_params.get("fee_waiver_amount", 0.0))
 
-        # Principal after haircut
+        # Waiver components (from balance decomposition if available)
+        principal_waived = float(offer_params.get("principal_waived", outstanding * haircut_pct))
+        interest_waived  = float(offer_params.get("interest_waived", 0.0))
+        charges_waived   = float(offer_params.get("charges_waived", 0.0))
+
+        # Monthly instalment on the settlement / restructured amount
         principal_after_haircut = outstanding * (1 - haircut_pct)
-
-        # Monthly instalment (standard annuity formula)
         monthly_rate = rate_pa / 12.0
         if monthly_rate > 0:
             instalment = (
@@ -189,62 +210,60 @@ class NPVEngine:
                 / (1 - (1 + monthly_rate) ** (-tenor))
             )
         else:
-            instalment = principal_after_haircut / tenor
+            instalment = principal_after_haircut / tenor if tenor > 0 else principal_after_haircut
 
         is_affordable = instalment <= payment_capacity
 
-        # Re-default survival curve
-        redefault_curve = cfg.redefault_curve_by_stage.get(
-            stage, cfg.redefault_curve_by_stage["NPL"]
+        # Concession cost to CardX (cheapest-first economic weighting)
+        if concession_cost is None:
+            concession_cost = (
+                principal_waived * 1.0            # full face value loss
+                + interest_waived * 0.6           # foregone income
+                + charges_waived * 0.3            # often already impaired
+                + cfg.processing_cost_per_tdr     # agent + system
+            )
+
+        # Paydown curve NPV
+        paydown_result = self.curve_engine.compute_npv(
+            persona=persona,
+            months_at_180plus=months_at_180plus,
+            outstanding=outstanding,
+            concession_cost=concession_cost,
+            monthly_discount_rate=self._monthly_rate,
+            horizon_months=cfg.paydown_horizon_months,
         )
 
-        # PV of cash flows weighted by P(customer still paying at month t)
-        pv_cashflows = 0.0
-        for t in range(1, tenor + 1):
-            # P(survive to month t) = 1 − cumulative re-default by t
-            # Interpolate from curve checkpoints
-            redefault_t = self._interpolate_redefault(redefault_curve, t)
-            p_survive_t = max(1.0 - redefault_t, 0.0)
-
-            # Discount factor
-            discount = (1 + self._monthly_rate) ** (-t)
-
-            pv_cashflows += p_survive_t * instalment * discount
-
-        # Concession cost to CardX
-        concession_cost = (
-            outstanding * haircut_pct        # waived principal
-            + fee_waiver                      # waived fees
-            + cfg.processing_cost_per_tdr     # agent + system
-        )
-
-        # Loan NPV
-        loan_npv = pv_cashflows - concession_cost
-
-        # Re-default at 12 months (FICO KPI)
-        redefault_12m = self._interpolate_redefault(redefault_curve, 12)
-
-        # Expected cashflow = take_up_prob × loan_npv
-        expected_cashflow = take_up_probability * max(loan_npv, 0)
+        loan_npv      = paydown_result.npv_offer
+        incremental   = paydown_result.incremental_npv
+        pv_baseline   = paydown_result.pv_baseline
+        pv_with_offer = paydown_result.pv_with_offer
 
         logger.debug(
-            "LoanNPV: offer=%s pv_flows=%.0f concession=%.0f npv=%.0f",
-            offer_params.get("offer_id"), pv_cashflows, concession_cost, loan_npv
+            "LoanNPV: offer=%s pv_baseline=%.0f pv_offer=%.0f concession=%.0f "
+            "loan_npv=%.0f incremental=%.0f",
+            offer_params.get("offer_id"), pv_baseline, pv_with_offer,
+            concession_cost, loan_npv, incremental,
         )
 
         return LoanNPV(
             offer_id=str(offer_params.get("offer_id", "unknown")),
             offer_type=str(offer_params.get("offer_type", "unknown")),
             outstanding=outstanding,
-            take_up_probability=round(take_up_probability, 4),
-            redefault_probability_12m=round(redefault_12m, 4),
+            persona=persona,
+            months_at_180plus=months_at_180plus,
+            pv_baseline=round(pv_baseline, 2),
+            pv_with_offer=round(pv_with_offer, 2),
             loan_npv=round(loan_npv, 2),
+            incremental_npv=round(incremental, 2),
             concession_cost=round(concession_cost, 2),
-            expected_cashflow=round(expected_cashflow, 2),
+            expected_cashflow=round(loan_npv, 2),   # kept for API compat
             monthly_instalment=round(instalment, 2),
             tenor_months=tenor,
             haircut_pct=haircut_pct,
             is_affordable=is_affordable,
+            principal_waived=round(principal_waived, 2),
+            interest_waived=round(interest_waived, 2),
+            charges_waived=round(charges_waived, 2),
         )
 
     def compute_legal_npv(
@@ -315,30 +334,49 @@ class NPVEngine:
         outstanding: float,
         stage: str,
         tdr_offers: List[LoanNPV],
+        persona: str = "UNKNOWN",
+        months_at_180plus: int = 0,
         bureau_asset_value: float = 0.0,
         has_secured_asset: bool   = False,
         override_sale_price: Optional[float] = None,
     ) -> PathValuation:
         """
-        FICO: Collection Treatment Optimization.
-        Compare all paths on same Loan NPV basis, recommend best.
+        Compare all paths on absolute NPV basis; recommend best.
+
+        Paths:
+          TDR      = PV(Curve_B) − concession (best offer from grid)
+          LEGAL    = P(success) × asset_value discounted − legal_cost
+          DEBT_SALE= sale_price_pct × outstanding  (immediate, certain)
+          HOLD     = PV(Curve_A) — natural recovery, zero concession
         """
         cfg = self.config
 
-        # ── TDR: pick best offer ──────────────────────────────────────────────
-        affordable_offers = [o for o in tdr_offers if o.is_affordable]
-        all_offers        = affordable_offers or tdr_offers  # fallback if none affordable
+        # ── HOLD: natural recovery baseline ───────────────────────────────────
+        hold_result = self.curve_engine.get_curve(
+            curve_type="A",
+            persona=persona,
+            months_at_180plus=months_at_180plus,
+            outstanding=outstanding,
+            monthly_discount_rate=self._monthly_rate,
+            horizon_months=cfg.paydown_horizon_months,
+        )
+        hold_npv = hold_result.pv_amount
 
-        if all_offers:
-            best_offer = max(all_offers, key=lambda o: o.expected_cashflow)
-            tdr_ecf    = best_offer.expected_cashflow
+        # ── TDR: pick best offer ──────────────────────────────────────────────
+        # Prefer affordable offers; rank by incremental_npv (gain over baseline)
+        affordable_offers = [o for o in tdr_offers if o.is_affordable]
+        ranked_offers     = affordable_offers or tdr_offers  # fallback if none affordable
+
+        if ranked_offers:
+            best_offer = max(ranked_offers, key=lambda o: o.incremental_npv)
             tdr_npv    = best_offer.loan_npv
-            tdr_tup    = best_offer.take_up_probability
+            tdr_incr   = best_offer.incremental_npv
+            tdr_ecf    = best_offer.expected_cashflow
         else:
             best_offer = None
-            tdr_ecf    = 0.0
             tdr_npv    = 0.0
-            tdr_tup    = 0.0
+            tdr_incr   = 0.0
+            tdr_ecf    = 0.0
 
         # ── Legal ─────────────────────────────────────────────────────────────
         legal_npv, p_legal, legal_viable = self.compute_legal_npv(
@@ -350,35 +388,33 @@ class NPVEngine:
             outstanding, stage, override_sale_price
         )
 
-        # ── Path selection ────────────────────────────────────────────────────
+        # ── Path selection (absolute NPV basis) ───────────────────────────────
         path_values = {
-            "TDR":       tdr_ecf,
+            "TDR":       tdr_npv,
             "LEGAL":     legal_npv if legal_viable else -np.inf,
             "DEBT_SALE": sale_npv,
+            "HOLD":      hold_npv,
         }
 
         recommended_path = max(path_values, key=path_values.get)
         recommended_npv  = path_values[recommended_path]
 
-        # Hold if all paths have negative NPV
-        if recommended_npv <= 0:
-            recommended_path = "HOLD"
-            recommended_npv  = 0.0
-
         # Build rationale
         rationale = self._build_rationale(
-            recommended_path, tdr_ecf, tdr_npv, tdr_tup,
-            legal_npv, legal_viable, sale_npv, best_offer
+            recommended_path, tdr_ecf, tdr_npv, tdr_incr,
+            hold_npv, legal_npv, legal_viable, sale_npv, best_offer
         )
 
         return PathValuation(
             account_id=account_id,
             outstanding=outstanding,
             stage=stage,
+            persona=persona,
             best_tdr_offer_id=best_offer.offer_id if best_offer else "none",
             best_tdr_loan_npv=tdr_npv,
-            best_tdr_take_up_prob=tdr_tup,
+            best_tdr_incremental_npv=tdr_incr,
             best_tdr_expected_cashflow=tdr_ecf,
+            hold_npv=round(hold_npv, 2),
             legal_npv=legal_npv,
             p_legal_success=p_legal,
             legal_viable=legal_viable,
@@ -393,13 +429,14 @@ class NPVEngine:
         self, path_valuations: List[PathValuation]
     ) -> Dict[str, float]:
         """
-        FICO: Portfolio NPV — aggregate across all accounts.
+        Portfolio NPV — aggregate across all accounts.
         Used for capacity-constrained optimisation.
         """
-        total_tdr   = sum(p.best_tdr_expected_cashflow for p in path_valuations)
+        recommended = sum(p.recommended_path_npv for p in path_valuations)
         total_legal = sum(p.legal_npv for p in path_valuations if p.legal_viable)
         total_sale  = sum(p.debt_sale_npv for p in path_valuations)
-        recommended = sum(p.recommended_path_npv for p in path_valuations)
+        total_hold  = sum(p.hold_npv for p in path_valuations)
+        total_tdr   = sum(p.best_tdr_loan_npv for p in path_valuations)
 
         by_path = {}
         for path in ["TDR", "LEGAL", "DEBT_SALE", "HOLD"]:
@@ -414,6 +451,7 @@ class NPVEngine:
             "portfolio_tdr_npv":         round(total_tdr, 2),
             "portfolio_legal_npv":       round(total_legal, 2),
             "portfolio_sale_npv":        round(total_sale, 2),
+            "portfolio_hold_npv":        round(total_hold, 2),
             "accounts_tdr":              sum(1 for p in path_valuations if p.recommended_path == "TDR"),
             "accounts_legal":            sum(1 for p in path_valuations if p.recommended_path == "LEGAL"),
             "accounts_sale":             sum(1 for p in path_valuations if p.recommended_path == "DEBT_SALE"),
@@ -423,26 +461,10 @@ class NPVEngine:
 
     # ── PRIVATE ───────────────────────────────────────────────────────────────
 
-    def _interpolate_redefault(
-        self, curve: Dict[int, float], month: int
-    ) -> float:
-        """Linearly interpolate re-default probability at arbitrary month."""
-        checkpoints = sorted(curve.keys())
-        if month <= checkpoints[0]:
-            return curve[checkpoints[0]] * month / checkpoints[0]
-        if month >= checkpoints[-1]:
-            return curve[checkpoints[-1]]
-        for i in range(len(checkpoints) - 1):
-            t0, t1 = checkpoints[i], checkpoints[i + 1]
-            if t0 <= month <= t1:
-                frac = (month - t0) / (t1 - t0)
-                return curve[t0] + frac * (curve[t1] - curve[t0])
-        return curve[checkpoints[-1]]
-
     def _build_rationale(
         self,
-        path, tdr_ecf, tdr_npv, tdr_tup,
-        legal_npv, legal_viable, sale_npv, best_offer
+        path, tdr_ecf, tdr_npv, tdr_incr,
+        hold_npv, legal_npv, legal_viable, sale_npv, best_offer
     ) -> str:
         if path == "TDR":
             offer_desc = (
@@ -451,25 +473,32 @@ class NPVEngine:
                 if best_offer else "no offer"
             )
             return (
-                f"TDR recommended: expected_cashflow={tdr_ecf:.0f} "
-                f"take_up_prob={tdr_tup:.0%} loan_npv={tdr_npv:.0f}. "
+                f"TDR recommended: loan_npv={tdr_npv:.0f} "
+                f"(incremental over hold={tdr_incr:.0f}). "
                 f"Best offer: {offer_desc}."
             )
         elif path == "LEGAL":
             return (
                 f"LEGAL recommended: legal_npv={legal_npv:.0f} "
-                f"beats TDR ({tdr_ecf:.0f}) and sale ({sale_npv:.0f}). "
+                f"beats TDR ({tdr_npv:.0f}) and sale ({sale_npv:.0f}). "
                 f"Secured asset identified in bureau."
             )
         elif path == "DEBT_SALE":
             return (
                 f"DEBT SALE recommended: sale_npv={sale_npv:.0f} "
-                f"beats TDR ({tdr_ecf:.0f}). "
+                f"beats TDR ({tdr_npv:.0f}) and hold ({hold_npv:.0f}). "
                 f"{'Legal not viable (no asset). ' if not legal_viable else ''}"
                 f"Immediate recovery preferred."
             )
+        elif path == "HOLD":
+            return (
+                f"HOLD recommended: natural recovery PV={hold_npv:.0f} "
+                f"beats TDR ({tdr_npv:.0f}), "
+                f"sale ({sale_npv:.0f}), legal ({legal_npv:.0f}). "
+                f"No structured offer justified."
+            )
         else:
             return (
-                f"HOLD: all paths have negative NPV. "
-                f"TDR={tdr_ecf:.0f}, Legal={legal_npv:.0f}, Sale={sale_npv:.0f}."
+                f"Path={path}: TDR={tdr_npv:.0f}, Hold={hold_npv:.0f}, "
+                f"Legal={legal_npv:.0f}, Sale={sale_npv:.0f}."
             )

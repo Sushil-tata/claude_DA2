@@ -40,6 +40,7 @@ from ..data.schema_mapper import SchemaMapper, STALE_FIELDS
 from .delinquency_features import DelinquencyFeatureBuilder
 from .billing_cycle_features import BillingCycleCalculator, BillingCycleConfig
 from .collection_action_aggregator import CollectionActionAggregator, ActionAggregatorConfig
+from .bureau_features import BureauFeatureBuilder, BureauConfig, BUREAU_FEATURE_COLS
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +59,11 @@ class PipelineConfig:
     enable_billing_cycle: bool = True
     enable_actions:       bool = True
     enable_demographics:  bool = True
+    enable_bureau:        bool = True
 
     billing_config:  BillingCycleConfig    = field(default_factory=BillingCycleConfig)
     action_config:   ActionAggregatorConfig = field(default_factory=ActionAggregatorConfig)
+    bureau_config:   BureauConfig          = field(default_factory=BureauConfig)
 
     # Null-fill strategy per dtype
     fill_numeric_with: float = 0.0
@@ -132,6 +135,7 @@ class CollectionsFeaturePipeline:
         actions_df:     Optional[pd.DataFrame] = None,  # T4 — optional
         settlements_df: Optional[pd.DataFrame] = None,  # T5 — optional
         snapshot_date:  Optional[date]         = None,
+        bureau_df:      Optional[pd.DataFrame] = None,  # T6 NCB — optional
     ) -> PipelineResult:
         """
         Run the full feature pipeline. Returns PipelineResult.
@@ -207,9 +211,21 @@ class CollectionsFeaturePipeline:
         else:
             demo_df = self._empty_demographics(base_df)
 
+        # ── Stage 6b: Bureau features ─────────────────────────────────────────
+        if self.cfg.enable_bureau and bureau_df is not None:
+            bur_builder = BureauFeatureBuilder(self.cfg.bureau_config)
+            customer_id_col = "m_token" if "m_token" in base_df.columns else "account_id"
+            bur_feat = bur_builder.build(bureau_df, base_df, customer_id_col=customer_id_col)
+            bur_feat = bur_feat.drop(
+                columns=[self.cfg.bureau_config.customer_id_col], errors="ignore"
+            ).reset_index(drop=True)
+        else:
+            bur_feat = self._empty_bureau(base_df)
+
         # ── Stage 7: Assemble feature matrix ──────────────────────────────────
         feat_df = pd.concat(
             [base_df.reset_index(drop=True),
+             bur_feat,
              dlnq_df.reset_index(drop=True),
              bill_df.reset_index(drop=True),
              act_df.reset_index(drop=True),
@@ -434,6 +450,12 @@ class CollectionsFeaturePipeline:
         ]
         return pd.DataFrame(
             {c: 0.0 for c in cols},
+            index=range(len(base_df)),
+        )
+
+    def _empty_bureau(self, base_df: pd.DataFrame) -> pd.DataFrame:
+        return pd.DataFrame(
+            {c: 0.0 for c in BUREAU_FEATURE_COLS},
             index=range(len(base_df)),
         )
 
