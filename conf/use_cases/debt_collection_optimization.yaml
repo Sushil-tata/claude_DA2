@@ -1,0 +1,421 @@
+use_case_id: debt_collection_optimization
+version: v1.0.0
+description: |
+  Next Best Action and Next Best Offer optimization for debt collection.
+  Predicts optimal channel, timing, and offer strategy to maximize recovery
+  while minimizing cost and maintaining compliance.
+
+# Data sources
+data:
+  accounts_table: "debt_collection.accounts"
+  demographics_table: "debt_collection.customer_demographics"
+  contact_history_table: "debt_collection.contact_history"
+  payment_history_table: "debt_collection.payment_history"
+  offers_history_table: "debt_collection.offers_history"
+
+# Feature engineering
+features:
+  snapshot_timestamp: "{{ execution_date }}"
+  lookback_windows: [7, 30, 90, 180, 365]  # days
+
+  # Account features
+  account_features:
+    - current_balance
+    - original_balance
+    - balance_ratio  # current/original
+    - days_past_due
+    - debt_age_days
+    - months_since_last_payment
+    - payment_to_balance_ratio
+    - total_payments_made
+
+  # Behavioral features (contact history)
+  behavioral_features:
+    - contact_count_7d
+    - contact_count_30d
+    - contact_count_90d
+    - last_contact_days_ago
+    - contact_response_rate
+    - promise_to_pay_count
+    - promise_kept_rate
+    - avg_time_to_payment_after_contact
+    - preferred_contact_channel  # which channel gets best response
+    - best_contact_time_of_day
+    - best_day_of_week
+
+  # Financial features
+  financial_features:
+    - estimated_income
+    - debt_to_income_ratio
+    - credit_score
+    - payment_capacity_score  # ability to pay
+
+  # Engagement features
+  engagement_features:
+    - dispute_rate
+    - complaint_filed
+    - returned_mail_count
+    - phone_disconnected
+    - email_bounce_rate
+    - cease_and_desist_flag
+
+  # Historical offer response
+  offer_response_features:
+    - settlement_offers_made
+    - settlement_acceptance_rate
+    - avg_discount_accepted
+    - payment_plan_completion_rate
+    - legal_threat_response_rate
+
+  leakage_prevention: true
+  point_in_time_join: true
+
+# Segmentation (Personas)
+segmentation:
+  method: combined  # Use both rule-based and ML clustering
+
+  # Rule-based segments (business knowledge)
+  rule_based_segments:
+    - name: "high_value_cooperative"
+      rules:
+        - current_balance > 5000
+        - days_past_due < 180
+        - contact_response_rate > 0.3
+        - promise_kept_rate > 0.5
+      strategy: "engagement_focused"
+
+    - name: "high_value_unresponsive"
+      rules:
+        - current_balance > 5000
+        - days_past_due >= 180
+        - contact_response_rate < 0.1
+      strategy: "aggressive_settlement"
+
+    - name: "medium_value_willing"
+      rules:
+        - current_balance BETWEEN 1000 AND 5000
+        - payment_capacity_score > 0.5
+        - dispute_rate < 0.2
+      strategy: "payment_plan_focused"
+
+    - name: "low_value_low_capacity"
+      rules:
+        - current_balance < 1000
+        - payment_capacity_score < 0.3
+        - days_past_due > 270
+      strategy: "minimal_contact_or_sale"
+
+    - name: "disputer"
+      rules:
+        - dispute_rate > 0.3
+        - complaint_filed = true
+      strategy: "compliance_focused"
+
+    - name: "skip_tracer_needed"
+      rules:
+        - phone_disconnected = true
+        - returned_mail_count > 2
+        - email_bounce_rate > 0.5
+      strategy: "locate_then_contact"
+
+  # ML-based segments (data-driven)
+  ml_segments:
+    n_clusters: 8
+    features:
+      - balance_ratio
+      - days_past_due
+      - contact_response_rate
+      - payment_capacity_score
+      - debt_to_income_ratio
+    method: "kmeans"
+
+  # Final segmentation combines both
+  final_segments: "hierarchical"  # Rule-based first, then ML within
+
+# Multi-Model Architecture
+models:
+  # Model 1: Propensity to Pay
+  propensity_to_pay:
+    algorithm: gradient_boosting
+    target: payment_made_30d
+    hyperparameters:
+      n_estimators: 200
+      max_depth: 6
+      learning_rate: 0.05
+    output: ltp_score  # Likelihood to Pay
+
+  # Model 2: Payment Capacity
+  payment_capacity:
+    algorithm: gradient_boosting
+    target: payment_amount_normalized
+    hyperparameters:
+      n_estimators: 200
+      max_depth: 6
+      learning_rate: 0.05
+    output: atp_score  # Ability to Pay
+
+  # Model 3: Channel Response (Multi-class)
+  channel_response:
+    algorithm: xgboost_multiclass
+    target: best_response_channel
+    classes: [email, sms, call, voice_bot, none]
+    hyperparameters:
+      n_estimators: 150
+      max_depth: 5
+      learning_rate: 0.1
+    output: channel_probabilities
+
+  # Model 4: Offer Response (Multi-output)
+  offer_response:
+    algorithm: multi_target_gradient_boosting
+    targets:
+      - settlement_acceptance
+      - payment_plan_acceptance
+      - optimal_discount_pct
+      - plan_completion_probability
+    output: offer_scores
+
+  # Model 5: Uplift Models (Treatment Effect)
+  uplift_models:
+    - treatment: settlement_offer_50pct
+      control: no_contact
+      learner: t_learner
+      outcome: payment_amount_recovered
+
+    - treatment: payment_plan_6mo
+      control: no_contact
+      learner: t_learner
+      outcome: payment_amount_recovered
+
+    - treatment: legal_warning
+      control: standard_contact
+      learner: s_learner
+      outcome: payment_amount_recovered
+
+# Next Best Action Decision Logic
+next_best_action:
+  # Channel Selection
+  channel_strategy:
+    rules:
+      - if: cease_and_desist_flag = true
+        then: no_contact
+
+      - if: phone_disconnected = true AND email_bounce_rate > 0.5
+        then: skip_trace
+
+      - if: dispute_rate > 0.3
+        then: compliance_review_required
+
+      - if: segment = "high_value_cooperative"
+        then: use_model_prediction
+        model: channel_response
+        min_probability: 0.3
+
+      - if: segment = "high_value_unresponsive"
+        then: escalate_to_priority_call
+
+      - default: use_model_prediction
+        model: channel_response
+
+  # Timing Optimization
+  timing_strategy:
+    best_time_of_day: model_predicted  # Use behavioral features
+    best_day_of_week: model_predicted
+    min_days_between_contacts: 7
+    max_contacts_per_month: 4  # Regulatory compliance
+
+  # Offer Selection
+  offer_strategy:
+    decision_tree:
+      - if: ltp_score < 0.2 AND atp_score < 0.3 AND current_balance < 2000
+        then: recommend_debt_sale
+
+      - if: ltp_score < 0.3 AND days_past_due > 360
+        then: recommend_legal_action
+
+      - if: ltp_score > 0.5 AND atp_score > 0.6
+        then: offer_payment_plan
+        params:
+          plan_months: 6-12
+          discount: 0-10%
+
+      - if: ltp_score > 0.4 AND atp_score < 0.5
+        then: offer_settlement
+        params:
+          discount_range: 30-60%
+          preference: one_time_payment
+
+      - if: segment = "high_value_unresponsive" AND days_past_due > 180
+        then: aggressive_settlement
+        params:
+          discount_range: 40-70%
+          urgency: high
+
+      - default: standard_contact
+        params:
+          offer_type: payment_reminder
+
+# Business Constraints
+constraints:
+  regulatory:
+    fdcpa_compliant: true
+    tcpa_compliant: true
+    max_contact_attempts_per_week: 3
+    no_contact_before_hour: 8  # 8am local time
+    no_contact_after_hour: 21  # 9pm local time
+    respect_cease_and_desist: true
+
+  cost:
+    max_cost_per_account: 50.00
+    channel_costs:
+      email: 0.10
+      sms: 0.25
+      voice_bot: 1.00
+      call: 5.00
+      legal: 200.00
+
+  recovery:
+    min_recovery_rate_target: 0.15  # 15% of portfolio
+    cost_to_collect_ratio_max: 0.30  # Cost should be < 30% of recovered
+
+# Validation Strategy
+validation:
+  # Segment-based validation
+  segments:
+    - dimension: persona
+      values:
+        - high_value_cooperative
+        - high_value_unresponsive
+        - medium_value_willing
+        - low_value_low_capacity
+        - disputer
+        - skip_tracer_needed
+
+    - dimension: debt_age_bucket
+      values: [0-90, 91-180, 181-270, 271-360, 360+]
+
+    - dimension: balance_bucket
+      values: [<500, 500-1000, 1000-5000, 5000+]
+
+  # Calibration by segment
+  calibration_config:
+    method: isotonic
+    by_segment: true
+    by_time: true
+    min_samples_per_bin: 100
+
+  # Business metrics
+  business_metrics:
+    - name: recovery_rate
+      formula: "sum(payments_received) / sum(total_balance)"
+      target: 0.15
+
+    - name: cost_efficiency
+      formula: "sum(contact_costs) / sum(payments_received)"
+      target: 0.30
+
+    - name: roi
+      formula: "(sum(payments_received) - sum(contact_costs)) / sum(contact_costs)"
+      target: 2.0
+
+    - name: settlement_acceptance_rate
+      formula: "count(accepted_settlements) / count(settlement_offers)"
+      target: 0.25
+
+    - name: payment_plan_completion_rate
+      formula: "count(completed_plans) / count(accepted_plans)"
+      target: 0.60
+
+    - name: compliance_violations
+      formula: "count(violations)"
+      target: 0
+
+  # A/B testing for uplift validation
+  ab_testing:
+    enabled: true
+    control_group_size: 0.20  # 20% holdout
+    randomization: stratified  # By segment
+    duration_days: 90
+
+# Output Schema
+output:
+  decision_table: "debt_collection.collection_decisions"
+  schema:
+    - account_id: STRING
+    - customer_id: STRING
+    - decision_timestamp: TIMESTAMP
+    - persona_segment: STRING
+    - ml_segment: STRING
+
+    # Scores
+    - ltp_score: DECIMAL(5,4)  # Likelihood to Pay
+    - atp_score: DECIMAL(5,4)  # Ability to Pay
+    - wtp_score: DECIMAL(5,4)  # Willingness to Pay (derived)
+
+    # Recommended Actions
+    - recommended_channel: STRING
+    - channel_confidence: DECIMAL(5,4)
+    - recommended_contact_time: TIMESTAMP
+
+    # Recommended Offer
+    - recommended_offer_type: STRING  # settlement, payment_plan, legal, debt_sale
+    - settlement_discount_pct: DECIMAL(5,2)
+    - settlement_amount: DECIMAL(10,2)
+    - payment_plan_months: INT
+    - payment_plan_monthly: DECIMAL(10,2)
+
+    # Expected Outcomes
+    - expected_recovery_amount: DECIMAL(10,2)
+    - expected_recovery_probability: DECIMAL(5,4)
+    - expected_cost: DECIMAL(10,2)
+    - expected_roi: DECIMAL(10,2)
+
+    # Uplift Estimates
+    - uplift_vs_no_contact: DECIMAL(10,2)
+    - uplift_confidence: DECIMAL(5,4)
+
+    # Metadata
+    - model_version: STRING
+    - run_id: STRING
+    - as_of_date: DATE
+    - compliant: BOOLEAN
+    - compliance_notes: STRING
+
+# Monitoring & Alerts
+monitoring:
+  metrics:
+    - recovery_rate_by_segment
+    - channel_effectiveness
+    - offer_acceptance_rates
+    - cost_per_dollar_recovered
+    - compliance_violations
+    - model_drift
+
+  alerts:
+    - metric: compliance_violations
+      threshold: 0
+      action: stop_campaign
+
+    - metric: cost_efficiency
+      threshold: 0.35
+      action: review_strategy
+
+    - metric: recovery_rate
+      threshold: 0.10
+      action: escalate_to_management
+
+# Reporting
+reporting:
+  dashboards:
+    - portfolio_health
+    - channel_performance
+    - offer_effectiveness
+    - segment_analysis
+    - compliance_monitoring
+    - roi_tracking
+
+  cadence: weekly
+  recipients:
+    - collections_manager
+    - compliance_officer
+    - analytics_team

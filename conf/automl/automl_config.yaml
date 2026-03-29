@@ -1,0 +1,299 @@
+# AutoML Configuration
+#
+# Configuration for automated model selection and hyperparameter tuning
+
+# Databricks AutoML Configuration
+databricks_automl:
+  # Problem type
+  problem_type: "regression"  # regression, classification, forecasting
+
+  # Target column
+  target_col: "income"
+
+  # Optimization settings
+  timeout_minutes: 30
+  max_trials: 20
+
+  # Primary metric (auto-selected if not specified)
+  # Regression: r2, mae, rmse, mse
+  # Classification: f1, precision, recall, accuracy, roc_auc, log_loss
+  # Forecasting: smape, mape, mae, mse, rmse
+  primary_metric: "r2"
+
+  # Feature engineering
+  exclude_cols:
+    - "customer_id"
+    - "as_of_date"
+    - "created_timestamp"
+
+  # Framework exclusions (optional)
+  exclude_frameworks: []  # e.g., ["sklearn", "xgboost", "lightgbm"]
+
+  # Experiment settings
+  experiment_dir: "/Users/decision_agent/automl/experiments"
+
+  # Post-training
+  register_best_model: true
+  model_registry_name: "income_estimation_automl"
+  model_stage: "Staging"  # None, Staging, Production
+
+# Hyperopt Configuration
+hyperopt:
+  # Optimization settings
+  max_evals: 100
+  timeout_seconds: 3600  # 1 hour
+  early_stop_rounds: 20
+  parallelism: 4  # For SparkTrials
+  use_spark: true  # Use distributed search
+
+  # Cross-validation
+  cv_folds: 5
+
+  # Model types to tune
+  model_types:
+    - gradient_boosting
+    - random_forest
+    - xgboost
+    - lightgbm
+
+  # Search spaces for each model type
+  search_spaces:
+    gradient_boosting:
+      n_estimators:
+        type: "quniform"
+        low: 50
+        high: 500
+        q: 50
+      max_depth:
+        type: "quniform"
+        low: 3
+        high: 15
+        q: 1
+      learning_rate:
+        type: "loguniform"
+        low: -5
+        high: 0
+      min_samples_split:
+        type: "quniform"
+        low: 2
+        high: 20
+        q: 2
+      min_samples_leaf:
+        type: "quniform"
+        low: 1
+        high: 10
+        q: 1
+      subsample:
+        type: "uniform"
+        low: 0.5
+        high: 1.0
+
+    random_forest:
+      n_estimators:
+        type: "quniform"
+        low: 50
+        high: 500
+        q: 50
+      max_depth:
+        type: "quniform"
+        low: 5
+        high: 30
+        q: 5
+      min_samples_split:
+        type: "quniform"
+        low: 2
+        high: 20
+        q: 2
+      min_samples_leaf:
+        type: "quniform"
+        low: 1
+        high: 10
+        q: 1
+      max_features:
+        type: "choice"
+        options: ["sqrt", "log2", null]
+
+    xgboost:
+      n_estimators:
+        type: "quniform"
+        low: 50
+        high: 500
+        q: 50
+      max_depth:
+        type: "quniform"
+        low: 3
+        high: 15
+        q: 1
+      learning_rate:
+        type: "loguniform"
+        low: -5
+        high: 0
+      subsample:
+        type: "uniform"
+        low: 0.5
+        high: 1.0
+      colsample_bytree:
+        type: "uniform"
+        low: 0.5
+        high: 1.0
+      gamma:
+        type: "loguniform"
+        low: -5
+        high: 2
+      reg_alpha:
+        type: "loguniform"
+        low: -5
+        high: 2
+      reg_lambda:
+        type: "loguniform"
+        low: -5
+        high: 2
+
+    lightgbm:
+      n_estimators:
+        type: "quniform"
+        low: 50
+        high: 500
+        q: 50
+      max_depth:
+        type: "quniform"
+        low: 3
+        high: 15
+        q: 1
+      learning_rate:
+        type: "loguniform"
+        low: -5
+        high: 0
+      num_leaves:
+        type: "quniform"
+        low: 10
+        high: 200
+        q: 10
+      min_child_samples:
+        type: "quniform"
+        low: 5
+        high: 50
+        q: 5
+      subsample:
+        type: "uniform"
+        low: 0.5
+        high: 1.0
+      colsample_bytree:
+        type: "uniform"
+        low: 0.5
+        high: 1.0
+      reg_alpha:
+        type: "loguniform"
+        low: -5
+        high: 2
+      reg_lambda:
+        type: "loguniform"
+        low: -5
+        high: 2
+
+  # Metrics
+  metric: "rmse"  # or r2, mae, accuracy, f1, auc
+  metric_direction: "minimize"  # or maximize
+
+# Model Comparison Configuration
+model_comparison:
+  # Models to compare (in addition to AutoML)
+  baseline_models:
+    - name: "gradient_boosting_baseline"
+      type: "GradientBoostingRegressor"
+      params:
+        n_estimators: 100
+        max_depth: 5
+        learning_rate: 0.1
+
+    - name: "random_forest_baseline"
+      type: "RandomForestRegressor"
+      params:
+        n_estimators: 100
+        max_depth: 10
+
+    - name: "ridge_baseline"
+      type: "Ridge"
+      params:
+        alpha: 1.0
+
+  # Comparison metrics
+  metrics:
+    - rmse
+    - r2
+    - mae
+
+  # Cross-validation
+  cv_folds: 5
+
+  # Constraints for recommendation
+  constraints:
+    max_training_time_seconds: 300  # 5 minutes
+    max_prediction_time_seconds: 1.0  # 1 second
+
+  # Primary metric for recommendation
+  primary_metric: "rmse"
+
+  # Statistical significance testing
+  statistical_test:
+    enabled: true
+    alpha: 0.05
+    method: "paired_t_test"
+
+# MLflow Integration
+mlflow:
+  experiment_name: "/Users/decision_agent/automl/model_comparison"
+  tracking_uri: "databricks"
+
+  # Auto-logging
+  autolog:
+    enabled: true
+    log_models: true
+    log_input_examples: false
+    log_model_signatures: true
+
+# Reporting
+reporting:
+  # Generate comparison report
+  generate_report: true
+  report_output_path: "dbfs:/decision_agent/reports/automl/"
+
+  # Include in report
+  include_sections:
+    - performance_comparison
+    - training_time_comparison
+    - complexity_analysis
+    - statistical_tests
+    - deployment_recommendation
+
+  # Visualization
+  generate_plots:
+    - metric_comparison_bar
+    - training_time_comparison
+    - performance_vs_complexity_scatter
+    - optimization_history
+
+# Advanced Options
+advanced:
+  # Feature selection during AutoML
+  feature_selection:
+    enabled: false
+    method: "recursive_feature_elimination"
+    n_features_to_select: 20
+
+  # Ensemble best models
+  ensemble_top_models:
+    enabled: false
+    top_n: 3
+    ensemble_method: "voting"  # or "stacking"
+
+  # Calibration
+  calibrate_predictions:
+    enabled: false
+    method: "isotonic"  # or "platt"
+
+  # Model explanation
+  generate_explanations:
+    enabled: true
+    method: "shap"
+    sample_size: 1000

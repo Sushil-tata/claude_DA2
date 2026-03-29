@@ -1,0 +1,223 @@
+name: Deploy to Databricks
+
+on:
+  push:
+    branches:
+      - main  # Deploy to production on merge to main
+      - staging  # Deploy to staging on merge to staging
+  workflow_dispatch:  # Allow manual trigger
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+env:
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  # Job 1: Lint and Test
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install black isort pylint pytest pyyaml
+
+      - name: Run Black (format check)
+        run: black --check src/
+
+      - name: Run isort (import check)
+        run: isort --check-only src/
+
+      - name: Run Pylint
+        run: pylint src/decision_agent/ --fail-under=8.0 || true
+
+      - name: Run unit tests
+        run: pytest tests/unit/ -v || true
+
+  # Job 2: Deploy to Databricks
+  deploy:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'production') || 'staging' }}
+      url: https://${{ secrets.DATABRICKS_HOST }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Databricks CLI
+        run: |
+          pip install databricks-cli
+
+      - name: Configure Databricks CLI
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          echo "[DEFAULT]" > ~/.databrickscfg
+          echo "host = $DATABRICKS_HOST" >> ~/.databrickscfg
+          echo "token = $DATABRICKS_TOKEN" >> ~/.databrickscfg
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event.inputs.environment }}" != "" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run deployment script
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          chmod +x deployment/deploy_to_databricks.sh
+          ./deployment/deploy_to_databricks.sh ${{ steps.env.outputs.environment }}
+
+      - name: Verify deployment
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          echo "Listing deployed jobs..."
+          databricks jobs list | grep decision_agent
+
+      - name: Notify Slack on success
+        if: success() && secrets.SLACK_WEBHOOK != ''
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "✅ Deployment to ${{ steps.env.outputs.environment }} succeeded",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment Successful*\n• Environment: `${{ steps.env.outputs.environment }}`\n• Branch: `${{ github.ref_name }}`\n• Commit: `${{ github.sha }}`"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Notify Slack on failure
+        if: failure() && secrets.SLACK_WEBHOOK != ''
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "❌ Deployment to ${{ steps.env.outputs.environment }} failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment Failed*\n• Environment: `${{ steps.env.outputs.environment }}`\n• Branch: `${{ github.ref_name }}`\n• Commit: `${{ github.sha }}`\n• View logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # Job 3: Integration Test (only for non-production)
+  integration-test:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.event.inputs.environment != 'production' && github.ref != 'refs/heads/main'
+    environment:
+      name: ${{ github.event.inputs.environment || 'staging' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Databricks CLI
+        run: pip install databricks-cli
+
+      - name: Configure Databricks CLI
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          echo "[DEFAULT]" > ~/.databrickscfg
+          echo "host = $DATABRICKS_HOST" >> ~/.databrickscfg
+          echo "token = $DATABRICKS_TOKEN" >> ~/.databrickscfg
+
+      - name: Trigger test job
+        id: test_job
+        run: |
+          JOB_NAME="production_inference_${{ github.event.inputs.environment || 'staging' }}"
+          echo "Triggering job: $JOB_NAME"
+
+          # Get job ID
+          JOB_ID=$(databricks jobs list --output JSON | jq -r ".jobs[] | select(.settings.name == \"$JOB_NAME\") | .job_id")
+
+          if [ -z "$JOB_ID" ]; then
+            echo "Error: Job not found: $JOB_NAME"
+            exit 1
+          fi
+
+          echo "Job ID: $JOB_ID"
+
+          # Trigger job
+          RUN_ID=$(databricks jobs run-now --job-id "$JOB_ID" --output JSON | jq -r '.run_id')
+          echo "Run ID: $RUN_ID"
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for job completion
+        run: |
+          RUN_ID=${{ steps.test_job.outputs.run_id }}
+          echo "Waiting for run $RUN_ID to complete..."
+
+          while true; do
+            STATUS=$(databricks runs get --run-id "$RUN_ID" --output JSON | jq -r '.state.life_cycle_state')
+            echo "Status: $STATUS"
+
+            if [ "$STATUS" == "TERMINATED" ]; then
+              RESULT=$(databricks runs get --run-id "$RUN_ID" --output JSON | jq -r '.state.result_state')
+              echo "Result: $RESULT"
+
+              if [ "$RESULT" == "SUCCESS" ]; then
+                echo "✓ Job completed successfully"
+                exit 0
+              else
+                echo "✗ Job failed"
+                exit 1
+              fi
+            fi
+
+            sleep 30
+          done

@@ -1,0 +1,152 @@
+# Model Hyperparameters Configuration
+
+# LightGBM
+lightgbm:
+  default:
+    boosting_type: 'gbdt'
+    objective: 'binary'
+    metric: 'auc'
+    num_leaves: 31
+    learning_rate: 0.05
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    max_depth: -1
+    min_child_samples: 20
+    reg_alpha: 0.0
+    reg_lambda: 1.0
+    n_estimators: 100
+    importance_type: 'gain'
+    verbose: -1
+  
+  search_space:
+    num_leaves: [15, 31, 63, 127]
+    learning_rate: [0.01, 0.05, 0.1]
+    feature_fraction: [0.6, 0.8, 1.0]
+    max_depth: [5, 7, 10, -1]
+    min_child_samples: [10, 20, 50]
+    reg_alpha: [0.0, 0.1, 1.0]
+    reg_lambda: [0.0, 1.0, 10.0]
+
+# XGBoost
+xgboost:
+  default:
+    objective: 'binary:logistic'
+    eval_metric: 'auc'
+    max_depth: 6
+    learning_rate: 0.05
+    n_estimators: 100
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 1
+    gamma: 0
+    reg_alpha: 0
+    reg_lambda: 1
+    scale_pos_weight: 1
+  
+  search_space:
+    max_depth: [3, 5, 7, 9]
+    learning_rate: [0.01, 0.05, 0.1]
+    subsample: [0.6, 0.8, 1.0]
+    colsample_bytree: [0.6, 0.8, 1.0]
+    min_child_weight: [1, 5, 10]
+    gamma: [0, 0.1, 0.5]
+
+# CatBoost
+catboost:
+  default:
+    iterations: 100
+    learning_rate: 0.05
+    depth: 6
+    l2_leaf_reg: 3.0
+    border_count: 128
+    loss_function: 'Logloss'
+    eval_metric: 'AUC'
+    verbose: False
+    thread_count: -1
+  
+  search_space:
+    depth: [4, 6, 8, 10]
+    learning_rate: [0.01, 0.05, 0.1]
+    l2_leaf_reg: [1.0, 3.0, 5.0, 10.0]
+    border_count: [32, 64, 128, 254]
+
+# Random Forest
+random_forest:
+  default:
+    n_estimators: 100
+    max_depth: None
+    min_samples_split: 2
+    min_samples_leaf: 1
+    max_features: 'sqrt'
+    bootstrap: true
+    oob_score: true
+    n_jobs: -1
+  
+  search_space:
+    n_estimators: [50, 100, 200, 500]
+    max_depth: [5, 10, 20, None]
+    min_samples_split: [2, 5, 10]
+    min_samples_leaf: [1, 2, 4]
+    max_features: ['sqrt', 'log2', None]
+
+# TabNet
+tabnet:
+  default:
+    n_d: 8
+    n_a: 8
+    n_steps: 3
+    gamma: 1.3
+    lambda_sparse: 0.001
+    optimizer_fn: 'adam'
+    optimizer_params: {'lr': 0.02}
+    mask_type: 'sparsemax'
+    scheduler_params: {'step_size': 10, 'gamma': 0.9}
+    scheduler_fn: 'StepLR'
+    n_independent: 2
+    n_shared: 2
+  
+  search_space:
+    n_d: [8, 16, 32, 64]
+    n_a: [8, 16, 32, 64]
+    n_steps: [3, 4, 5, 6]
+    gamma: [1.0, 1.3, 1.5, 2.0]
+
+# Ensemble Configuration
+ensemble:
+  methods:
+    - 'weighted_average'
+    - 'stacking'
+    - 'blending'
+  
+  stacking:
+    meta_learner: 'logistic_regression'
+    cv_folds: 5
+    use_probas: true
+  
+  weighted_average:
+    optimization_metric: 'auc'
+    method: 'optuna'
+
+# AutoML Configuration
+automl:
+  framework: 'optuna'
+  n_trials: 100
+  timeout: 3600
+  optimization_direction: 'maximize'
+  
+  metrics:
+    primary: 'auc'
+    secondary: ['ks', 'gini', 'precision', 'recall']
+  
+  multi_objective:
+    enabled: true
+    objectives:
+      - metric: 'auc'
+        weight: 0.4
+      - metric: 'stability_index'
+        weight: 0.3
+      - metric: 'calibration_score'
+        weight: 0.2
+      - metric: 'business_value'
+        weight: 0.1

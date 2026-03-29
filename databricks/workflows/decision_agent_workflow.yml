@@ -1,0 +1,153 @@
+# Databricks Workflow for Decision Agent Pipeline
+# This orchestrates the full end-to-end pipeline on Databricks
+
+name: decision_agent_income_estimation
+
+# Workflow configuration
+schedule:
+  quartz_cron_expression: "0 0 2 * * ?"  # Daily at 2 AM
+  timezone_id: "America/Los_Angeles"
+  pause_status: "UNPAUSED"
+
+# Email notifications
+email_notifications:
+  on_failure:
+    - data-science-team@example.com
+  on_success:
+    - data-science-team@example.com
+
+# Maximum concurrent runs
+max_concurrent_runs: 1
+
+# Workflow parameters
+parameters:
+  - name: use_case_config
+    default: "conf/use_cases/income_estimation.yaml"
+  - name: execution_date
+    default: "{{ ds }}"  # Databricks template for execution date
+
+# Tasks
+tasks:
+  # Task 1: Generate or load data
+  - task_key: load_data
+    description: "Load or generate synthetic transaction data"
+    depends_on: []
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point: run_usecase
+      parameters:
+        - "--config"
+        - "{{ job.parameters.use_case_config }}"
+        - "--execution-date"
+        - "{{ job.parameters.execution_date }}"
+
+    new_cluster:
+      spark_version: "13.3.x-scala2.12"
+      node_type_id: "i3.xlarge"
+      num_workers: 2
+      spark_conf:
+        "spark.sql.extensions": "io.delta.sql.DeltaSparkSessionExtension"
+        "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.delta.catalog.DeltaCatalog"
+
+    libraries:
+      - pypi:
+          package: "delta-spark==2.4.0"
+      - pypi:
+          package: "mlflow>=2.8.0"
+
+  # Task 2: Feature engineering
+  - task_key: compute_features
+    description: "Compute features with rolling windows, tags, and liquidity metrics"
+    depends_on:
+      - task_key: load_data
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point: compute_features
+      parameters:
+        - "--execution-date"
+        - "{{ job.parameters.execution_date }}"
+
+    existing_cluster_id: "{{ job.tasks.load_data.cluster_id }}"
+
+    timeout_seconds: 3600
+
+  # Task 3: Train model
+  - task_key: train_model
+    description: "Train income estimation model with MLflow tracking"
+    depends_on:
+      - task_key: compute_features
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point: train_model
+      parameters:
+        - "--execution-date"
+        - "{{ job.parameters.execution_date }}"
+
+    existing_cluster_id: "{{ job.tasks.load_data.cluster_id }}"
+
+    timeout_seconds: 1800
+
+  # Task 4: Validate model
+  - task_key: validate_model
+    description: "Validate model with segment and calibration evaluation"
+    depends_on:
+      - task_key: train_model
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point: validate_model
+      parameters:
+        - "--execution-date"
+        - "{{ job.parameters.execution_date }}"
+
+    existing_cluster_id: "{{ job.tasks.load_data.cluster_id }}"
+
+    timeout_seconds: 900
+
+  # Task 5: Batch scoring
+  - task_key: score_batch
+    description: "Score test set with trained model"
+    depends_on:
+      - task_key: validate_model
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point: score_batch
+      parameters:
+        - "--execution-date"
+        - "{{ job.parameters.execution_date }}"
+
+    existing_cluster_id: "{{ job.tasks.load_data.cluster_id }}"
+
+    timeout_seconds: 1800
+
+  # Task 6: Write decisions
+  - task_key: write_decisions
+    description: "Write decision output to Delta Lake"
+    depends_on:
+      - task_key: score_batch
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point: write_decisions
+      parameters:
+        - "--execution-date"
+        - "{{ job.parameters.execution_date }}"
+
+    existing_cluster_id: "{{ job.tasks.load_data.cluster_id }}"
+
+    timeout_seconds: 600
+
+# Retry policy
+retry_on_timeout: false
+max_retries: 2
+min_retry_interval_millis: 60000  # 1 minute
+
+# Tags for organization
+tags:
+  project: "decision_agent"
+  use_case: "income_estimation"
+  environment: "production"
