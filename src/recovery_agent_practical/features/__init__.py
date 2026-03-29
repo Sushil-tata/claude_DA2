@@ -1,10 +1,14 @@
-"""Features module - reused from decision_agent"""
+"""
+Recovery Agent Practical — Features
 
-# These are symlinked from decision_agent/features
-# Available modules:
-# - bureau_features
-# - delinquency_features
-# - billing_cycle_features
-# - collection_action_aggregator
-# - collections_feature_pipeline
-# - pipeline_adapter
+All feature modules are imported from the canonical source:
+  src/decision_agent/features/
+
+Do NOT duplicate code here. Import from decision_agent.features directly.
+"""
+from decision_agent.features.bureau_features import *
+from decision_agent.features.billing_cycle_features import *
+from decision_agent.features.collection_action_aggregator import *
+from decision_agent.features.collections_feature_pipeline import *
+from decision_agent.features.delinquency_features import *
+from decision_agent.features.pipeline_adapter import *
