@@ -1,0 +1,278 @@
+# Performance Optimization Configuration
+#
+# Configuration for distributed training, feature caching, and inference optimization
+
+# Distributed Training Configuration
+distributed_training:
+  # Enable distributed training
+  enabled: false  # Set to true when using multi-GPU/multi-node
+
+  # Framework
+  framework: "tensorflow"  # tensorflow, pytorch, or keras
+
+  # Horovod settings
+  horovod:
+    # Number of workers (auto-detected if not specified)
+    num_workers: null  # 4, 8, 16, etc.
+
+    # Communication backend
+    backend: "nccl"  # nccl (GPU), gloo (CPU), mpi
+
+    # Gradient compression
+    compression:
+      enabled: false
+      method: "fp16"  # fp16, none
+
+  # Training parameters
+  training:
+    # Batch size per worker
+    batch_size_per_worker: 64
+
+    # Learning rate scaling
+    lr_scaling:
+      enabled: true
+      method: "linear"  # linear, sqrt
+      base_lr: 0.001
+
+    # Warmup epochs
+    warmup_epochs: 3
+
+  # Checkpointing
+  checkpointing:
+    enabled: true
+    checkpoint_dir: "dbfs:/decision_agent/checkpoints/distributed/"
+    save_frequency_epochs: 5
+    keep_last_n: 3
+
+  # Performance monitoring
+  monitoring:
+    log_every_n_batches: 10
+    profile_batch_range: [10, 20]  # Profile batches 10-20
+
+# Feature Caching Configuration
+feature_caching:
+  # Enable feature caching
+  enabled: true
+
+  # Cache table
+  cache_table: "decision_agent.customer_features_cache"
+
+  # Time-to-live (hours)
+  ttl_hours: 24
+
+  # Incremental update strategy
+  incremental_update:
+    enabled: true
+    # Update triggers
+    triggers:
+      - new_data_available
+      - scheduled_refresh
+
+    # Schedule for automatic refresh
+    refresh_schedule: "0 0 2 * * ?"  # Daily at 2 AM
+
+  # Cache invalidation
+  invalidation:
+    # Invalidate on feature definition change
+    on_schema_change: true
+
+    # Invalidate specific entities
+    entity_invalidation:
+      enabled: true
+      # Invalidate entities with recent events
+      lookback_hours: 1
+
+  # Materialized views
+  materialized_views:
+    - name: "decision_agent.monthly_aggregates"
+      query: |
+        SELECT
+          customer_id,
+          DATE_TRUNC('month', event_timestamp) as month,
+          SUM(amount) as monthly_total,
+          COUNT(*) as monthly_count
+        FROM decision_agent.transactions
+        GROUP BY customer_id, DATE_TRUNC('month', event_timestamp)
+      refresh_schedule: "0 0 3 * * ?"  # Daily at 3 AM
+      partition_by: ["month"]
+
+    - name: "decision_agent.customer_summary"
+      query: |
+        SELECT
+          customer_id,
+          COUNT(*) as lifetime_transactions,
+          SUM(amount) as lifetime_value,
+          MAX(event_timestamp) as last_activity
+        FROM decision_agent.transactions
+        GROUP BY customer_id
+      refresh_schedule: "0 0 1 * * ?"  # Daily at 1 AM
+      partition_by: []
+
+  # Cache optimization
+  optimization:
+    # Z-order by customer_id for faster lookups
+    zorder_enabled: true
+    zorder_columns: ["customer_id"]
+
+    # Compact files regularly
+    compact_enabled: true
+    compact_schedule: "0 0 4 * * ?"  # Daily at 4 AM
+
+# Inference Optimization Configuration
+inference_optimization:
+  # Model quantization
+  quantization:
+    enabled: false  # Set to true for production
+    method: "dynamic"  # dynamic, static, qat
+
+    # Calibration for static quantization
+    calibration:
+      sample_size: 1000
+      calibration_table: "decision_agent.calibration_data"
+
+    # Expected improvements
+    target_metrics:
+      model_size_reduction_pct: 75
+      latency_reduction_pct: 40
+
+  # Batch prediction
+  batch_prediction:
+    # Default batch size
+    default_batch_size: 1000
+
+    # Adaptive batching (adjust based on load)
+    adaptive_batching:
+      enabled: true
+      min_batch_size: 100
+      max_batch_size: 5000
+
+    # Batch timeout (ms)
+    batch_timeout_ms: 100
+
+  # Model compilation
+  compilation:
+    # Compile to ONNX for production
+    compile_to_onnx:
+      enabled: false
+      output_path: "dbfs:/decision_agent/models/onnx/"
+
+    # TensorRT optimization (for NVIDIA GPUs)
+    tensorrt:
+      enabled: false
+      precision: "fp16"  # fp32, fp16, int8
+
+  # Prediction caching
+  prediction_caching:
+    enabled: true
+
+    # Cache backend
+    backend: "redis"  # redis or memory
+
+    # Redis configuration
+    redis:
+      host: "{{ secrets.redis_host }}"
+      port: 6379
+      db: 1  # Use different db than feature cache
+      ttl_seconds: 300  # 5 minutes
+
+    # Memory cache (fallback)
+    memory:
+      max_size: 10000  # Maximum cached predictions
+      ttl_seconds: 60
+
+  # GPU acceleration
+  gpu:
+    enabled: false  # Set to true if GPU available
+    device_id: 0
+    memory_fraction: 0.5  # Use 50% of GPU memory
+
+  # Benchmarking
+  benchmarking:
+    # Automatic benchmarking on model load
+    auto_benchmark: true
+    num_warmup_runs: 10
+    num_benchmark_runs: 100
+    sample_size: 100
+
+    # Performance targets
+    targets:
+      mean_latency_ms: 50
+      p95_latency_ms: 100
+      p99_latency_ms: 200
+      min_throughput_per_sec: 100
+
+# Performance Monitoring
+monitoring:
+  # Metrics to track
+  metrics:
+    - training_time_seconds
+    - inference_latency_ms
+    - throughput_per_sec
+    - cache_hit_rate
+    - model_size_mb
+    - gpu_utilization_pct
+
+  # Logging
+  logging:
+    log_level: "INFO"
+    log_performance_metrics: true
+    log_every_n_requests: 100
+
+  # Alerting
+  alerting:
+    enabled: true
+
+    # Alert thresholds
+    thresholds:
+      high_latency_ms: 200
+      low_throughput_per_sec: 50
+      low_cache_hit_rate: 0.70
+      high_gpu_memory_pct: 90
+
+    # Alert channels
+    channels:
+      - slack
+      - email
+
+# Experiment Tracking
+experiments:
+  # A/B testing for optimizations
+  ab_testing:
+    enabled: false
+
+    # Compare baseline vs optimized
+    variants:
+      - name: "baseline"
+        optimizations: []
+
+      - name: "optimized"
+        optimizations:
+          - quantization
+          - batching
+          - caching
+
+  # MLflow tracking
+  mlflow:
+    experiment_name: "/Users/decision_agent/optimization/experiments"
+    log_optimization_metrics: true
+
+# Advanced Options
+advanced:
+  # Mixed precision training
+  mixed_precision:
+    enabled: false
+    policy: "mixed_float16"  # mixed_float16, mixed_bfloat16
+
+  # Model pruning
+  pruning:
+    enabled: false
+    pruning_rate: 0.5  # Remove 50% of weights
+    fine_tune_epochs: 5
+
+  # Knowledge distillation
+  knowledge_distillation:
+    enabled: false
+    teacher_model_uri: "models:/income_estimation_champion/Production"
+    student_model_layers: [64, 32, 1]
+    temperature: 5.0
+    alpha: 0.7  # Distillation loss weight

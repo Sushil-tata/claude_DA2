@@ -1,0 +1,34 @@
+{
+  "cluster_name": "decision_agent_inference_production",
+  "spark_version": "13.3.x-scala2.12",
+  "node_type_id": "i3.xlarge",
+  "driver_node_type_id": "i3.xlarge",
+  "autoscale": {
+    "min_workers": 2,
+    "max_workers": 8
+  },
+  "autotermination_minutes": 30,
+  "spark_conf": {
+    "spark.databricks.delta.preview.enabled": "true",
+    "spark.databricks.delta.retentionDurationCheck.enabled": "false",
+    "spark.sql.adaptive.enabled": "true",
+    "spark.sql.adaptive.coalescePartitions.enabled": "true"
+  },
+  "spark_env_vars": {
+    "PYSPARK_PYTHON": "/databricks/python3/bin/python3"
+  },
+  "custom_tags": {
+    "environment": "production",
+    "use_case": "income_estimation",
+    "cluster_type": "inference",
+    "managed_by": "terraform"
+  },
+  "cluster_log_conf": {
+    "dbfs": {
+      "destination": "dbfs:/cluster-logs/decision_agent/production"
+    }
+  },
+  "init_scripts": [],
+  "enable_elastic_disk": true,
+  "runtime_engine": "PHOTON"
+}

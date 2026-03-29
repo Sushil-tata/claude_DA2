@@ -1,0 +1,30 @@
+# Core dependencies for local development and unit tests
+# These do NOT include PySpark (too heavy for local testing)
+
+# Data processing (pandas only for unit tests)
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Machine learning
+scikit-learn>=1.3.0
+
+# Configuration and validation
+pyyaml>=6.0.0
+jsonschema>=4.17.0
+
+# MLflow for experiment tracking (optional for local)
+mlflow>=2.8.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Code quality
+black>=23.0.0
+isort>=5.12.0
+pylint>=2.17.0
+flake8>=6.0.0
+
+# Jupyter notebooks (optional)
+jupyter>=1.0.0
+ipykernel>=6.25.0

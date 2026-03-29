@@ -1,0 +1,133 @@
+use_case_id: income_estimation
+description: Production monitoring configuration
+
+# Data Sources
+decision_table: decision_agent.production_predictions
+baseline_table: decision_agent.training_baseline
+monitoring_metrics_table: decision_agent.monitoring_metrics
+
+# Feature Monitoring (PSI)
+feature_monitoring:
+  enabled: true
+  feature_cols:
+    - transaction_count_30d
+    - transaction_sum_30d
+    - avg_transaction_amount_30d
+    - deposit_periodicity
+    - deposit_stability_score
+    - income_expense_ratio
+  psi_threshold: 0.25  # Alert if PSI > 0.25 (retrain recommended)
+  psi_warning_threshold: 0.10  # Warning if PSI > 0.10
+  num_bins: 10  # Bins for PSI calculation
+  min_samples: 100  # Min samples required for PSI
+
+# Prediction Drift Monitoring
+prediction_drift:
+  enabled: true
+  mean_shift_threshold: 0.10  # Alert if mean shifts > 10%
+  std_shift_threshold: 0.20  # Alert if std shifts > 20%
+  percentile_shift_threshold: 0.15  # Alert if percentiles shift > 15%
+
+# Data Quality Monitoring
+data_quality:
+  enabled: true
+  null_threshold: 0.10  # Alert if nulls > 10%
+  freshness_threshold_hours: 48  # Alert if data > 48h old
+  min_daily_predictions: 100  # Alert if daily predictions < 100
+  check_schema_consistency: true
+
+# Performance Monitoring (if labels available)
+performance_monitoring:
+  enabled: true
+  baseline_mae: 10000  # Baseline MAE from training
+  degradation_threshold: 0.15  # Alert if MAE increases > 15%
+  min_samples_for_check: 1000  # Min labeled samples needed
+  label_lag_days: 30  # Expected lag for labels
+
+# Lookback Windows
+lookback_days: 1  # Days to look back for current data
+comparison_window_days: 30  # Days to look back for baseline
+
+# Alerting
+alerting:
+  enabled: true
+
+  # Slack Integration
+  slack_webhook: null  # Set to Slack webhook URL
+
+  # PagerDuty Integration
+  pagerduty_integration_key: null  # Set to PagerDuty integration key
+
+  # Email Configuration
+  email:
+    enabled: false
+    smtp_host: smtp.gmail.com
+    smtp_port: 587
+    use_tls: true
+    username: null  # Set to SMTP username
+    password: null  # Set to SMTP password
+    from_address: ml-monitoring@company.com
+
+  email_recipients:
+    - ml-team@company.com
+    - data-engineering@company.com
+
+  # Alert Severity Routing
+  severity_routing:
+    info:
+      - slack
+    warning:
+      - slack
+      - email
+    critical:
+      - slack
+      - pagerduty
+      - email
+
+# Automated Actions
+automated_actions:
+  # Automated Retraining Trigger
+  retrain_trigger:
+    enabled: true
+    conditions:
+      - type: feature_drift
+        threshold: 0.25
+        min_features_drifted: 3  # Trigger if >= 3 features drifted
+      - type: performance_degradation
+        threshold: 0.20  # Trigger if MAE increased > 20%
+      - type: prediction_drift
+        threshold: 0.15  # Trigger if prediction mean shifted > 15%
+    action: notify  # Options: notify, auto_trigger_job
+    notification_channel: slack
+
+  # Automated Rollback
+  rollback_trigger:
+    enabled: true
+    conditions:
+      - type: data_quality_failure
+        severity: critical
+      - type: fair_lending_violation
+        severity: critical
+      - type: extreme_drift
+        psi_threshold: 0.50  # Extreme drift
+    action: notify  # Options: notify, auto_rollback
+
+# Dashboard Configuration
+dashboard:
+  enabled: true
+  output_table: decision_agent.dashboard_metrics
+  refresh_interval_hours: 1
+  metrics:
+    - feature_drift_trends
+    - prediction_drift_trends
+    - alert_history
+    - performance_trends
+    - data_quality_trends
+  lookback_days: 30
+
+# Monitoring Schedule
+schedule:
+  frequency: daily
+  time: "09:00"  # UTC
+  timezone: "UTC"
+  max_runtime_minutes: 60

@@ -1,0 +1,52 @@
+# Agent Configuration
+agent:
+  name: "Principal Data Science Decision Agent"
+  role: "Head of AI / Chief Risk Scientist"
+  expertise:
+    - "Credit Risk Modeling"
+    - "Fraud Detection"
+    - "Behavioral Analytics"
+    - "Graph ML"
+    - "Optimization"
+    - "Recommender Systems"
+    - "Production ML Architecture"
+  
+  operating_rules:
+    - "Always Think Multi-Model - Never recommend a single model solution"
+    - "Always Check Temporal Robustness - OOT validation is mandatory"
+    - "Always Recommend Challenger Designs - Champion-challenger framework"
+    - "Always Explain Trade-offs - Every recommendation must include pros/cons"
+    - "Always Optimize for Business Value - Not just statistical metrics"
+  
+  decision_output_structure:
+    - "Problem Understanding"
+    - "Data Architecture"
+    - "Feature Blueprint"
+    - "Modeling Blueprint"
+    - "Optimization Strategy"
+    - "Validation Blueprint"
+    - "Simulation & Policy Layer"
+    - "Production Design"
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+  log_dir: "logs"
+  
+# Orchestration Settings
+orchestration:
+  max_models: 10
+  champion_challenger_ratio: 0.7
+  ensemble_threshold: 3
+  parallel_execution: true
+  max_workers: 4
+
+# Validation Settings
+validation:
+  oot_months: 3
+  min_segment_size: 1000
+  psi_threshold: 0.25
+  csi_threshold: 0.25
+  min_auc: 0.65
+  calibration_bins: 10
