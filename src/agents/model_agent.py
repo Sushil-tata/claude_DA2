@@ -66,11 +66,17 @@ ELASTICITY_ALPHA (default: 2.5)
 """
 
 import logging
+import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from agents.base_agent import AgentBlockedException, BaseAgent
+
+DEFAULT_ELASTICITY_MODEL_DIR = Path(
+    os.environ.get("ELASTICITY_MODEL_DIR", "models/elasticity_model")
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,11 +156,65 @@ class ModelAgent(BaseAgent):
         self.action_alphas          = {**DEFAULT_ELASTICITY_ALPHA, **(action_alphas or {})}
         self.legal_uplift_threshold = legal_uplift_threshold
 
+        # Load elasticity model if available — replaces hardcoded alpha curves
+        self._elasticity_curves: dict = {}   # account_id → {d: p_accept}
+        self._elasticity_model_dir = DEFAULT_ELASTICITY_MODEL_DIR
+        self._try_load_elasticity_model()
+
+    def _try_load_elasticity_model(self) -> None:
+        """Load elasticity model if fitted. Falls back to alpha curves silently."""
+        import importlib.util as _ilu
+        import pathlib as _pl
+        model_path = self._elasticity_model_dir / "elasticity_model.pkl"
+        if model_path.exists():
+            try:
+                _spec = _ilu.spec_from_file_location(
+                    "elasticity_model_trainer",
+                    _pl.Path(__file__).parent.parent / "models" / "elasticity_model_trainer.py",
+                )
+                _mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                ElasticityModelTrainer = _mod.ElasticityModelTrainer
+                self._elasticity_trainer = ElasticityModelTrainer(
+                    model_dir=self._elasticity_model_dir
+                )
+                self.log("Elasticity model found — will use model-based P(accept|d)")
+            except Exception as e:
+                self._elasticity_trainer = None
+                self.log(f"Could not load elasticity model: {e} — using alpha fallback", level="warning")
+        else:
+            self._elasticity_trainer = None
+            self.log(
+                f"No elasticity model at {model_path} — "
+                "using hardcoded alpha curves. "
+                "Run ElasticityModelTrainer.fit() to enable model-based elasticity.",
+                level="warning",
+            )
+
     def execute(self) -> dict:
         self.log("Reading feature_output")
         df = self._read_features()
 
         output = df.copy()
+
+        # ── Pre-compute elasticity curves if model is available ───────────────
+        # Uses propensity_30d (P_1M) as primary signal per design spec.
+        if getattr(self, "_elasticity_trainer", None) is not None:
+            try:
+                curves_df = self._elasticity_trainer.predict_accept_curve(output)
+                # Store as {account_id: {d: p_accept}} for fast row-level lookup
+                d_cols = [c for c in curves_df.columns if c.startswith("p_accept_d")]
+                for _, row in curves_df.iterrows():
+                    aid = row.get("account_id")
+                    if aid is not None:
+                        self._elasticity_curves[aid] = {
+                            float(col.replace("p_accept_d", "")) / 100: row[col]
+                            for col in d_cols
+                        }
+                self.log(f"Elasticity curves computed for {len(self._elasticity_curves):,} accounts")
+            except Exception as e:
+                self.log(f"Elasticity model inference failed: {e} — using alpha fallback", level="warning")
+                self._elasticity_curves = {}
 
         # ── Compute per-action ERV and select best action ─────────────────────
         erv_results = output.apply(self._select_best_action, axis=1)
@@ -212,13 +272,18 @@ class ModelAgent(BaseAgent):
           LEGAL is only selected over AGENCY if
           ERV(LEGAL) > ERV(AGENCY) + legal_uplift_threshold.
         """
+        # propensity_30d (P_1M) is the primary decisioning signal
+        # propensity_180d (P_6M) used only for AGENCY/LEGAL (longer-horizon actions)
         p30     = row.get("propensity_30d",    0.0) or 0.0
         p180    = row.get("propensity_180d",   0.0) or 0.0
-        balance = row.get("erv_at_d_optimal",  0.0) or 0.0  # outstanding proxy
+        balance = row.get("erv_at_d_optimal",  0.0) or 0.0
         seg     = row.get("signal_segment",    "D")
         alpha   = self.action_alphas.get(seg, 2.5)
+        aid     = row.get("account_id")
 
-        # Use P_1M (30d) as primary signal; fall back to P_6M for LEGAL/AGENCY
+        # Use model-based elasticity curves if available for this account
+        elast_curves = self._elasticity_curves.get(aid, {})
+
         erv_by_action = {}
 
         # ── HOLD — no discount, no contact ────────────────────────────────────
@@ -227,32 +292,32 @@ class ModelAgent(BaseAgent):
             "d_optimal": 0.0, "action_cost": 0,
         }
 
-        # ── DIGITAL_NUDGE ─────────────────────────────────────────────────────
+        # ── DIGITAL_NUDGE — uses P_1M (primary signal) ───────────────────────
         erv_by_action["DIGITAL_NUDGE"] = self._best_discounted_erv(
             p_base=p30, balance=balance, alpha=alpha * 0.5,
-            action="DIGITAL_NUDGE",
+            action="DIGITAL_NUDGE", elast_curves=elast_curves,
         )
 
-        # ── AGENT_CALL ────────────────────────────────────────────────────────
+        # ── AGENT_CALL — uses P_1M (primary signal) ───────────────────────────
         erv_by_action["AGENT_CALL"] = self._best_discounted_erv(
             p_base=p30, balance=balance, alpha=alpha,
-            action="AGENT_CALL",
+            action="AGENT_CALL", elast_curves=elast_curves,
         )
 
-        # ── AGENCY (charge-off path, evaluated before LEGAL) ─────────────────
+        # ── AGENCY — uses P_6M (longer-horizon action) ───────────────────────
         erv_by_action["AGENCY"] = self._best_discounted_erv(
-            p_base=p180 * 0.6,   # agency recovery rate lower than direct contact
+            p_base=p180 * 0.6,
             balance=balance,
-            alpha=alpha * 1.2,   # agency more discount-responsive
-            action="AGENCY",
+            alpha=alpha * 1.2,
+            action="AGENCY", elast_curves=elast_curves,
         )
 
-        # ── LEGAL (charge-off escalation, agency-first rule applies) ──────────
+        # ── LEGAL — uses P_6M, less elastic (escalation, not first choice) ───
         erv_by_action["LEGAL"] = self._best_discounted_erv(
-            p_base=p180 * 0.4,   # legal success rate, typically lower than agency
+            p_base=p180 * 0.4,
             balance=balance,
-            alpha=0.5,           # legal less elastic to discount
-            action="LEGAL",
+            alpha=0.5,
+            action="LEGAL", elast_curves=elast_curves,
         )
 
         # ── Agency-first rule: LEGAL must beat AGENCY by threshold ────────────
@@ -278,24 +343,39 @@ class ModelAgent(BaseAgent):
         }
 
     def _best_discounted_erv(
-        self, p_base: float, balance: float, alpha: float, action: str
+        self,
+        p_base: float,
+        balance: float,
+        alpha: float,
+        action: str,
+        elast_curves: dict = None,
     ) -> dict:
         """
         Finds d in DISCOUNT_GRID that maximises net ERV for a given action.
 
-        ERV(d) = P(pay | d) × balance × (1 − d) − cost(action)
+        If elasticity model curves are provided (from ElasticityModelTrainer),
+        uses model P(accept|d) directly.
+        Otherwise falls back to parametric alpha curve:
+            P(pay | d) = 1 − (1 − p_base) × (1 − d)^alpha
 
-        P(pay | d) = 1 − (1 − p_base) × (1 − d)^alpha
+        ERV(d) = P(accept|d) × p_base × balance × (1−d) − cost(action)
         """
-        cost = self.action_costs.get(action, 0)
-        best_erv_net  = -cost   # net ERV at d=0 with no recovery
+        cost          = self.action_costs.get(action, 0)
+        best_erv_net  = -cost
         best_d        = 0.0
         best_erv_gross = 0.0
 
         for d in DISCOUNT_GRID:
-            p_adj      = 1.0 - (1.0 - p_base) * ((1.0 - d) ** alpha)
-            erv_gross  = p_adj * balance * (1.0 - d)
-            erv_net    = erv_gross - cost
+            if elast_curves and d in elast_curves:
+                # Model-based P(accept | d) — preferred
+                p_accept = float(elast_curves[d])
+                p_adj    = p_accept * p_base
+            else:
+                # Parametric alpha fallback
+                p_adj = 1.0 - (1.0 - p_base) * ((1.0 - d) ** alpha)
+
+            erv_gross = p_adj * balance * (1.0 - d)
+            erv_net   = erv_gross - cost
             if erv_net > best_erv_net:
                 best_erv_net   = erv_net
                 best_d         = d

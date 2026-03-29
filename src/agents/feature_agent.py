@@ -74,11 +74,21 @@ BEHAVIOURAL_PERSONA definitions (derived from willingness + capacity scores):
 """
 
 import logging
-from datetime import datetime, timedelta
+import os
+from pathlib import Path
 
 import pandas as pd
 
 from agents.base_agent import AgentBlockedException, BaseAgent
+import importlib.util as _ilu
+import pathlib as _pl
+_pct_spec = _ilu.spec_from_file_location(
+    "persona_cluster_trainer",
+    _pl.Path(__file__).parent.parent / "models" / "persona_cluster_trainer.py",
+)
+_pct_mod = _ilu.module_from_spec(_pct_spec)
+_pct_spec.loader.exec_module(_pct_mod)
+PersonaClusterTrainer = _pct_mod.PersonaClusterTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +96,10 @@ logger = logging.getLogger(__name__)
 
 # See CONFIGURATION INSTRUCTIONS above before changing this value.
 DEFAULT_BUREAU_SIGNAL_LAG_DAYS = 60
+
+DEFAULT_PERSONA_MODEL_DIR = Path(
+    os.environ.get("PERSONA_MODEL_DIR", "models/persona_clusters")
+)
 
 # Columns passed downstream — explicit allowlist
 FEATURE_COLUMNS = [
@@ -124,6 +138,7 @@ class FeatureAgent(BaseAgent):
         memory,
         dry_run: bool = False,
         bureau_signal_lag_days: int = DEFAULT_BUREAU_SIGNAL_LAG_DAYS,
+        persona_model_dir: Path = DEFAULT_PERSONA_MODEL_DIR,
     ):
         """
         Args:
@@ -134,6 +149,10 @@ class FeatureAgent(BaseAgent):
                                     bureau signal to count as available.
                                     Default: 60 (2 months). See module
                                     docstring for full guidance.
+            persona_model_dir:      Path to fitted PersonaClusterTrainer models.
+                                    If models are not found, falls back to
+                                    rule-based personas with a warning.
+                                    Set PERSONA_MODEL_DIR env var to override.
         """
         super().__init__(
             agent_name="feature_agent",
@@ -142,9 +161,13 @@ class FeatureAgent(BaseAgent):
             dry_run=dry_run,
         )
         self.bureau_signal_lag_days = bureau_signal_lag_days
+        self.persona_model_dir      = Path(persona_model_dir)
+        self._persona_trainer       = PersonaClusterTrainer(
+            model_dir=self.persona_model_dir
+        )
         self.log(
-            f"bureau_signal_lag_days={self.bureau_signal_lag_days} "
-            f"(bureau signal valid if pull date within {self.bureau_signal_lag_days}d of score_date)"
+            f"bureau_signal_lag_days={self.bureau_signal_lag_days} | "
+            f"persona_model_dir={self.persona_model_dir}"
         )
 
     def execute(self) -> dict:
@@ -169,8 +192,8 @@ class FeatureAgent(BaseAgent):
             lambda r: self._signal_segment(r, self.bureau_signal_lag_days), axis=1
         )
 
-        # ── Derive BEHAVIOURAL_PERSONA ────────────────────────────────────────
-        df["behavioural_persona"] = df.apply(self._behavioural_persona, axis=1)
+        # ── Derive BEHAVIOURAL_PERSONA (cluster model; rule-based fallback) ───
+        df["behavioural_persona"] = self._derive_persona(df)
 
         # ── Composite segment key (SIGNAL_SEGMENT + BEHAVIOURAL_PERSONA) ──────
         df["final_segment"] = df["signal_segment"] + "_" + df["behavioural_persona"]
@@ -262,8 +285,40 @@ class FeatureAgent(BaseAgent):
 
     # ── BEHAVIOURAL_PERSONA derivation ────────────────────────────────────────
 
+    def _derive_persona(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Attempts to use fitted PersonaClusterTrainer models first.
+        Falls back to rule-based thresholds if models are not found.
+
+        Cluster-based approach is preferred — it derives behavioural identity
+        from data, not from manually defined rules.
+        Rule-based fallback exists only for cold-start (no trained model yet).
+        """
+        any_model = any(
+            (self.persona_model_dir / f"{seg}_persona_model.pkl").exists()
+            for seg in ["A", "B", "C", "D"]
+        )
+
+        if any_model:
+            self.log("Using fitted cluster models for BEHAVIOURAL_PERSONA")
+            return self._persona_trainer.predict(df)
+
+        self.log(
+            "No fitted persona cluster models found at "
+            f"{self.persona_model_dir} — using rule-based fallback. "
+            "Run PersonaClusterTrainer.fit() on historical data to enable "
+            "data-driven behavioural segmentation.",
+            level="warning",
+        )
+        return df.apply(self._behavioural_persona_rules, axis=1)
+
     @staticmethod
-    def _behavioural_persona(row) -> str:
+    def _behavioural_persona_rules(row) -> str:
+        """
+        Rule-based fallback for BEHAVIOURAL_PERSONA.
+        Used only when no fitted cluster model exists.
+        Replace with PersonaClusterTrainer as soon as training data is available.
+        """
         """
         Derives behavioural persona from willingness and capacity scores.
 
