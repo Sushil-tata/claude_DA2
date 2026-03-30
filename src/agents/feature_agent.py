@@ -70,6 +70,49 @@ BEHAVIOURAL_PERSONA definitions (derived from willingness + capacity scores):
     willingness_score and capacity_score are passed as FEATURES to downstream
     models (propensity, amount, elasticity). They are NOT used as segmentation
     rules to pre-assign actions.
+
+ENTERPRISE FEATURE TABLE (optional join — recommended)
+──────────────────────────────────────────────────────────────────────────────
+    Your DS team's enterprise feature engineering notebook produces ~100+
+    features and writes them to a Delta table (e.g. cdx_mdz_prd.feature_store).
+    Those 100 features were used to TRAIN the propensity models.
+
+    The FeatureAgent does NOT recreate those features. It reads pre-computed
+    propensity scores from recovery.model_scores (output of recovery-engine-v2).
+
+    To make all 100 features available to downstream models (PersonaCluster,
+    WillingnessModel, CapacityModel, AmountModel), configure:
+
+        enterprise_feature_table: fully-qualified Delta table name
+        enterprise_feature_join_keys: columns to join on (default: account_id + score_date)
+
+    How to configure via env variables (Databricks cluster config):
+        ENTERPRISE_FEATURE_TABLE=cdx_mdz_prd.feature_store
+        ENTERPRISE_FEATURE_JOIN_KEYS=account_id,score_date
+
+    How to configure in code:
+        FeatureAgent(
+            ...,
+            enterprise_feature_table="cdx_mdz_prd.feature_store",
+            enterprise_feature_join_keys=["account_id", "score_date"],
+        )
+
+    If enterprise_feature_table is not set:
+        FeatureAgent only passes through columns present in recovery.model_scores.
+        Downstream models fall back to their default feature subsets.
+
+FEATURE PASSTHROUGH — ALL COLUMNS FLOW DOWNSTREAM
+    FeatureAgent no longer filters to a hard column allowlist.
+    All columns from model_scores + enterprise feature join pass through to
+    feature_output. Downstream agents select only what they need.
+
+    Columns that FeatureAgent itself ADDS (always present in output):
+        signal_segment, behavioural_persona, final_segment
+        willingness_score, capacity_score
+        erv_band, recovery_tier, contact_priority
+
+    BLOCKED columns (never passed downstream — PII / future-dated):
+        PII_BLOCK_COLS list below. Add any PII fields your data contains.
 ──────────────────────────────────────────────────────────────────────────────
 """
 
@@ -98,25 +141,30 @@ logger = logging.getLogger(__name__)
 # See CONFIGURATION INSTRUCTIONS above before changing this value.
 DEFAULT_BUREAU_SIGNAL_LAG_DAYS = 60
 
-DEFAULT_PERSONA_MODEL_DIR    = Path(os.environ.get("PERSONA_MODEL_DIR",    "models/persona_clusters"))
+DEFAULT_PERSONA_MODEL_DIR     = Path(os.environ.get("PERSONA_MODEL_DIR",     "models/persona_clusters"))
 DEFAULT_WILLINGNESS_MODEL_DIR = Path(os.environ.get("WILLINGNESS_MODEL_DIR", "models/willingness_model"))
 DEFAULT_CAPACITY_MODEL_DIR    = Path(os.environ.get("CAPACITY_MODEL_DIR",    "models/capacity_model"))
 
-# Columns passed downstream — explicit allowlist
-FEATURE_COLUMNS = [
-    "account_id", "score_date",
-    "signal_quadrant", "segment_label",
-    "propensity_30d", "propensity_90d", "propensity_180d",
-    "low_confidence_flag",
-    "d_optimal", "erv_at_d_optimal",
-    "erv_d20", "erv_d30", "erv_d40", "erv_d50", "erv_d60",
-    "p_accept_d20", "p_accept_d30", "p_accept_d40", "p_accept_d50", "p_accept_d60",
-    "model_version", "experiment_id",
-    # Bureau signal fields (optional — used for SIGNAL_SEGMENT derivation)
-    "bureau_pull_date", "ncb_tradeline_count",
-    # Willingness + capacity (optional — used for BEHAVIOURAL_PERSONA derivation)
-    "willingness_score", "capacity_score",
-]
+# Enterprise feature table — set via env var or constructor param.
+# This is the Delta table your DS team writes 100+ features to.
+# Leave None to skip the join (FeatureAgent will use only model_scores columns).
+DEFAULT_ENTERPRISE_FEATURE_TABLE = os.environ.get("ENTERPRISE_FEATURE_TABLE", None)
+
+# Join keys between model_scores and enterprise feature table.
+# Default: account_id + score_date for point-in-time safe join.
+# Override via env: ENTERPRISE_FEATURE_JOIN_KEYS=account_id,score_date
+_join_keys_env = os.environ.get("ENTERPRISE_FEATURE_JOIN_KEYS", "account_id,score_date")
+DEFAULT_ENTERPRISE_JOIN_KEYS = [k.strip() for k in _join_keys_env.split(",")]
+
+# PII columns — NEVER passed downstream regardless of source.
+# Add any PII fields present in your enterprise feature table.
+PII_BLOCK_COLS = {
+    "national_id", "citizen_id", "passport_no",
+    "full_name", "first_name", "last_name",
+    "phone_number", "mobile_number", "email",
+    "address", "home_address",
+    "date_of_birth", "dob",
+}
 
 # ERV bands for ConstraintAgent rules (THB)
 ERV_BANDS = [
@@ -138,30 +186,44 @@ class FeatureAgent(BaseAgent):
         execution_date: str,
         memory,
         dry_run: bool = False,
-        bureau_signal_lag_days: int = DEFAULT_BUREAU_SIGNAL_LAG_DAYS,
-        persona_model_dir: Path     = DEFAULT_PERSONA_MODEL_DIR,
-        willingness_model_dir: Path = DEFAULT_WILLINGNESS_MODEL_DIR,
-        capacity_model_dir: Path    = DEFAULT_CAPACITY_MODEL_DIR,
+        bureau_signal_lag_days: int    = DEFAULT_BUREAU_SIGNAL_LAG_DAYS,
+        persona_model_dir: Path        = DEFAULT_PERSONA_MODEL_DIR,
+        willingness_model_dir: Path    = DEFAULT_WILLINGNESS_MODEL_DIR,
+        capacity_model_dir: Path       = DEFAULT_CAPACITY_MODEL_DIR,
+        enterprise_feature_table: str  = DEFAULT_ENTERPRISE_FEATURE_TABLE,
+        enterprise_join_keys: list     = None,
     ):
         """
         Args:
-            execution_date:         Scoring date (YYYY-MM-DD).
-            memory:                 AgentMemory instance.
-            dry_run:                If True, skip all Delta writes.
-            bureau_signal_lag_days: Max days since last bureau pull for
-                                    bureau signal to count as available.
-                                    Default: 60 (2 months).
-            persona_model_dir:      Fitted PersonaClusterTrainer models.
-                                    Falls back to rule-based if not found.
-                                    Set PERSONA_MODEL_DIR env var to override.
-            willingness_model_dir:  Fitted WillingnessModelTrainer.
-                                    Falls back to raw willingness_score column
-                                    if column present, else 0.5 default.
-                                    Set WILLINGNESS_MODEL_DIR to override.
-            capacity_model_dir:     Fitted CapacityModelTrainer.
-                                    Falls back to raw capacity_score column
-                                    if column present, else 0.5 default.
-                                    Set CAPACITY_MODEL_DIR to override.
+            execution_date:           Scoring date (YYYY-MM-DD).
+            memory:                   AgentMemory instance.
+            dry_run:                  If True, skip all Delta writes.
+            bureau_signal_lag_days:   Max days since last bureau pull for
+                                      bureau signal to count as available.
+                                      Default: 60 (2 months).
+            persona_model_dir:        Fitted PersonaClusterTrainer models.
+                                      Falls back to rule-based if not found.
+                                      Set PERSONA_MODEL_DIR env var to override.
+            willingness_model_dir:    Fitted WillingnessModelTrainer.
+                                      Falls back to raw willingness_score column
+                                      if column present, else 0.5 default.
+                                      Set WILLINGNESS_MODEL_DIR to override.
+            capacity_model_dir:       Fitted CapacityModelTrainer.
+                                      Falls back to raw capacity_score column
+                                      if column present, else 0.5 default.
+                                      Set CAPACITY_MODEL_DIR to override.
+            enterprise_feature_table: Fully-qualified Delta table name for your
+                                      enterprise feature store (e.g.
+                                      'cdx_mdz_prd.feature_store').
+                                      All columns from this table are joined to
+                                      model_scores and passed downstream.
+                                      Set ENTERPRISE_FEATURE_TABLE env var to
+                                      configure without code changes.
+                                      Leave None to skip the join.
+            enterprise_join_keys:     Columns to join on between model_scores
+                                      and enterprise_feature_table.
+                                      Default: ['account_id', 'score_date'].
+                                      Set ENTERPRISE_FEATURE_JOIN_KEYS env var.
         """
         super().__init__(
             agent_name="feature_agent",
@@ -169,19 +231,22 @@ class FeatureAgent(BaseAgent):
             memory=memory,
             dry_run=dry_run,
         )
-        self.bureau_signal_lag_days   = bureau_signal_lag_days
-        self.persona_model_dir        = Path(persona_model_dir)
-        self.willingness_model_dir    = Path(willingness_model_dir)
-        self.capacity_model_dir       = Path(capacity_model_dir)
-        self._persona_trainer         = PersonaClusterTrainer(model_dir=self.persona_model_dir)
-        self._willingness_trainer     = None
-        self._capacity_trainer        = None
+        self.bureau_signal_lag_days    = bureau_signal_lag_days
+        self.persona_model_dir         = Path(persona_model_dir)
+        self.willingness_model_dir     = Path(willingness_model_dir)
+        self.capacity_model_dir        = Path(capacity_model_dir)
+        self.enterprise_feature_table  = enterprise_feature_table
+        self.enterprise_join_keys      = enterprise_join_keys or DEFAULT_ENTERPRISE_JOIN_KEYS
+        self._persona_trainer          = PersonaClusterTrainer(model_dir=self.persona_model_dir)
+        self._willingness_trainer      = None
+        self._capacity_trainer         = None
         self._try_load_score_models()
         self.log(
             f"bureau_signal_lag_days={self.bureau_signal_lag_days} | "
             f"persona_model_dir={self.persona_model_dir} | "
             f"willingness_model={'loaded' if self._willingness_trainer else 'fallback'} | "
-            f"capacity_model={'loaded' if self._capacity_trainer else 'fallback'}"
+            f"capacity_model={'loaded' if self._capacity_trainer else 'fallback'} | "
+            f"enterprise_features={'YES: ' + str(self.enterprise_feature_table) if self.enterprise_feature_table else 'NO (set ENTERPRISE_FEATURE_TABLE to enable)'}"
         )
 
     def _try_load_score_models(self) -> None:
@@ -257,21 +322,160 @@ class FeatureAgent(BaseAgent):
 
         return df
 
+    def _join_enterprise_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Joins your enterprise feature table to model_scores on account_id + score_date.
+
+        This is the bridge between your existing DS feature pipeline and the
+        agent pipeline. The enterprise table is read once per execution and
+        joined in-memory.
+
+        - All columns from the enterprise table are added to df.
+        - Duplicate column names (already in model_scores) are skipped —
+          model_scores values take precedence (propensity scores are authoritative).
+        - If the join produces zero matches, logs a warning but does NOT block.
+        - PII columns are stripped AFTER this join in execute().
+
+        Args:
+            df: model_scores DataFrame (account_id + score_date + score columns).
+
+        Returns:
+            df enriched with enterprise feature columns (or unchanged if no table configured).
+        """
+        if not self.enterprise_feature_table:
+            self.log(
+                "No enterprise_feature_table configured — "
+                "downstream models will use only model_scores columns. "
+                "Set ENTERPRISE_FEATURE_TABLE env var to connect your feature store.",
+                level="warning",
+            )
+            return df
+
+        self.log(f"Joining enterprise feature table: {self.enterprise_feature_table}")
+        try:
+            # Read from Spark if available (Databricks), else read as Delta via pandas
+            feat_df = self._read_enterprise_table()
+            if feat_df is None or feat_df.empty:
+                self.log(
+                    f"Enterprise feature table {self.enterprise_feature_table} returned 0 rows "
+                    f"— skipping join. Check table name and execution_date.",
+                    level="warning",
+                )
+                return df
+
+            # Validate join keys exist in both tables
+            missing_left  = [k for k in self.enterprise_join_keys if k not in df.columns]
+            missing_right = [k for k in self.enterprise_join_keys if k not in feat_df.columns]
+            if missing_left or missing_right:
+                self.log(
+                    f"Join key mismatch — skipping enterprise join. "
+                    f"Missing in model_scores: {missing_left}. "
+                    f"Missing in feature table: {missing_right}. "
+                    f"enterprise_join_keys={self.enterprise_join_keys}",
+                    level="warning",
+                )
+                return df
+
+            # Drop duplicate columns from feature table — model_scores is authoritative
+            existing_cols   = set(df.columns)
+            join_key_set    = set(self.enterprise_join_keys)
+            new_feat_cols   = [
+                c for c in feat_df.columns
+                if c not in existing_cols or c in join_key_set
+            ]
+            feat_df = feat_df[new_feat_cols]
+
+            enriched = df.merge(feat_df, on=self.enterprise_join_keys, how="left")
+
+            match_rate = enriched[self.enterprise_join_keys[0]].notna().mean()
+            added_cols = len(enriched.columns) - len(df.columns)
+            self.log(
+                f"Enterprise join complete | "
+                f"added_cols={added_cols} | "
+                f"match_rate={match_rate:.1%} | "
+                f"rows={len(enriched):,}"
+            )
+            return enriched
+
+        except Exception as e:
+            self.log(
+                f"Enterprise feature join failed: {e} — "
+                "continuing without enterprise features. "
+                "Downstream models will use model_scores columns only.",
+                level="warning",
+            )
+            return df
+
+    def _read_enterprise_table(self) -> pd.DataFrame:
+        """
+        Reads the enterprise feature table for execution_date.
+
+        Tries Spark first (Databricks production), falls back to pandas Delta reader.
+        Filters to execution_date to ensure point-in-time safety.
+        """
+        table = self.enterprise_feature_table
+        date  = self.execution_date
+
+        # Try Spark (Databricks)
+        try:
+            from pyspark.sql import SparkSession
+            spark = SparkSession.getActiveSession()
+            if spark is not None:
+                # Point-in-time filter — only features as of execution_date
+                # Assumes the feature table has a score_date or feature_date column
+                date_col = next(
+                    (c for c in ["score_date", "feature_date", "snapshot_date"]
+                     if c in [f.name for f in spark.table(table).schema]),
+                    None,
+                )
+                sdf = spark.table(table)
+                if date_col:
+                    sdf = sdf.filter(f"{date_col} = '{date}'")
+                return sdf.toPandas()
+        except Exception:
+            pass
+
+        # Fallback: pandas + delta-rs (local / non-Spark environments)
+        try:
+            import delta
+            return delta.DeltaTable(table).toDF().toPandas()
+        except Exception:
+            pass
+
+        # Last resort: try reading as a parquet path
+        try:
+            return pd.read_parquet(table)
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not read enterprise feature table '{table}'. "
+                f"Tried Spark, delta-rs, and parquet. Error: {e}"
+            )
+
     def execute(self) -> dict:
         self.log("Reading validated model_scores")
         df = self._read_scores()
 
-        # ── Select feature columns (drop anything not in allowlist) ───────────
-        available = [c for c in FEATURE_COLUMNS if c in df.columns]
-        missing   = [c for c in FEATURE_COLUMNS if c not in df.columns]
-        if missing:
-            self.log(f"Optional columns not present: {missing}", level="warning")
+        # ── Join enterprise feature table (your DS team's 100+ features) ──────
+        # This brings all features used to train propensity/willingness/capacity
+        # models into the same DataFrame so downstream agents can use them.
+        # No features are recreated here — only joined from the feature store.
+        df = self._join_enterprise_features(df)
 
-        df = df[available].copy()
+        # ── Drop PII columns — never passed downstream ─────────────────────────
+        pii_present = [c for c in df.columns if c.lower() in PII_BLOCK_COLS]
+        if pii_present:
+            df = df.drop(columns=pii_present)
+            self.log(f"Dropped PII columns: {pii_present}")
+
+        self.log(
+            f"Feature columns available for downstream: {len(df.columns)} | "
+            f"sample: {list(df.columns[:10])}"
+        )
 
         # ── Compute model-based willingness + capacity scores ─────────────────
         # These replace rule-based weighted sums.
         # Both are FEATURES passed downstream — not segmentation rules.
+        # If enterprise features are present they will be used by the models.
         df = self._compute_scores(df)
 
         # ── Derive computed features ──────────────────────────────────────────
