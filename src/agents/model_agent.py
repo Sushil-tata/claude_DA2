@@ -62,6 +62,24 @@ ELASTICITY_ALPHA (default: 2.5)
         Segment C: ~3.0 (less predictable, more responsive to discount)
         Segment D: ~3.5 (high discount needed to generate any response)
     Override via action_alphas dict in ModelAgent constructor.
+
+AMOUNT MODEL (E(recovery_amount))
+    Two fitted AmountModelTrainer instances are loaded at startup:
+        amount_model_30d.pkl  — E(amount) for DIGITAL_NUDGE and AGENT_CALL
+                                Aligned with P_1M (propensity_30d) horizon.
+        amount_model_180d.pkl — E(amount) for AGENCY and LEGAL
+                                Aligned with P_6M (propensity_180d) horizon.
+
+    When models are not yet fitted, ERV falls back to:
+        outstanding_balance → total_outstanding → 0
+
+    To activate model-based E(amount):
+        Run AmountModelTrainer(outcome_window_days=30).fit(recovered_df)
+        Run AmountModelTrainer(outcome_window_days=180).fit(recovered_df)
+        Set AMOUNT_MODEL_DIR env variable to the path where models are saved.
+
+    In Databricks:
+        AMOUNT_MODEL_DIR = /dbfs/FileStore/models/amount_model/
 ──────────────────────────────────────────────────────────────────────────────
 """
 
@@ -76,6 +94,9 @@ from agents.base_agent import AgentBlockedException, BaseAgent
 
 DEFAULT_ELASTICITY_MODEL_DIR = Path(
     os.environ.get("ELASTICITY_MODEL_DIR", "models/elasticity_model")
+)
+DEFAULT_AMOUNT_MODEL_DIR = Path(
+    os.environ.get("AMOUNT_MODEL_DIR", "models/amount_model")
 )
 
 logger = logging.getLogger(__name__)
@@ -215,6 +236,19 @@ class ModelAgent(BaseAgent):
         )
         self._try_load_uplift_model()
 
+        # Load amount models — E(recovery_amount | recovery occurred)
+        # Two windows: 30d aligned with P_1M (tactical), 180d aligned with P_6M (agency/legal)
+        # Replaces using outstanding_balance directly as the ERV "balance" term.
+        # Falls back to outstanding_balance → total_outstanding → 0 if not fitted.
+        self._amount_model_dir     = DEFAULT_AMOUNT_MODEL_DIR
+        self._amount_trainer_30d   = None   # for DIGITAL_NUDGE, AGENT_CALL
+        self._amount_trainer_180d  = None   # for AGENCY, LEGAL
+        self._try_load_amount_models()
+
+        # Per-account predicted amounts — populated in execute() before ERV loop
+        # {account_id: {"amount_30d": float, "amount_180d": float}}
+        self._predicted_amounts: dict = {}
+
         # Treatment logger — appends every action decision to treatment_log
         # This is the data collection foundation for Phase 2 uplift training
         self._treatment_logger = None  # initialised in execute() after memory is ready
@@ -282,6 +316,51 @@ class ModelAgent(BaseAgent):
                 level="warning",
             )
 
+    def _try_load_amount_models(self) -> None:
+        """
+        Load AmountModelTrainer for 30d and 180d windows if fitted models exist.
+
+        30d model: used as E(amount) for DIGITAL_NUDGE and AGENT_CALL (tactical).
+        180d model: used as E(amount) for AGENCY and LEGAL (strategic).
+
+        Falls back silently to outstanding_balance column if models are not yet fitted.
+        Run AmountModelTrainer(outcome_window_days=30).fit() and
+        AmountModelTrainer(outcome_window_days=180).fit() on recovered accounts to activate.
+        """
+        import importlib.util as _ilu
+        import pathlib as _pl
+
+        _spec = _ilu.spec_from_file_location(
+            "amount_model_trainer",
+            _pl.Path(__file__).parent.parent / "models" / "amount_model_trainer.py",
+        )
+        _mod = _ilu.module_from_spec(_spec)
+
+        for window, attr in [(30, "_amount_trainer_30d"), (180, "_amount_trainer_180d")]:
+            model_path = self._amount_model_dir / f"amount_model_{window}d.pkl"
+            if model_path.exists():
+                try:
+                    _spec.loader.exec_module(_mod)
+                    trainer = _mod.AmountModelTrainer(
+                        outcome_window_days=window,
+                        model_dir=self._amount_model_dir,
+                    )
+                    setattr(self, attr, trainer)
+                    self.log(f"Amount model {window}d loaded — E(amount) will use model predictions")
+                except Exception as e:
+                    self.log(
+                        f"Could not load amount model {window}d: {e} — "
+                        "using outstanding_balance fallback",
+                        level="warning",
+                    )
+            else:
+                self.log(
+                    f"No amount model at {model_path} — "
+                    f"using outstanding_balance as E(amount) proxy for {window}d window. "
+                    f"Run AmountModelTrainer(outcome_window_days={window}).fit() to activate.",
+                    level="warning",
+                )
+
     def execute(self) -> dict:
         self.log("Reading feature_output")
         df = self._read_features()
@@ -328,6 +407,53 @@ class ModelAgent(BaseAgent):
             except Exception as e:
                 self.log(f"Uplift inference failed: {e} — falling back to predictive ERV", level="warning")
                 self._uplift_scores = {}
+
+        # ── Pre-compute E(recovery_amount) per account ────────────────────────
+        # Two windows:
+        #   amount_30d  → used for DIGITAL_NUDGE and AGENT_CALL (tactical, P_1M)
+        #   amount_180d → used for AGENCY and LEGAL (strategic, P_6M)
+        #
+        # When fitted models exist: model predictions are used.
+        # Fallback priority: outstanding_balance → total_outstanding → 0.
+        #
+        # Models replace the earlier approach of using erv_at_d_optimal from
+        # feature_output as the balance term — that column is the agent's own
+        # output and is not available or meaningful as an input.
+        self._predicted_amounts = {}
+        if "outstanding_balance" in output.columns:
+            _balance_fallback = output["outstanding_balance"].fillna(0.0)
+        elif "total_outstanding" in output.columns:
+            _balance_fallback = output["total_outstanding"].fillna(0.0)
+        else:
+            _balance_fallback = pd.Series(0.0, index=output.index)
+
+        _aid_col = output["account_id"] if "account_id" in output.columns else output.index
+        fallback_amounts = dict(zip(_aid_col, _balance_fallback))
+
+        for window, attr in [(30, "_amount_trainer_30d"), (180, "_amount_trainer_180d")]:
+            trainer = getattr(self, attr, None)
+            key = f"amount_{window}d"
+            if trainer is not None:
+                try:
+                    preds = trainer.predict(output)
+                    for aid, val in zip(_aid_col, preds):
+                        self._predicted_amounts.setdefault(aid, {})[key] = float(val)
+                    self.log(
+                        f"Amount model {window}d: E(amount) computed for "
+                        f"{len(preds):,} accounts | "
+                        f"mean={preds.mean():,.0f} THB"
+                    )
+                except Exception as e:
+                    self.log(
+                        f"Amount model {window}d inference failed: {e} — "
+                        "using outstanding_balance fallback",
+                        level="warning",
+                    )
+                    for aid, val in fallback_amounts.items():
+                        self._predicted_amounts.setdefault(aid, {})[key] = val
+            else:
+                for aid, val in fallback_amounts.items():
+                    self._predicted_amounts.setdefault(aid, {})[key] = val
 
         # ── Compute per-action ERV and select best action ─────────────────────
         erv_results = output.apply(self._select_best_action, axis=1)
@@ -409,21 +535,30 @@ class ModelAgent(BaseAgent):
         Computes net ERV for every action across the discount grid.
         Returns the action + discount that maximises net ERV.
 
+        E(amount) is sourced from AmountModelTrainer predictions (pre-computed
+        in execute()) rather than outstanding balance directly:
+          - amount_30d → DIGITAL_NUDGE, AGENT_CALL (aligned with P_1M / 30d horizon)
+          - amount_180d → AGENCY, LEGAL            (aligned with P_6M / 180d horizon)
+
         Agency-first rule for charge-off accounts:
           LEGAL is only selected over AGENCY if
           ERV(LEGAL) > ERV(AGENCY) + legal_uplift_threshold.
         """
         # propensity_30d (P_1M) is the primary decisioning signal
         # propensity_180d (P_6M) used only for AGENCY/LEGAL (longer-horizon actions)
-        p30          = row.get("propensity_30d",    0.0) or 0.0
-        p180         = row.get("propensity_180d",   0.0) or 0.0
-        balance      = row.get("erv_at_d_optimal",  0.0) or 0.0
-        seg          = row.get("signal_segment",    "D")
+        p30          = row.get("propensity_30d",  0.0) or 0.0
+        p180         = row.get("propensity_180d", 0.0) or 0.0
+        seg          = row.get("signal_segment",  "D")
         alpha        = self.action_alphas.get(seg, 2.5)
         aid          = row.get("account_id")
         strategy     = SEGMENT_STRATEGY.get(seg, SEGMENT_STRATEGY["B"])
         allowed      = strategy["allowed_actions"]
         disc_penalty = strategy["discount_penalty"]
+
+        # E(recovery_amount) per horizon — from AmountModelTrainer or fallback
+        amounts      = self._predicted_amounts.get(aid, {})
+        amount_30d   = amounts.get("amount_30d",  0.0) or 0.0
+        amount_180d  = amounts.get("amount_180d", 0.0) or 0.0
 
         elast_curves = self._elasticity_curves.get(aid, {})
 
@@ -447,34 +582,34 @@ class ModelAgent(BaseAgent):
             "d_optimal": 0.0, "action_cost": 0,
         }
 
-        # ── DIGITAL_NUDGE — P_1M primary, low-cost ───────────────────────────
+        # ── DIGITAL_NUDGE — P_1M + amount_30d ────────────────────────────────
         if "DIGITAL_NUDGE" in allowed:
             erv_by_action["DIGITAL_NUDGE"] = self._best_discounted_erv(
-                p_base=p30, balance=balance, alpha=alpha * 0.5,
+                p_base=p30, balance=amount_30d, alpha=alpha * 0.5,
                 action="DIGITAL_NUDGE", elast_curves=elast_curves,
                 discount_penalty=disc_penalty,
             )
 
-        # ── AGENT_CALL — P_1M primary ─────────────────────────────────────────
+        # ── AGENT_CALL — P_1M + amount_30d ───────────────────────────────────
         if "AGENT_CALL" in allowed:
             erv_by_action["AGENT_CALL"] = self._best_discounted_erv(
-                p_base=p30, balance=balance, alpha=alpha,
+                p_base=p30, balance=amount_30d, alpha=alpha,
                 action="AGENT_CALL", elast_curves=elast_curves,
                 discount_penalty=disc_penalty,
             )
 
-        # ── AGENCY — P_6M, evaluated before LEGAL ────────────────────────────
+        # ── AGENCY — P_6M + amount_180d, evaluated before LEGAL ──────────────
         if "AGENCY" in allowed:
             erv_by_action["AGENCY"] = self._best_discounted_erv(
-                p_base=p180 * 0.6, balance=balance, alpha=alpha * 1.2,
+                p_base=p180 * 0.6, balance=amount_180d, alpha=alpha * 1.2,
                 action="AGENCY", elast_curves=elast_curves,
                 discount_penalty=disc_penalty,
             )
 
-        # ── LEGAL — P_6M, escalation only ────────────────────────────────────
+        # ── LEGAL — P_6M + amount_180d, escalation only ──────────────────────
         if "LEGAL" in allowed:
             erv_by_action["LEGAL"] = self._best_discounted_erv(
-                p_base=p180 * 0.4, balance=balance, alpha=0.5,
+                p_base=p180 * 0.4, balance=amount_180d, alpha=0.5,
                 action="LEGAL", elast_curves=elast_curves,
                 discount_penalty=disc_penalty,
             )
