@@ -44,6 +44,10 @@ parameters:
     default: "false"
   - name: local_mode
     default: "false"
+  - name: champion_challenger_enabled
+    default: "true"
+  - name: holdout_pct
+    default: "5"
 
 # ── Shared cluster config ─────────────────────────────────────────────────────
 # Referenced by tasks that don't need heavy compute
@@ -107,6 +111,33 @@ tasks:
     new_cluster: *standard_cluster
     timeout_seconds: 3600
 
+  # ── Task 2b: Holdout Agent ────────────────────────────────────────────────
+  - task_key: holdout_agent
+    description: >
+      Assigns 5% per SIGNAL_SEGMENT to holdout (control group) for uplift
+      model training. Uses deterministic hash(account_id) % 100 so the same
+      account always lands in the control group across daily runs.
+      Adds holdout_flag, holdout_group, holdout_assigned_date to
+      recovery.feature_output (overwrite). Appends control-group rows to
+      recovery.treatment_log. champion_challenger_enabled parameter controls
+      activation.
+    depends_on:
+      - task_key: feature_agent
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point:  run_agent
+      parameters:
+        - "--agent"
+        - "holdout"
+        - "--execution-date"
+        - "{{job.parameters.execution_date}}"
+
+    new_cluster: *standard_cluster
+    timeout_seconds: 1800
+    max_retries: 1
+    retry_on_timeout: false
+
   # ── Task 3: Model Agent (parallel with Task 4) ───────────────────────────────
   - task_key: model_agent
     description: >
@@ -115,7 +146,7 @@ tasks:
       Applies no constraint overrides here — that is Constraint Agent's job.
       Writes to recovery.model_agent_output.
     depends_on:
-      - task_key: feature_agent
+      - task_key: holdout_agent
 
     python_wheel_task:
       package_name: decision_agent
@@ -139,7 +170,7 @@ tasks:
       Writes overrides to recovery.constraint_overrides.
       Raises BLOCKED if leakage detected in feature columns.
     depends_on:
-      - task_key: feature_agent
+      - task_key: holdout_agent
 
     python_wheel_task:
       package_name: decision_agent

@@ -43,6 +43,8 @@ TABLES = {
     "nba_explanations":      "recovery.nba_explanations",
     "data_quality_metrics":  "recovery.data_quality_metrics",
     "agent_audit_log":       "recovery.agent_audit_log",
+    "treatment_log":         "recovery.treatment_log",
+    "holdout_assignments":   "recovery.holdout_assignments",
 }
 
 # Local parquet paths for non-Databricks execution

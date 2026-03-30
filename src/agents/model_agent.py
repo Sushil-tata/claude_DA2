@@ -202,9 +202,22 @@ class ModelAgent(BaseAgent):
         self.legal_uplift_threshold = legal_uplift_threshold
 
         # Load elasticity model if available — replaces hardcoded alpha curves
-        self._elasticity_curves: dict = {}   # account_id → {d: p_accept}
+        self._elasticity_curves: dict = {}
         self._elasticity_model_dir = DEFAULT_ELASTICITY_MODEL_DIR
         self._try_load_elasticity_model()
+
+        # Load uplift (T-learner) models if available — enables causal ERV
+        # causal ERV = τ(x) × E(amount) × (1−d) − cost(action)
+        # Falls back to predictive ERV when no uplift model exists
+        self._uplift_scores: dict = {}   # account_id → τ(x)
+        self._uplift_model_dir = Path(
+            os.environ.get("UPLIFT_MODEL_DIR", "models/uplift_models")
+        )
+        self._try_load_uplift_model()
+
+        # Treatment logger — appends every action decision to treatment_log
+        # This is the data collection foundation for Phase 2 uplift training
+        self._treatment_logger = None  # initialised in execute() after memory is ready
 
     def _try_load_elasticity_model(self) -> None:
         """Load elasticity model if fitted. Falls back to alpha curves silently."""
@@ -236,6 +249,39 @@ class ModelAgent(BaseAgent):
                 level="warning",
             )
 
+    def _try_load_uplift_model(self) -> None:
+        """Load T-learner uplift models if fitted. Falls back to predictive ERV silently."""
+        import importlib.util as _ilu
+        import pathlib as _pl
+        any_model = any(
+            (self._uplift_model_dir / f"{seg}_treated.pkl").exists()
+            for seg in ["A", "B", "C", "D"]
+        )
+        if any_model:
+            try:
+                _spec = _ilu.spec_from_file_location(
+                    "uplift_model_trainer",
+                    _pl.Path(__file__).parent.parent / "models" / "uplift_model_trainer.py",
+                )
+                _mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                self._uplift_trainer = _mod.UpliftModelTrainer(
+                    model_dir=self._uplift_model_dir
+                )
+                self.log("Uplift (T-learner) models found — causal ERV active")
+            except Exception as e:
+                self._uplift_trainer = None
+                self.log(f"Could not load uplift models: {e} — using predictive ERV", level="warning")
+        else:
+            self._uplift_trainer = None
+            self.log(
+                f"No uplift models at {self._uplift_model_dir} — "
+                "using predictive ERV (Phase 1 mode). "
+                "Causal ERV activates automatically once UpliftModelTrainer.fit() "
+                "has been run on champion/challenger data.",
+                level="warning",
+            )
+
     def execute(self) -> dict:
         self.log("Reading feature_output")
         df = self._read_features()
@@ -261,6 +307,28 @@ class ModelAgent(BaseAgent):
                 self.log(f"Elasticity model inference failed: {e} — using alpha fallback", level="warning")
                 self._elasticity_curves = {}
 
+        # ── Pre-compute uplift scores τ(x) per account ───────────────────────
+        # When T-learner models are available:
+        #   τ(x) = P(pay|treated,x) − P(pay|control,x)
+        #   causal ERV = τ(x) × E(amount) × (1−d) − cost(action)
+        #   Accounts with τ(x) ≤ 0 receive HOLD — intervening would not help.
+        # When models are absent: τ(x) defaults to 1.0 (predictive ERV mode).
+        causal_mode = False
+        if getattr(self, "_uplift_trainer", None) is not None:
+            try:
+                tau_series = self._uplift_trainer.predict_uplift(output)
+                self._uplift_scores = dict(zip(output["account_id"], tau_series))
+                pct_positive = (tau_series > 0).mean()
+                self.log(
+                    f"Causal ERV active | τ(x) computed for {len(tau_series):,} accounts | "
+                    f"positive uplift={pct_positive:.1%} | "
+                    f"negative uplift (HOLD forced)={(1-pct_positive):.1%}"
+                )
+                causal_mode = True
+            except Exception as e:
+                self.log(f"Uplift inference failed: {e} — falling back to predictive ERV", level="warning")
+                self._uplift_scores = {}
+
         # ── Compute per-action ERV and select best action ─────────────────────
         erv_results = output.apply(self._select_best_action, axis=1)
 
@@ -271,6 +339,8 @@ class ModelAgent(BaseAgent):
         output["erv_gross"]           = erv_results.apply(lambda r: r["erv_gross"])
         output["action_cost"]         = erv_results.apply(lambda r: r["action_cost"])
         output["erv_by_action"]       = erv_results.apply(lambda r: str(r["erv_by_action"]))
+        output["tau_uplift"]          = erv_results.apply(lambda r: r.get("tau", 1.0))
+        output["erv_mode"]            = "causal" if causal_mode else "predictive"
 
         # ── Contact timing from recovery_tier ─────────────────────────────────
         output["contact_timing"] = output["recovery_tier"].map({
@@ -293,17 +363,43 @@ class ModelAgent(BaseAgent):
         if not self.dry_run:
             self.memory.write("model_agent_output", output)
 
+            # ── Log all treatment decisions to treatment_log ──────────────────
+            # This is the data collection foundation for uplift model training.
+            # treatment_log is append-only — every run adds rows.
+            # Outcomes (paid_180d) are joined back 30/90/180 days later.
+            try:
+                import importlib.util as _ilu
+                import pathlib as _pl
+                _spec = _ilu.spec_from_file_location(
+                    "treatment_logger",
+                    _pl.Path(__file__).parent / "treatment_logger.py",
+                )
+                _mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                logger_obj = _mod.TreatmentLogger(
+                    memory=self.memory,
+                    execution_date=self.execution_date,
+                )
+                rows_logged = logger_obj.log_treatments(output)
+                self.log(f"Treatment log: {rows_logged:,} rows appended to recovery.treatment_log")
+            except Exception as e:
+                self.log(f"Treatment logging failed (non-blocking): {e}", level="warning")
+
         action_dist  = output["recommended_action"].value_counts().to_dict()
         channel_dist = output["recommended_channel"].value_counts().to_dict()
+        neg_uplift   = int((output["tau_uplift"] <= 0).sum()) if causal_mode else 0
         self.log(
             f"Model selections ready | rows={len(output):,} | "
-            f"actions={action_dist} | channels={channel_dist}"
+            f"mode={output['erv_mode'].iloc[0]} | "
+            f"actions={action_dist} | negative_uplift_held={neg_uplift}"
         )
         return {
             "rows_written":           len(output),
+            "erv_mode":               output["erv_mode"].iloc[0],
             "action_distribution":    action_dist,
             "channel_distribution":   channel_dist,
             "needs_constraint_check": int(output["needs_constraint_check"].sum()),
+            "negative_uplift_held":   neg_uplift,
         }
 
     # ── Per-action ERV computation ────────────────────────────────────────────
@@ -330,6 +426,19 @@ class ModelAgent(BaseAgent):
         disc_penalty = strategy["discount_penalty"]
 
         elast_curves = self._elasticity_curves.get(aid, {})
+
+        # τ(x) = causal uplift score from T-learner
+        # τ = 1.0 means predictive mode (no causal model yet)
+        # τ ≤ 0 means intervening causes no incremental benefit — force HOLD
+        tau = self._uplift_scores.get(aid, 1.0)
+        if tau <= 0:
+            return {
+                "action": "HOLD", "d_optimal": 0.0,
+                "erv_net": 0.0, "erv_gross": 0.0,
+                "action_cost": 0, "tau": tau,
+                "erv_by_action": {"HOLD": 0.0},
+            }
+
         erv_by_action = {}
 
         # ── HOLD — always evaluated as baseline ───────────────────────────────
@@ -376,7 +485,17 @@ class ModelAgent(BaseAgent):
                erv_by_action["AGENCY"]["erv_net"] + self.legal_uplift_threshold:
                 erv_by_action["LEGAL"]["erv_net"] = -1.0
 
-        # ── Select action with highest net ERV ────────────────────────────────
+        # ── Apply causal scaling: ERV × τ(x) when T-learner is active ──────────
+        # τ < 1.0 discounts ERV for accounts with low incremental response
+        # τ = 1.0 in predictive mode (no scaling applied)
+        if tau != 1.0:
+            for a in erv_by_action:
+                if erv_by_action[a]["erv_net"] > 0:
+                    erv_by_action[a]["erv_net"] = round(
+                        erv_by_action[a]["erv_net"] * tau, 2
+                    )
+
+        # ── Select action with highest net causal ERV ─────────────────────────
         best_action = max(erv_by_action, key=lambda a: erv_by_action[a]["erv_net"])
         best        = erv_by_action[best_action]
 
@@ -386,6 +505,7 @@ class ModelAgent(BaseAgent):
             "erv_net":      best["erv_net"],
             "erv_gross":    best["erv_gross"],
             "action_cost":  best["action_cost"],
+            "tau":          tau,
             "erv_by_action": {
                 a: round(erv_by_action[a]["erv_net"], 2)
                 for a in erv_by_action
