@@ -65,14 +65,45 @@ _standard_cluster: &standard_cluster
 
 tasks:
 
+  # ── Task 0: Propensity Agent ─────────────────────────────────────────────────
+  - task_key: propensity_agent
+    description: >
+      Scores all delinquent accounts for propensity at three horizons:
+        propensity_30d  (P_1M) — tactical decisions: DIGITAL_NUDGE, AGENT_CALL
+        propensity_90d  (P_3M) — intermediate monitoring signal
+        propensity_180d (P_6M) — strategic decisions: AGENCY, LEGAL
+      Uses PropensityModelTrainer (LightGBM per horizon) trained on enterprise
+      features. Falls back to recovery-engine-v2 scores if models not fitted yet.
+      Sets low_confidence_flag for accounts with propensity_30d near 0.5.
+      Writes to recovery.model_scores.
+    depends_on: []
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point:  run_agent
+      parameters:
+        - "--agent"
+        - "propensity"
+        - "--execution-date"
+        - "{{job.parameters.execution_date}}"
+        - "--dry-run"
+        - "{{job.parameters.dry_run}}"
+
+    new_cluster: *standard_cluster
+    timeout_seconds: 3600    # scoring 100+ features on large portfolio takes longer
+    max_retries: 1
+    retry_on_timeout: false
+
   # ── Task 1: Data Quality Agent ──────────────────────────────────────────────
   - task_key: data_quality_agent
     description: >
-      Validates recovery.model_scores written by recovery-engine-v2.
-      Checks: null rates, quadrant distribution shift vs prior week.
-      Raises BLOCKED if null_rate > 5% on segmentation features
-      or quadrant distribution shifts > 10% week-over-week.
-    depends_on: []
+      Validates recovery.model_scores written by PropensityAgent (or upstream
+      recovery-engine-v2 in fallback mode). Checks: null rates on propensity
+      scores, score distribution shift vs prior week.
+      Raises BLOCKED if null_rate > 5% on propensity_30d or propensity_180d,
+      or if score distribution shifts > 10% week-over-week.
+    depends_on:
+      - task_key: propensity_agent
 
     python_wheel_task:
       package_name: decision_agent
@@ -93,9 +124,9 @@ tasks:
   # ── Task 2: Feature Agent ────────────────────────────────────────────────────
   - task_key: feature_agent
     description: >
-      Reads recovery.model_scores. Passes propensity scores + segment_label
-      to downstream model and constraint agents via recovery.feature_output.
-      Performs point-in-time safe feature joins if additional features needed.
+      Reads recovery.model_scores (propensity scores from PropensityAgent).
+      Joins enterprise feature store. Derives SIGNAL_SEGMENT + BEHAVIOURAL_PERSONA.
+      Writes recovery.feature_output for ModelAgent + ConstraintAgent.
     depends_on:
       - task_key: data_quality_agent
 

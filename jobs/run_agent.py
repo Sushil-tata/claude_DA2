@@ -37,8 +37,10 @@ logger = logging.getLogger("run_agent")
 
 # ── Agent registry ────────────────────────────────────────────────────────────
 AGENT_REGISTRY = {
+    "propensity":   "agents.propensity_agent.PropensityAgent",
     "data_quality": "agents.data_quality_agent.DataQualityAgent",
     "feature":      "agents.feature_agent.FeatureAgent",
+    "holdout":      "agents.holdout_agent.HoldoutAgent",
     "model":        "agents.model_agent.ModelAgent",
     "capacity":     "agents.capacity_agent.CapacityAllocationAgent",
     "constraint":   "agents.constraint_agent.ConstraintAgent",
