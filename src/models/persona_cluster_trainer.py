@@ -57,6 +57,7 @@ MODEL_PATH
 ──────────────────────────────────────────────────────────────────────────────
 """
 
+import importlib.util as _ilu
 import logging
 import os
 from pathlib import Path
@@ -67,6 +68,17 @@ import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
+
+
+def _load_validator():
+    """Lazy-load ClusterBusinessValidator to avoid circular imports."""
+    _spec = _ilu.spec_from_file_location(
+        "cluster_business_validator",
+        Path(__file__).parent / "cluster_business_validator.py",
+    )
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    return _mod.ClusterBusinessValidator
 
 logger = logging.getLogger(__name__)
 
@@ -103,18 +115,29 @@ class PersonaClusterTrainer:
         n_clusters: int = DEFAULT_N_CLUSTERS,
         model_dir: Path = DEFAULT_MODEL_DIR,
         random_state: int = 42,
+        min_pairwise_recovery_diff: float = 0.05,
+        skip_business_validation: bool = False,
     ):
         """
         Args:
-            n_clusters:    Number of clusters per SIGNAL_SEGMENT.
-                           See CONFIGURATION INSTRUCTIONS above.
-            model_dir:     Directory to save fitted models.
-                           Set PERSONA_MODEL_DIR env var to override.
-            random_state:  For reproducibility.
+            n_clusters:                  Number of clusters per SIGNAL_SEGMENT.
+            model_dir:                   Save path. Set PERSONA_MODEL_DIR to override.
+            random_state:                For reproducibility.
+            min_pairwise_recovery_diff:  Min abs diff in recovery_180d between
+                                         best and worst cluster for PASS.
+                                         Default: 0.05 (5pp). See
+                                         ClusterBusinessValidator docstring.
+            skip_business_validation:    Set True only if outcome labels are not
+                                         yet available (e.g. cold start). Models
+                                         will be saved but validation is skipped
+                                         with a warning. Remove this flag once
+                                         outcome data is available.
         """
-        self.n_clusters   = n_clusters
-        self.model_dir    = Path(model_dir)
-        self.random_state = random_state
+        self.n_clusters                  = n_clusters
+        self.model_dir                   = Path(model_dir)
+        self.random_state                = random_state
+        self.min_pairwise_recovery_diff  = min_pairwise_recovery_diff
+        self.skip_business_validation    = skip_business_validation
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
     def fit(self, df: pd.DataFrame) -> dict:
@@ -128,7 +151,17 @@ class PersonaClusterTrainer:
 
         Returns:
             dict of {segment: {"silhouette": float, "cluster_sizes": dict,
-                               "persona_map": dict}}
+                               "persona_map": dict, "business_validation": dict}}
+
+        ⚠ IMPORTANT — Business Validation:
+            After fitting, validate() is called on clusters with outcome labels
+            (recovery_30d, recovery_90d, recovery_180d) if present in df.
+            If clusters are NOT differentiated on recovery_180d by ≥5pp, the fit
+            is rejected for that segment and rule-based fallback is recommended.
+
+            Include outcome columns in df for full validation.
+            If outcomes not yet available (cold start), set skip_business_validation=True
+            and validate retroactively once outcomes are labelled.
         """
         results = {}
         for seg in SIGNAL_SEGMENTS:
@@ -152,16 +185,71 @@ class PersonaClusterTrainer:
             sil = silhouette_score(X, labels) if len(set(labels)) > 1 else 0.0
             persona_map = self._assign_persona_labels(seg_df, labels)
 
+            # ── Business validation before saving ─────────────────────────────
+            # Clusters must be differentiated on recovery outcomes, not just
+            # geometrically separated. If validation fails, log warning and
+            # record result — do NOT save model for this segment.
+            seg_df_labeled = seg_df.copy()
+            seg_df_labeled["behavioural_persona"] = [
+                persona_map.get(lbl, "Disconnected") for lbl in labels
+            ]
+
+            biz_validation = {"passed": True, "recommendation": "SKIPPED — no outcome columns"}
+            if not self.skip_business_validation:
+                outcome_cols = [c for c in ["recovery_30d", "recovery_90d",
+                                            "recovery_180d", "recovery_amount"]
+                                if c in seg_df_labeled.columns]
+                if outcome_cols:
+                    try:
+                        Validator = _load_validator()
+                        biz_validation = Validator(
+                            min_pairwise_recovery_diff=self.min_pairwise_recovery_diff
+                        ).validate(
+                            seg_df_labeled,
+                            cluster_col="behavioural_persona",
+                            segment=seg,
+                        )
+                    except Exception as e:
+                        biz_validation = {"passed": False, "error": str(e)}
+                        logger.warning(f"Business validation error for segment {seg}: {e}")
+                else:
+                    logger.warning(
+                        f"Segment {seg}: no outcome columns (recovery_*) in df — "
+                        f"skipping business validation. Include recovery_180d in df "
+                        f"to validate cluster separation on recovery outcomes."
+                    )
+
+            if not biz_validation.get("passed") and not self.skip_business_validation:
+                if "SKIPPED" not in str(biz_validation.get("recommendation", "")):
+                    logger.warning(
+                        f"Segment {seg}: business validation FAILED — "
+                        f"recommendation: {biz_validation.get('recommendation')}. "
+                        f"Model NOT saved for this segment. "
+                        f"Rule-based persona fallback will be used."
+                    )
+                    results[seg] = {
+                        "silhouette":          round(sil, 4),
+                        "cluster_sizes":       pd.Series(labels).value_counts().to_dict(),
+                        "persona_map":         persona_map,
+                        "business_validation": biz_validation,
+                        "saved":               False,
+                    }
+                    continue   # skip _save — do not persist invalid clusters
+
             self._save(seg, km, scaler, persona_map)
 
             results[seg] = {
-                "silhouette":   round(sil, 4),
-                "cluster_sizes":pd.Series(labels).value_counts().to_dict(),
-                "persona_map":  persona_map,
+                "silhouette":          round(sil, 4),
+                "cluster_sizes":       pd.Series(labels).value_counts().to_dict(),
+                "persona_map":         persona_map,
+                "business_validation": biz_validation,
+                "saved":               True,
             }
             logger.info(
                 f"Segment {seg} | n={len(seg_df):,} | "
-                f"silhouette={sil:.3f} | personas={persona_map}"
+                f"silhouette={sil:.3f} | "
+                f"biz_validation={biz_validation.get('recommendation')} | "
+                f"personas={persona_map}"
             )
 
         return results

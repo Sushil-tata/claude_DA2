@@ -73,6 +73,7 @@ BEHAVIOURAL_PERSONA definitions (derived from willingness + capacity scores):
 ──────────────────────────────────────────────────────────────────────────────
 """
 
+import importlib.util as _ilu
 import logging
 import os
 from pathlib import Path
@@ -97,9 +98,9 @@ logger = logging.getLogger(__name__)
 # See CONFIGURATION INSTRUCTIONS above before changing this value.
 DEFAULT_BUREAU_SIGNAL_LAG_DAYS = 60
 
-DEFAULT_PERSONA_MODEL_DIR = Path(
-    os.environ.get("PERSONA_MODEL_DIR", "models/persona_clusters")
-)
+DEFAULT_PERSONA_MODEL_DIR    = Path(os.environ.get("PERSONA_MODEL_DIR",    "models/persona_clusters"))
+DEFAULT_WILLINGNESS_MODEL_DIR = Path(os.environ.get("WILLINGNESS_MODEL_DIR", "models/willingness_model"))
+DEFAULT_CAPACITY_MODEL_DIR    = Path(os.environ.get("CAPACITY_MODEL_DIR",    "models/capacity_model"))
 
 # Columns passed downstream — explicit allowlist
 FEATURE_COLUMNS = [
@@ -138,21 +139,29 @@ class FeatureAgent(BaseAgent):
         memory,
         dry_run: bool = False,
         bureau_signal_lag_days: int = DEFAULT_BUREAU_SIGNAL_LAG_DAYS,
-        persona_model_dir: Path = DEFAULT_PERSONA_MODEL_DIR,
+        persona_model_dir: Path     = DEFAULT_PERSONA_MODEL_DIR,
+        willingness_model_dir: Path = DEFAULT_WILLINGNESS_MODEL_DIR,
+        capacity_model_dir: Path    = DEFAULT_CAPACITY_MODEL_DIR,
     ):
         """
         Args:
             execution_date:         Scoring date (YYYY-MM-DD).
             memory:                 AgentMemory instance.
             dry_run:                If True, skip all Delta writes.
-            bureau_signal_lag_days: Maximum days since last bureau pull for
+            bureau_signal_lag_days: Max days since last bureau pull for
                                     bureau signal to count as available.
-                                    Default: 60 (2 months). See module
-                                    docstring for full guidance.
-            persona_model_dir:      Path to fitted PersonaClusterTrainer models.
-                                    If models are not found, falls back to
-                                    rule-based personas with a warning.
+                                    Default: 60 (2 months).
+            persona_model_dir:      Fitted PersonaClusterTrainer models.
+                                    Falls back to rule-based if not found.
                                     Set PERSONA_MODEL_DIR env var to override.
+            willingness_model_dir:  Fitted WillingnessModelTrainer.
+                                    Falls back to raw willingness_score column
+                                    if column present, else 0.5 default.
+                                    Set WILLINGNESS_MODEL_DIR to override.
+            capacity_model_dir:     Fitted CapacityModelTrainer.
+                                    Falls back to raw capacity_score column
+                                    if column present, else 0.5 default.
+                                    Set CAPACITY_MODEL_DIR to override.
         """
         super().__init__(
             agent_name="feature_agent",
@@ -160,15 +169,93 @@ class FeatureAgent(BaseAgent):
             memory=memory,
             dry_run=dry_run,
         )
-        self.bureau_signal_lag_days = bureau_signal_lag_days
-        self.persona_model_dir      = Path(persona_model_dir)
-        self._persona_trainer       = PersonaClusterTrainer(
-            model_dir=self.persona_model_dir
-        )
+        self.bureau_signal_lag_days   = bureau_signal_lag_days
+        self.persona_model_dir        = Path(persona_model_dir)
+        self.willingness_model_dir    = Path(willingness_model_dir)
+        self.capacity_model_dir       = Path(capacity_model_dir)
+        self._persona_trainer         = PersonaClusterTrainer(model_dir=self.persona_model_dir)
+        self._willingness_trainer     = None
+        self._capacity_trainer        = None
+        self._try_load_score_models()
         self.log(
             f"bureau_signal_lag_days={self.bureau_signal_lag_days} | "
-            f"persona_model_dir={self.persona_model_dir}"
+            f"persona_model_dir={self.persona_model_dir} | "
+            f"willingness_model={'loaded' if self._willingness_trainer else 'fallback'} | "
+            f"capacity_model={'loaded' if self._capacity_trainer else 'fallback'}"
         )
+
+    def _try_load_score_models(self) -> None:
+        """Load willingness + capacity models if fitted. Silent fallback if not."""
+        for attr, model_dir, trainer_name, file_name in [
+            ("_willingness_trainer", self.willingness_model_dir,
+             "willingness_model_trainer", "willingness_model.pkl"),
+            ("_capacity_trainer",    self.capacity_model_dir,
+             "capacity_model_trainer",    "capacity_model_30d.pkl"),
+        ]:
+            model_path = model_dir / file_name
+            if model_path.exists():
+                try:
+                    _spec = _ilu.spec_from_file_location(
+                        trainer_name,
+                        Path(__file__).parent.parent / "models" / f"{trainer_name}.py",
+                    )
+                    _mod = _ilu.module_from_spec(_spec)
+                    _spec.loader.exec_module(_mod)
+                    cls_name  = "WillingnessModelTrainer" if "willingness" in trainer_name \
+                                else "CapacityModelTrainer"
+                    setattr(self, attr, getattr(_mod, cls_name)(model_dir=model_dir))
+                    self.log(f"{trainer_name} loaded from {model_dir}")
+                except Exception as e:
+                    self.log(f"Could not load {trainer_name}: {e} — using fallback", level="warning")
+            else:
+                self.log(
+                    f"No fitted {trainer_name} at {model_path} — "
+                    f"using column value or 0.5 default. "
+                    f"Run {cls_name if 'cls_name' in dir() else trainer_name}.fit() "
+                    f"to replace rule-based score.",
+                    level="warning",
+                )
+
+    def _compute_scores(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Computes willingness_score and capacity_score.
+
+        Priority:
+          1. Trained model output (WillingnessModelTrainer / CapacityModelTrainer)
+          2. Raw column value if present in input (upstream pre-computed)
+          3. Default 0.5 (neutral — no information)
+
+        Both scores are written as numeric features, NOT used for segmentation rules.
+        """
+        df = df.copy()
+
+        # willingness_score
+        if self._willingness_trainer is not None:
+            try:
+                df["willingness_score"] = self._willingness_trainer.predict(df).values
+                self.log("willingness_score: model-based")
+            except Exception as e:
+                self.log(f"Willingness model predict failed: {e} — using column/default", level="warning")
+                if "willingness_score" not in df.columns:
+                    df["willingness_score"] = 0.5
+        elif "willingness_score" not in df.columns:
+            df["willingness_score"] = 0.5
+            self.log("willingness_score: default 0.5 (no model, no column)")
+
+        # capacity_score
+        if self._capacity_trainer is not None:
+            try:
+                df["capacity_score"] = self._capacity_trainer.predict(df).values
+                self.log("capacity_score: model-based")
+            except Exception as e:
+                self.log(f"Capacity model predict failed: {e} — using column/default", level="warning")
+                if "capacity_score" not in df.columns:
+                    df["capacity_score"] = 0.5
+        elif "capacity_score" not in df.columns:
+            df["capacity_score"] = 0.5
+            self.log("capacity_score: default 0.5 (no model, no column)")
+
+        return df
 
     def execute(self) -> dict:
         self.log("Reading validated model_scores")
@@ -181,6 +268,11 @@ class FeatureAgent(BaseAgent):
             self.log(f"Optional columns not present: {missing}", level="warning")
 
         df = df[available].copy()
+
+        # ── Compute model-based willingness + capacity scores ─────────────────
+        # These replace rule-based weighted sums.
+        # Both are FEATURES passed downstream — not segmentation rules.
+        df = self._compute_scores(df)
 
         # ── Derive computed features ──────────────────────────────────────────
         df["erv_band"]         = df["erv_at_d_optimal"].apply(self._erv_band)
