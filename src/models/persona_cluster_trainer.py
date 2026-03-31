@@ -30,20 +30,68 @@ N_CLUSTERS_PER_SEGMENT (default: 4)
 
 CLUSTER_FEATURES
     Features used for clustering. All must be numeric.
-    Missing values are imputed with column median before fitting.
+    Domain-meaningful imputation applied (see _prepare_features).
 
-    Current features:
-        propensity_30d      — short-term recovery signal (primary)
-        propensity_180d     — long-term structural signal
-        willingness_score   — engagement proxy (contact + payment behaviour)
-        capacity_score      — ability-to-pay proxy (bureau + card features)
-        erv_at_d_optimal    — economic value of the account
-        low_confidence_flag — model uncertainty signal
+    ⚠ CRITICAL DESIGN RULE — NO OUTCOME PROXIES IN CLUSTERING:
+        propensity_30d, propensity_180d, willingness_score, capacity_score
+        are EXPLICITLY EXCLUDED from CLUSTER_FEATURES.
+
+        These are forward-looking / semi-target signals. Including them makes
+        personas behave as propensity buckets:
+          persona ≈ "people likely to pay" rather than "how people behave"
+
+        Consequences of mixing them in:
+          - Segmentation becomes latent supervised classification
+          - Persona ≈ propensity → redundancy in the feature pipeline
+          - ERV optimisation (which consumes propensity) becomes circular
+          - Cluster interpretability degrades for collectors + compliance
+
+        Rule: cluster on OBSERVABLE BEHAVIOUR only (what they do, not what
+        models predict they'll do).
+
+    Current features — three behavioural groups:
+        PAYMENT BEHAVIOUR (what money moves):
+            dpd_current, months_delinquent
+            partial_payment_count_3m, broken_promise_count_3m
+            days_since_last_payment, card_payment_pct_minimum_3m
+
+        CONTACT / ENGAGEMENT (how they respond):
+            contact_success_rate_3m, days_since_last_response
+            digital_open_rate_3m, avg_response_lag_days
+
+        BUREAU STRESS (structural financial position):
+            ncb_total_revolving_util, ncb_enquiry_count_3m
+            ncb_other_accounts_current
+
+        TREATMENT HISTORY (collections exposure — prevents fatigue/anchoring):
+            contact_attempts_total, days_since_last_offer
+            prior_discount_max, n_prior_settlements_declined
 
     Do NOT include:
+        - propensity_30d / propensity_180d / willingness_score / capacity_score
+          (outcome proxies — see above)
+        - low_confidence_flag (model uncertainty, not customer behaviour)
         - PII fields (name, phone, address, NationalID)
         - Future-dated fields (labels, outcomes)
         - SIGNAL_SEGMENT itself (clustering is done within segment)
+
+ALGORITHM
+    Default: KMeans (n_init=10, random_state=42).
+    GMM option: PersonaClusterTrainer(algorithm="gmm") uses GaussianMixture.
+
+    When to prefer GMM:
+        - Customer profiles overlap significantly (soft boundaries expected)
+        - Silhouette score < 0.25 with KMeans on your data
+        - Portfolio has mixed Segment A/B accounts with similar scores
+
+    When to keep KMeans:
+        - Explainability to business stakeholders is important
+        - Segment D (few features, sparse data) — GMM can be unstable
+        - Cold start — KMeans is more robust with small n
+
+    KMeans assumption of spherical clusters IS a limitation. If your feature
+    space shows elongated or overlapping clusters (check PCA scatter plots),
+    switch to GMM. Hierarchical clustering offline can validate KMeans structure.
 
 MODEL_PATH
     Where fitted cluster models are saved (one file per SIGNAL_SEGMENT).
@@ -67,6 +115,7 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
+from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 
 
@@ -100,35 +149,46 @@ DEFAULT_N_CLUSTERS = 4
 #   These give the clustering genuine behavioural resolution.
 #   Without these, personas are only as differentiated as the 6 derived scores.
 CLUSTER_FEATURES = [
-    # ── Tier 1: derived scores ────────────────────────────────────────────────
-    "propensity_30d",           # short-term recovery probability (P_1M)
-    "propensity_180d",          # long-term recovery probability (P_6M)
-    "willingness_score",        # P(contact_responded) from WillingnessModel
-    "capacity_score",           # P(made_any_payment_30d) from CapacityModel
-    "low_confidence_flag",      # model uncertainty flag
+    # ── Payment behaviour ─────────────────────────────────────────────────────
+    # WHAT money moves — delinquency severity and payment trajectory
+    "dpd_current",                # current DPD bucket — severity of delinquency
+    "months_delinquent",          # how long account has been delinquent
+    "partial_payment_count_3m",   # count of partial payments last 3 months
+    "broken_promise_count_3m",    # broken PTPs — distinguishes intent vs. ability
+    "days_since_last_payment",    # recency of any payment
+    "card_payment_pct_minimum_3m",# payment as % of minimum due
 
-    # ── Tier 2: raw payment behaviour (from enterprise feature store) ─────────
-    "dpd_current",              # current DPD bucket — severity of delinquency
-    "months_delinquent",        # how long account has been delinquent
-    "partial_payment_count_3m", # count of partial payments last 3 months
-    "broken_promise_count_3m",  # broken PTPs — distinguishes intent vs. ability
-    "days_since_last_payment",  # recency of any payment
-    "card_payment_pct_minimum_3m", # payment as % of minimum due — capacity signal
+    # ── Contact / engagement behaviour ───────────────────────────────────────
+    # HOW the customer responds to outreach
+    "contact_success_rate_3m",    # % of contact attempts that reached customer
+    "days_since_last_response",   # recency of last meaningful engagement
+    "digital_open_rate_3m",       # digital nudge open rate — passive engagement
+    "avg_response_lag_days",      # how long customer takes to respond when contacted
 
-    # ── Tier 2: raw contact / engagement behaviour ────────────────────────────
-    "contact_success_rate_3m",  # % of contact attempts that reached customer
-    "days_since_last_response", # recency of engagement
-    "digital_open_rate_3m",     # digital nudge open rate — passive engagement
-    "avg_response_lag_days",    # how long customer takes to respond when contacted
+    # ── Bureau structural position ────────────────────────────────────────────
+    # WHAT financial stress exists beyond this account
+    "ncb_total_revolving_util",   # total credit utilisation — financial stress
+    "ncb_enquiry_count_3m",       # recent credit enquiries — financial search behaviour
+    "ncb_other_accounts_current", # accounts still in good standing — capacity proxy
 
-    # ── Tier 2: bureau signals (from enterprise feature store) ────────────────
-    "ncb_total_revolving_util", # total credit utilisation — financial stress
-    "ncb_enquiry_count_3m",     # recent credit enquiries — financial search behaviour
-    "ncb_other_accounts_current",  # accounts still in good standing — capacity proxy
+    # ── Treatment history ─────────────────────────────────────────────────────
+    # WHAT collections exposure has already occurred — prevents over-contact
+    # and discount anchoring (customer learns to wait for higher offers)
+    "contact_attempts_total",     # total outbound attempts — contact fatigue signal
+    "days_since_last_offer",      # recency of last settlement offer
+    "prior_discount_max",         # highest discount ever offered — anchor risk
+    "n_prior_settlements_declined",# declined offers — strategic behaviour signal
+
+    # ⚠ DELIBERATELY EXCLUDED — see CONFIGURATION INSTRUCTIONS:
+    #   propensity_30d, propensity_180d  — outcome proxies (target leakage)
+    #   willingness_score, capacity_score — model outputs (circular dependency)
+    #   low_confidence_flag              — model uncertainty, not behaviour
 ]
 
 # Persona label map: cluster index → human-readable name.
-# Assigned POST-FIT by ranking clusters on mean propensity_30d × capacity_score.
+# ⚠ Labels are assigned by ranking clusters on a BEHAVIOURAL composite score
+# (contact_success_rate_3m + payment activity − broken_promise penalty).
+# NOT ranked by propensity × capacity — that would reintroduce outcome leakage.
 # This is descriptive naming only — does NOT prescribe any action.
 PERSONA_RANK_LABELS = ["Cooperative", "Stressed", "Sporadic", "Disconnected"]
 
@@ -148,6 +208,7 @@ class PersonaClusterTrainer:
         random_state: int = 42,
         min_pairwise_recovery_diff: float = 0.05,
         skip_business_validation: bool = False,
+        algorithm: str = "kmeans",
     ):
         """
         Args:
@@ -163,12 +224,22 @@ class PersonaClusterTrainer:
                                          will be saved but validation is skipped
                                          with a warning. Remove this flag once
                                          outcome data is available.
+            algorithm:                   Clustering algorithm. Options:
+                                         "kmeans" (default) — fast, explainable,
+                                           assumes spherical clusters.
+                                         "gmm" — Gaussian Mixture Model, allows
+                                           soft/overlapping clusters. Prefer when
+                                           silhouette < 0.25 or profiles overlap.
+                                         See CONFIGURATION INSTRUCTIONS for guidance.
         """
+        if algorithm not in ("kmeans", "gmm"):
+            raise ValueError(f"algorithm must be 'kmeans' or 'gmm', got: {algorithm!r}")
         self.n_clusters                  = n_clusters
         self.model_dir                   = Path(model_dir)
         self.random_state                = random_state
         self.min_pairwise_recovery_diff  = min_pairwise_recovery_diff
         self.skip_business_validation    = skip_business_validation
+        self.algorithm                   = algorithm
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
     def fit(self, df: pd.DataFrame) -> dict:
@@ -206,12 +277,7 @@ class PersonaClusterTrainer:
                 continue
 
             X, scaler = self._prepare_features(seg_df)
-            km        = KMeans(
-                n_clusters=self.n_clusters,
-                random_state=self.random_state,
-                n_init=10,
-            )
-            labels = km.fit_predict(X)
+            model, labels = self._fit_algorithm(X)
 
             sil = silhouette_score(X, labels) if len(set(labels)) > 1 else 0.0
             persona_map = self._assign_persona_labels(seg_df, labels)
@@ -267,10 +333,11 @@ class PersonaClusterTrainer:
                     }
                     continue   # skip _save — do not persist invalid clusters
 
-            self._save(seg, km, scaler, persona_map)
+            self._save(seg, model, scaler, persona_map)
 
             results[seg] = {
                 "silhouette":          round(sil, 4),
+                "algorithm":           self.algorithm,
                 "cluster_sizes":       pd.Series(labels).value_counts().to_dict(),
                 "persona_map":         persona_map,
                 "business_validation": biz_validation,
@@ -278,6 +345,7 @@ class PersonaClusterTrainer:
             }
             logger.info(
                 f"Segment {seg} | n={len(seg_df):,} | "
+                f"algorithm={self.algorithm} | "
                 f"silhouette={sil:.3f} | "
                 f"biz_validation={biz_validation.get('recommendation')} | "
                 f"personas={persona_map}"
@@ -331,34 +399,36 @@ class PersonaClusterTrainer:
                 )
                 continue
 
-            km, scaler, persona_map = self._load(seg)
+            model, scaler, persona_map = self._load(seg)
             seg_df = df[seg_mask].copy()
             X, _   = self._prepare_features(seg_df, scaler=scaler)
-            labels = km.predict(X)
+            labels = self._predict_algorithm(model, X)
 
             personas[seg_mask] = [
                 persona_map.get(lbl, "Disconnected") for lbl in labels
             ]
 
             # ── Cluster membership confidence ─────────────────────────────────
-            # confidence = dist_to_nearest_other_centroid / dist_to_own_centroid
-            # > 2.0 → clearly assigned; ≈ 1.0 → on the boundary
+            # KMeans: confidence = dist_to_nearest_other_centroid / dist_to_own_centroid
+            #   > 2.0 → clearly assigned; ≈ 1.0 → on the boundary
+            # GMM: confidence = max posterior probability across clusters
+            #   (already a soft assignment — use max probability directly)
             try:
-                centroids = km.cluster_centers_
-                dists = np.linalg.norm(
-                    X[:, np.newaxis, :] - centroids[np.newaxis, :, :], axis=2
-                )  # shape: (n_accounts, n_clusters)
-                own_dist     = dists[np.arange(len(labels)), labels]
-                # set own cluster dist to inf before finding nearest other
-                dists_copy = dists.copy()
-                dists_copy[np.arange(len(labels)), labels] = np.inf
-                nearest_other_dist = dists_copy.min(axis=1)
-                conf = np.where(
-                    own_dist > 0,
-                    nearest_other_dist / own_dist,
-                    2.0,   # on centroid → max confidence
-                )
-                confidence[seg_mask] = conf
+                if isinstance(model, GaussianMixture):
+                    probs = model.predict_proba(X)
+                    confidence[seg_mask] = probs.max(axis=1)
+                else:
+                    centroids  = model.cluster_centers_
+                    dists      = np.linalg.norm(
+                        X[:, np.newaxis, :] - centroids[np.newaxis, :, :], axis=2
+                    )
+                    own_dist   = dists[np.arange(len(labels)), labels]
+                    dists_copy = dists.copy()
+                    dists_copy[np.arange(len(labels)), labels] = np.inf
+                    nearest_other_dist = dists_copy.min(axis=1)
+                    confidence[seg_mask] = np.where(
+                        own_dist > 0, nearest_other_dist / own_dist, 2.0
+                    )
             except Exception as e:
                 logger.warning(f"Confidence score computation failed for segment {seg}: {e}")
 
@@ -366,38 +436,79 @@ class PersonaClusterTrainer:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
+    def _fit_algorithm(self, X: np.ndarray):
+        """Fits the configured clustering algorithm. Returns (model, labels)."""
+        if self.algorithm == "gmm":
+            model = GaussianMixture(
+                n_components=self.n_clusters,
+                random_state=self.random_state,
+                n_init=5,
+                covariance_type="full",
+            )
+            model.fit(X)
+            labels = model.predict(X)
+        else:
+            model = KMeans(
+                n_clusters=self.n_clusters,
+                random_state=self.random_state,
+                n_init=10,
+            )
+            labels = model.fit_predict(X)
+        return model, labels
+
+    def _predict_algorithm(self, model, X: np.ndarray) -> np.ndarray:
+        """Predicts cluster labels. Works for both KMeans and GMM."""
+        return model.predict(X)
+
     def _prepare_features(
         self, df: pd.DataFrame, scaler: StandardScaler = None
     ):
         available = [c for c in CLUSTER_FEATURES if c in df.columns]
         X = df[available].copy()
 
-        # Domain-meaningful imputation — do NOT impute with median.
+        # ── Missing indicator flags ───────────────────────────────────────────
+        # A null value in these columns is itself a behavioural signal.
+        # "days_since_last_payment is null" = this customer has NEVER paid.
+        # Adding a binary flag preserves this signal after imputation, so the
+        # algorithm can learn that "never paid" is distinct from "paid long ago".
+        MISSING_INDICATOR_COLS = [
+            "days_since_last_payment",    # null = never paid
+            "days_since_last_response",   # null = never responded
+            "contact_success_rate_3m",    # null = no contact history
+            "days_since_last_offer",      # null = never received a settlement offer
+        ]
+        for col in MISSING_INDICATOR_COLS:
+            if col in X.columns:
+                X[f"_missing_{col}"] = X[col].isna().astype(float)
+
+        # ── Domain-meaningful imputation ──────────────────────────────────────
         # Null in these columns means "never happened", not "data missing".
         # Median imputation would place absent customers near the average,
         # masking the behavioural signal (e.g. a customer who has never paid
         # should be far from customers who pay regularly).
         DOMAIN_FILL = {
-            "days_since_last_payment":  999,  # never paid → worst case
-            "days_since_last_response": 999,  # never responded → worst case
-            "contact_success_rate_3m":    0,  # never reached → 0%
-            "broken_promise_count_3m":    0,  # no PTPs → 0 broken
-            "partial_payment_count_3m":   0,  # no partials → 0
-            "avg_response_lag_days":    999,  # never responded → worst case
-            "digital_open_rate_3m":       0,  # never opened → 0%
-            "months_delinquent":          0,  # unknown → 0 (conservative)
-            "dpd_current":                0,  # unknown → 0 (conservative)
+            "days_since_last_payment":    999,  # never paid → worst case
+            "days_since_last_response":   999,  # never responded → worst case
+            "contact_success_rate_3m":      0,  # never reached → 0%
+            "broken_promise_count_3m":      0,  # no PTPs → 0 broken
+            "partial_payment_count_3m":     0,  # no partials → 0
+            "avg_response_lag_days":      999,  # never responded → worst case
+            "digital_open_rate_3m":         0,  # never opened → 0%
+            "months_delinquent":            0,  # unknown → 0 (conservative)
+            "dpd_current":                  0,  # unknown → 0 (conservative)
+            "contact_attempts_total":       0,  # no contact history
+            "days_since_last_offer":      999,  # never received offer
+            "prior_discount_max":           0,  # never offered discount
+            "n_prior_settlements_declined": 0,  # never declined an offer
         }
         for col in X.columns:
+            if col.startswith("_missing_"):
+                continue   # already binary — no imputation needed
             if col in DOMAIN_FILL:
                 X[col] = X[col].fillna(DOMAIN_FILL[col])
             else:
-                # Remaining numeric columns: median is acceptable (scores, rates)
+                # Remaining numeric columns: median acceptable (rates, utilisation)
                 X[col] = X[col].fillna(X[col].median())
-
-        # Boolean to float
-        if "low_confidence_flag" in X.columns:
-            X["low_confidence_flag"] = X["low_confidence_flag"].astype(float)
 
         if scaler is None:
             scaler = StandardScaler()
@@ -411,22 +522,43 @@ class PersonaClusterTrainer:
         self, df: pd.DataFrame, labels: np.ndarray
     ) -> dict:
         """
-        Ranks clusters by mean(propensity_30d × capacity_score) descending.
-        Maps rank 0 → Cooperative, rank 1 → Stressed, etc.
-        This is descriptive naming only.
+        Ranks clusters by a BEHAVIOURAL composite score and maps to persona names.
+
+        ⚠ Deliberately does NOT use propensity_30d × capacity_score for ranking.
+        That approach reintroduces outcome leakage into persona naming:
+            rank-by-propensity → "Cooperative" ≈ "high propensity"
+            → segmentation and propensity become redundant
+
+        Behavioural composite (all raw, no model outputs):
+            + contact_success_rate_3m       — contactability (engagement axis)
+            + card_payment_pct_minimum_3m   — payment activity (payment axis)
+            + partial_payment_count_3m      — partial payment effort
+            − broken_promise_count_3m × 0.2 — PTP reliability penalty
+            − days_since_last_payment / 999  — payment recency penalty (normalised)
+
+        Rank 0 (highest composite) → Cooperative (engaged + paying)
+        Rank 1 → Stressed  (paying partially, some engagement)
+        Rank 2 → Sporadic  (inconsistent across axes)
+        Rank 3 → Disconnected (lowest — no contact, no payment)
+
+        This is descriptive naming only — does NOT prescribe any action.
         """
         df = df.copy()
         df["_cluster"] = labels
 
-        p30 = "propensity_30d" if "propensity_30d" in df.columns else None
-        cap = "capacity_score" if "capacity_score" in df.columns else None
+        contact     = df.get("contact_success_rate_3m",    pd.Series(0.0, index=df.index)).fillna(0)
+        pct_min     = df.get("card_payment_pct_minimum_3m",pd.Series(0.0, index=df.index)).fillna(0)
+        partial_cnt = df.get("partial_payment_count_3m",   pd.Series(0.0, index=df.index)).fillna(0)
+        broken      = df.get("broken_promise_count_3m",    pd.Series(0.0, index=df.index)).fillna(0)
+        days_pay    = df.get("days_since_last_payment",    pd.Series(999, index=df.index)).fillna(999)
 
-        if p30 and cap:
-            df["_score"] = df[p30].fillna(0) * df[cap].fillna(0)
-        elif p30:
-            df["_score"] = df[p30].fillna(0)
-        else:
-            df["_score"] = 0.0
+        df["_score"] = (
+            contact
+            + pct_min
+            + partial_cnt * 0.1          # normalise count to similar scale
+            - broken      * 0.2          # PTP reliability penalty
+            - (days_pay / 999.0)         # recency penalty (0–1 range)
+        )
 
         cluster_means = df.groupby("_cluster")["_score"].mean().sort_values(ascending=False)
         n = min(len(cluster_means), len(PERSONA_RANK_LABELS))
@@ -439,13 +571,20 @@ class PersonaClusterTrainer:
         return self.model_dir / f"{segment}_persona_model.pkl"
 
     def _save(
-        self, segment: str, km: KMeans,
+        self, segment: str, model,
         scaler: StandardScaler, persona_map: dict
     ) -> None:
         path = self._model_path(segment)
-        joblib.dump({"km": km, "scaler": scaler, "persona_map": persona_map}, path)
-        logger.info(f"Saved persona model → {path}")
+        joblib.dump({
+            "model":       model,
+            "algorithm":   self.algorithm,
+            "scaler":      scaler,
+            "persona_map": persona_map,
+        }, path)
+        logger.info(f"Saved persona model ({self.algorithm}) → {path}")
 
     def _load(self, segment: str):
         obj = joblib.load(self._model_path(segment))
-        return obj["km"], obj["scaler"], obj["persona_map"]
+        # Backward compat: older saves used "km" key
+        model = obj.get("model") or obj.get("km")
+        return model, obj["scaler"], obj["persona_map"]

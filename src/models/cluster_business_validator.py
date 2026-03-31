@@ -375,3 +375,136 @@ class ClusterBusinessValidator:
             f"failed={failed_segments}"
         )
         return results
+
+    def validate_stability(
+        self,
+        df_t1: pd.DataFrame,
+        df_t2: pd.DataFrame,
+        cluster_col: str = "behavioural_persona",
+        id_col:      str = "account_id",
+        max_transition_pct: float = 0.30,
+    ) -> dict:
+        """
+        Validates cluster stability between two time periods by computing
+        a persona transition matrix on accounts present in both periods.
+
+        Why this matters:
+          Good behavioural clusters should be relatively stable — a customer
+          who is "Cooperative" today should mostly remain "Cooperative" next
+          month. High churn (>30% of accounts switching cluster every period)
+          means the clusters are not capturing stable behavioural identity.
+          This can happen when: (a) clustering on outcome-proxy features that
+          fluctuate with model scores, (b) insufficient data per cluster,
+          (c) the feature distribution has shifted (population drift).
+
+        Args:
+            df_t1:               feature_output from period 1 (earlier).
+            df_t2:               feature_output from period 2 (later).
+            cluster_col:         Column with persona labels.
+            id_col:              Account identifier column for the join.
+            max_transition_pct:  Maximum acceptable fraction of accounts that
+                                 changed persona between t1 and t2.
+                                 Default: 0.30 (30% churn threshold).
+
+        Returns:
+            dict with:
+                transition_matrix (dict of dicts): t1_persona → {t2_persona: count}
+                transition_rates  (dict): fraction moving out of each t1 persona
+                overall_stability (float): fraction of accounts that kept same persona
+                passed (bool): True if overall_stability >= (1 - max_transition_pct)
+                recommendation (str)
+                n_matched (int): accounts present in both periods
+        """
+        if id_col not in df_t1.columns or id_col not in df_t2.columns:
+            return {
+                "passed": False,
+                "recommendation": "SKIP — id_col not found in both DataFrames",
+                "error": f"id_col='{id_col}' missing",
+            }
+        if cluster_col not in df_t1.columns or cluster_col not in df_t2.columns:
+            return {
+                "passed": False,
+                "recommendation": "SKIP — cluster_col not found in both DataFrames",
+                "error": f"cluster_col='{cluster_col}' missing",
+            }
+
+        merged = df_t1[[id_col, cluster_col]].rename(
+            columns={cluster_col: "persona_t1"}
+        ).merge(
+            df_t2[[id_col, cluster_col]].rename(columns={cluster_col: "persona_t2"}),
+            on=id_col, how="inner",
+        )
+        n_matched = len(merged)
+        if n_matched < 10:
+            return {
+                "passed": False,
+                "recommendation": f"SKIP — only {n_matched} accounts matched between periods",
+                "n_matched": n_matched,
+            }
+
+        # ── Transition matrix ─────────────────────────────────────────────────
+        transition_counts = (
+            merged.groupby(["persona_t1", "persona_t2"])
+            .size()
+            .unstack(fill_value=0)
+        )
+        all_personas = sorted(
+            set(merged["persona_t1"].unique()) | set(merged["persona_t2"].unique())
+        )
+        transition_matrix = {
+            p1: {
+                p2: int(transition_counts.loc[p1, p2])
+                    if p1 in transition_counts.index and p2 in transition_counts.columns
+                    else 0
+                for p2 in all_personas
+            }
+            for p1 in all_personas
+        }
+
+        # ── Transition rates per persona ──────────────────────────────────────
+        transition_rates = {}
+        for p1 in all_personas:
+            row = merged[merged["persona_t1"] == p1]
+            if len(row) > 0:
+                stayed      = (row["persona_t2"] == p1).sum()
+                transitioned = len(row) - stayed
+                transition_rates[p1] = {
+                    "n":                int(len(row)),
+                    "stayed":           int(stayed),
+                    "transitioned":     int(transitioned),
+                    "transition_pct":   round(float(transitioned / len(row)), 4),
+                }
+
+        # ── Overall stability ─────────────────────────────────────────────────
+        n_stable         = int((merged["persona_t1"] == merged["persona_t2"]).sum())
+        overall_stability = round(float(n_stable / n_matched), 4)
+        passed           = overall_stability >= (1.0 - max_transition_pct)
+
+        if passed:
+            recommendation = (
+                f"STABLE — {overall_stability:.1%} of accounts kept same persona. "
+                f"Clusters represent stable behavioural identity."
+            )
+        else:
+            recommendation = (
+                f"UNSTABLE — only {overall_stability:.1%} kept same persona "
+                f"(threshold: {1 - max_transition_pct:.1%}). "
+                f"Investigate: (1) are outcome proxies in CLUSTER_FEATURES? "
+                f"(2) population drift? (3) insufficient cluster data?"
+            )
+
+        log_level = "info" if passed else "warning"
+        getattr(logger, log_level)(
+            f"Cluster stability: overall_stability={overall_stability:.1%} | "
+            f"n_matched={n_matched:,} | passed={passed}"
+        )
+
+        return {
+            "passed":             passed,
+            "recommendation":     recommendation,
+            "overall_stability":  overall_stability,
+            "n_matched":          n_matched,
+            "transition_matrix":  transition_matrix,
+            "transition_rates":   transition_rates,
+            "max_transition_pct": max_transition_pct,
+        }
