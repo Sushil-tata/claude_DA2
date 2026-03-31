@@ -87,13 +87,44 @@ logger = logging.getLogger(__name__)
 DEFAULT_N_CLUSTERS = 4
 
 # Features used for clustering. See CONFIGURATION INSTRUCTIONS above.
+#
+# Two tiers of features — all are used when available (via enterprise join).
+# PersonaClusterTrainer uses available = [c for c in CLUSTER_FEATURES if c in df.columns]
+# so adding features here is safe — missing columns are skipped automatically.
+#
+# TIER 1 — Derived scores (always present after FeatureAgent runs)
+#   These summarise propensity and engagement but lose granularity.
+#   Clustering on scores alone is equivalent to a 2×2 matrix.
+#
+# TIER 2 — Raw behavioural signals (present when enterprise features are joined)
+#   These give the clustering genuine behavioural resolution.
+#   Without these, personas are only as differentiated as the 6 derived scores.
 CLUSTER_FEATURES = [
-    "propensity_30d",
-    "propensity_180d",
-    "willingness_score",
-    "capacity_score",
-    "erv_at_d_optimal",
-    "low_confidence_flag",
+    # ── Tier 1: derived scores ────────────────────────────────────────────────
+    "propensity_30d",           # short-term recovery probability (P_1M)
+    "propensity_180d",          # long-term recovery probability (P_6M)
+    "willingness_score",        # P(contact_responded) from WillingnessModel
+    "capacity_score",           # P(made_any_payment_30d) from CapacityModel
+    "low_confidence_flag",      # model uncertainty flag
+
+    # ── Tier 2: raw payment behaviour (from enterprise feature store) ─────────
+    "dpd_current",              # current DPD bucket — severity of delinquency
+    "months_delinquent",        # how long account has been delinquent
+    "partial_payment_count_3m", # count of partial payments last 3 months
+    "broken_promise_count_3m",  # broken PTPs — distinguishes intent vs. ability
+    "days_since_last_payment",  # recency of any payment
+    "card_payment_pct_minimum_3m", # payment as % of minimum due — capacity signal
+
+    # ── Tier 2: raw contact / engagement behaviour ────────────────────────────
+    "contact_success_rate_3m",  # % of contact attempts that reached customer
+    "days_since_last_response", # recency of engagement
+    "digital_open_rate_3m",     # digital nudge open rate — passive engagement
+    "avg_response_lag_days",    # how long customer takes to respond when contacted
+
+    # ── Tier 2: bureau signals (from enterprise feature store) ────────────────
+    "ncb_total_revolving_util", # total credit utilisation — financial stress
+    "ncb_enquiry_count_3m",     # recent credit enquiries — financial search behaviour
+    "ncb_other_accounts_current",  # accounts still in good standing — capacity proxy
 ]
 
 # Persona label map: cluster index → human-readable name.

@@ -302,10 +302,14 @@ class FeatureAgent(BaseAgent):
             except Exception as e:
                 self.log(f"Willingness model predict failed: {e} — using column/default", level="warning")
                 if "willingness_score" not in df.columns:
-                    df["willingness_score"] = 0.5
+                    df["willingness_score"] = None   # null = unknown, not neutral
         elif "willingness_score" not in df.columns:
-            df["willingness_score"] = 0.5
-            self.log("willingness_score: default 0.5 (no model, no column)")
+            df["willingness_score"] = None
+            self.log(
+                "willingness_score: NULL (no model, no column). "
+                "Rule-based persona fallback will assign 'Unknown'. "
+                "Train WillingnessModelTrainer to activate real scores."
+            )
 
         # capacity_score
         if self._capacity_trainer is not None:
@@ -315,10 +319,14 @@ class FeatureAgent(BaseAgent):
             except Exception as e:
                 self.log(f"Capacity model predict failed: {e} — using column/default", level="warning")
                 if "capacity_score" not in df.columns:
-                    df["capacity_score"] = 0.5
+                    df["capacity_score"] = None   # null = unknown, not neutral
         elif "capacity_score" not in df.columns:
-            df["capacity_score"] = 0.5
-            self.log("capacity_score: default 0.5 (no model, no column)")
+            df["capacity_score"] = None
+            self.log(
+                "capacity_score: NULL (no model, no column). "
+                "Rule-based persona fallback will assign 'Unknown'. "
+                "Train CapacityModelTrainer to activate real scores."
+            )
 
         return df
 
@@ -602,40 +610,63 @@ class FeatureAgent(BaseAgent):
         self.log(
             "No fitted persona cluster models found at "
             f"{self.persona_model_dir} — using rule-based fallback. "
-            "Run PersonaClusterTrainer.fit() on historical data to enable "
-            "data-driven behavioural segmentation.",
+            "WARNING: rule-based personas require willingness_score and "
+            "capacity_score to be model-derived (not null). "
+            "If models are not trained, all accounts will be labelled 'Unknown'. "
+            "Run PersonaClusterTrainer.fit() on historical data with recovery_180d "
+            "outcomes to enable data-driven behavioural segmentation.",
             level="warning",
         )
-        return df.apply(self._behavioural_persona_rules, axis=1)
+        personas = df.apply(self._behavioural_persona_rules, axis=1)
+        n_unknown = int((personas == "Unknown").sum())
+        if n_unknown > 0:
+            self.log(
+                f"{n_unknown:,} accounts ({n_unknown/len(df):.0%}) labelled 'Unknown' persona "
+                "— willingness_score or capacity_score is null. "
+                "Train WillingnessModelTrainer + CapacityModelTrainer first, "
+                "then PersonaClusterTrainer for full segmentation.",
+                level="warning",
+            )
+        return personas
 
     @staticmethod
     def _behavioural_persona_rules(row) -> str:
         """
         Rule-based fallback for BEHAVIOURAL_PERSONA.
-        Used only when no fitted cluster model exists.
-        Replace with PersonaClusterTrainer as soon as training data is available.
-        """
-        """
-        Derives behavioural persona from willingness and capacity scores.
+        Used only when no fitted PersonaClusterTrainer model exists.
 
-        IMPORTANT: willingness_score and capacity_score are used here ONLY
-        to derive a stable behavioural label. They must also be passed as
-        raw numeric FEATURES to the propensity, amount, and elasticity models.
-        Do NOT use this persona as a decisioning rule — it is a feature/label.
+        IMPORTANT — limitations of this fallback:
+          1. Requires willingness_score and capacity_score to be model-derived
+             (from WillingnessModelTrainer / CapacityModelTrainer). If these
+             are null (no model trained), all accounts are labelled "Unknown".
+          2. The 0.5 threshold is arbitrary — a boundary in model-output space,
+             not a data-driven cluster boundary.
+          3. Replace with PersonaClusterTrainer.fit() as soon as 3+ months of
+             labeled outcome data (recovery_180d) is available.
 
-          Cooperative  = willingness >= 0.5 AND capacity >= 0.5
-          Stressed     = willingness >= 0.5 AND capacity <  0.5
-          Sporadic     = willingness <  0.5 AND capacity >= 0.5
-          Disconnected = willingness <  0.5 AND capacity <  0.5
+        Persona assignment (STRICT threshold — > not >=):
+          Cooperative  = willingness > 0.5 AND capacity > 0.5
+          Stressed     = willingness > 0.5 AND capacity <= 0.5
+          Sporadic     = willingness <= 0.5 AND capacity > 0.5
+          Disconnected = willingness <= 0.5 AND capacity <= 0.5
+          Unknown      = either score is null (no model fitted)
         """
-        w = row.get("willingness_score", 0.0) or 0.0
-        c = row.get("capacity_score",    0.0) or 0.0
+        w = row.get("willingness_score")
+        c = row.get("capacity_score")
 
-        if w >= WILLINGNESS_THRESHOLD and c >= CAPACITY_THRESHOLD:
+        # Null means no model fitted — do not assign a false persona
+        if w is None or c is None or (isinstance(w, float) and pd.isna(w)) \
+                or (isinstance(c, float) and pd.isna(c)):
+            return "Unknown"
+
+        w = float(w)
+        c = float(c)
+
+        if w > WILLINGNESS_THRESHOLD and c > CAPACITY_THRESHOLD:
             return "Cooperative"
-        if w >= WILLINGNESS_THRESHOLD and c < CAPACITY_THRESHOLD:
+        if w > WILLINGNESS_THRESHOLD and c <= CAPACITY_THRESHOLD:
             return "Stressed"
-        if w < WILLINGNESS_THRESHOLD and c >= CAPACITY_THRESHOLD:
+        if w <= WILLINGNESS_THRESHOLD and c > CAPACITY_THRESHOLD:
             return "Sporadic"
         return "Disconnected"
 
