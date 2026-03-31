@@ -296,7 +296,27 @@ class PersonaClusterTrainer:
         Returns:
             pd.Series of persona labels (same index as df).
         """
-        personas = pd.Series("Disconnected", index=df.index)
+        result = self.predict_with_confidence(df)
+        return result["behavioural_persona"]
+
+    def predict_with_confidence(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Assigns BEHAVIOURAL_PERSONA and persona_confidence per row.
+
+        persona_confidence is the ratio of distance-to-nearest-centroid over
+        distance-to-own-centroid. Values close to 1.0 mean the account sits
+        near its cluster boundary (low confidence); values > 2.0 are clearly
+        assigned (high confidence).
+
+        Args:
+            df: DataFrame with signal_segment + CLUSTER_FEATURES columns.
+
+        Returns:
+            DataFrame with columns: behavioural_persona, persona_confidence
+            (same index as df).
+        """
+        personas   = pd.Series("Disconnected", index=df.index, name="behavioural_persona")
+        confidence = pd.Series(1.0,            index=df.index, name="persona_confidence")
 
         for seg in SIGNAL_SEGMENTS:
             seg_mask = df["signal_segment"] == seg
@@ -315,11 +335,34 @@ class PersonaClusterTrainer:
             seg_df = df[seg_mask].copy()
             X, _   = self._prepare_features(seg_df, scaler=scaler)
             labels = km.predict(X)
+
             personas[seg_mask] = [
                 persona_map.get(lbl, "Disconnected") for lbl in labels
             ]
 
-        return personas
+            # ── Cluster membership confidence ─────────────────────────────────
+            # confidence = dist_to_nearest_other_centroid / dist_to_own_centroid
+            # > 2.0 → clearly assigned; ≈ 1.0 → on the boundary
+            try:
+                centroids = km.cluster_centers_
+                dists = np.linalg.norm(
+                    X[:, np.newaxis, :] - centroids[np.newaxis, :, :], axis=2
+                )  # shape: (n_accounts, n_clusters)
+                own_dist     = dists[np.arange(len(labels)), labels]
+                # set own cluster dist to inf before finding nearest other
+                dists_copy = dists.copy()
+                dists_copy[np.arange(len(labels)), labels] = np.inf
+                nearest_other_dist = dists_copy.min(axis=1)
+                conf = np.where(
+                    own_dist > 0,
+                    nearest_other_dist / own_dist,
+                    2.0,   # on centroid → max confidence
+                )
+                confidence[seg_mask] = conf
+            except Exception as e:
+                logger.warning(f"Confidence score computation failed for segment {seg}: {e}")
+
+        return pd.DataFrame({"behavioural_persona": personas, "persona_confidence": confidence})
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -329,9 +372,28 @@ class PersonaClusterTrainer:
         available = [c for c in CLUSTER_FEATURES if c in df.columns]
         X = df[available].copy()
 
-        # Impute missing with median
+        # Domain-meaningful imputation — do NOT impute with median.
+        # Null in these columns means "never happened", not "data missing".
+        # Median imputation would place absent customers near the average,
+        # masking the behavioural signal (e.g. a customer who has never paid
+        # should be far from customers who pay regularly).
+        DOMAIN_FILL = {
+            "days_since_last_payment":  999,  # never paid → worst case
+            "days_since_last_response": 999,  # never responded → worst case
+            "contact_success_rate_3m":    0,  # never reached → 0%
+            "broken_promise_count_3m":    0,  # no PTPs → 0 broken
+            "partial_payment_count_3m":   0,  # no partials → 0
+            "avg_response_lag_days":    999,  # never responded → worst case
+            "digital_open_rate_3m":       0,  # never opened → 0%
+            "months_delinquent":          0,  # unknown → 0 (conservative)
+            "dpd_current":                0,  # unknown → 0 (conservative)
+        }
         for col in X.columns:
-            X[col] = X[col].fillna(X[col].median())
+            if col in DOMAIN_FILL:
+                X[col] = X[col].fillna(DOMAIN_FILL[col])
+            else:
+                # Remaining numeric columns: median is acceptable (scores, rates)
+                X[col] = X[col].fillna(X[col].median())
 
         # Boolean to float
         if "low_confidence_flag" in X.columns:

@@ -187,6 +187,59 @@ SEGMENT_STRATEGY = {
     },
 }
 
+# ── BEHAVIOURAL_PERSONA strategy modifiers ────────────────────────────────────
+# Applied ON TOP of SEGMENT_STRATEGY. Persona captures WHO the customer is
+# (behavioural identity); segment captures WHAT signal we have.
+# Together they define both the data quality and the customer type.
+#
+# Cooperative  → preserve recovery value; customer is willing AND able.
+#                Apply a discount haircut — do not over-discount a good payer.
+# Stressed     → capacity-limited but willing. Accept more discount to unlock
+#                payment. Extend AGENCY as a restructuring option.
+# Sporadic     → able to pay but disengaged. Discount alone won't work.
+#                Keep discount neutral; focus on digital re-engagement first.
+# Disconnected → neither willing nor able. Low-cost only. HOLD until signal.
+# Unknown      → no persona data. No modification — use segment default.
+#
+# discount_penalty_multiplier: multiplied against segment discount_penalty.
+#   < 1.0 → persona makes us LESS willing to discount (value preservation).
+#   > 1.0 → persona makes us MORE willing to discount (capacity/reactivation).
+# extra_actions_allowed: ADDS actions to the segment's allowed_actions set.
+# actions_force_remove: REMOVES actions from allowed_actions regardless of segment.
+
+PERSONA_STRATEGY_MODIFIER = {
+    "Cooperative": {
+        "discount_penalty_multiplier": 0.8,   # 20% extra discount haircut
+        "extra_actions_allowed":       set(),
+        "actions_force_remove":        set(),
+        "description": "Willing + able — preserve value, minimise discount",
+    },
+    "Stressed": {
+        "discount_penalty_multiplier": 1.3,   # accept 30% more discount
+        "extra_actions_allowed":       {"AGENCY"},   # restructuring option
+        "actions_force_remove":        set(),
+        "description": "Willing, capacity-limited — accept higher discount + AGENCY",
+    },
+    "Sporadic": {
+        "discount_penalty_multiplier": 1.0,   # neutral on discount
+        "extra_actions_allowed":       set(),
+        "actions_force_remove":        set(),
+        "description": "Able but disengaged — standard discount, digital focus",
+    },
+    "Disconnected": {
+        "discount_penalty_multiplier": 1.0,
+        "extra_actions_allowed":       set(),
+        "actions_force_remove":        {"AGENT_CALL", "AGENCY", "LEGAL"},  # low-cost only
+        "description": "No signal — low-cost actions only, HOLD or DIGITAL",
+    },
+    "Unknown": {
+        "discount_penalty_multiplier": 1.0,
+        "extra_actions_allowed":       set(),
+        "actions_force_remove":        set(),
+        "description": "No persona data — use segment default unchanged",
+    },
+}
+
 
 class ModelAgent(BaseAgent):
 
@@ -540,6 +593,13 @@ class ModelAgent(BaseAgent):
           - amount_30d → DIGITAL_NUDGE, AGENT_CALL (aligned with P_1M / 30d horizon)
           - amount_180d → AGENCY, LEGAL            (aligned with P_6M / 180d horizon)
 
+        Strategy = SEGMENT_STRATEGY[signal_segment] × PERSONA_STRATEGY_MODIFIER[persona]:
+          - Segment defines objective (maximise_amount / balanced / reactivation / exploration)
+          - Persona refines discount tolerance and action eligibility
+          - Example: Segment A + Stressed → tighter discount than A alone (preserve value
+            for willing customers) but AGENCY unlocked for restructuring
+          - Example: Segment B + Disconnected → AGENT_CALL/AGENCY removed (low-cost only)
+
         Agency-first rule for charge-off accounts:
           LEGAL is only selected over AGENCY if
           ERV(LEGAL) > ERV(AGENCY) + legal_uplift_threshold.
@@ -549,11 +609,23 @@ class ModelAgent(BaseAgent):
         p30          = row.get("propensity_30d",  0.0) or 0.0
         p180         = row.get("propensity_180d", 0.0) or 0.0
         seg          = row.get("signal_segment",  "D")
+        persona      = row.get("behavioural_persona", "Unknown")
         alpha        = self.action_alphas.get(seg, 2.5)
         aid          = row.get("account_id")
+
+        # ── Combine segment strategy + persona modifier ────────────────────────
+        # Segment defines the baseline objective and action set.
+        # Persona refines the discount tolerance and action eligibility.
         strategy     = SEGMENT_STRATEGY.get(seg, SEGMENT_STRATEGY["B"])
-        allowed      = strategy["allowed_actions"]
-        disc_penalty = strategy["discount_penalty"]
+        modifier     = PERSONA_STRATEGY_MODIFIER.get(persona, PERSONA_STRATEGY_MODIFIER["Unknown"])
+
+        # Apply persona modifier to discount_penalty
+        disc_penalty = strategy["discount_penalty"] * modifier["discount_penalty_multiplier"]
+
+        # Merge allowed_actions: start from segment, add persona extras, remove persona forces
+        allowed = (
+            strategy["allowed_actions"] | modifier["extra_actions_allowed"]
+        ) - modifier["actions_force_remove"]
 
         # E(recovery_amount) per horizon — from AmountModelTrainer or fallback
         amounts      = self._predicted_amounts.get(aid, {})

@@ -93,7 +93,10 @@ WILLINGNESS_FEATURES = [
     "preferred_contact_hour",
     "escalation_flag",
     "signal_segment",       # segment context
-    "propensity_30d",       # short-term recovery signal adds engagement context
+    # ⚠ propensity_30d deliberately excluded — it is a RECOVERY outcome signal,
+    # not an engagement signal. Including it creates a circular dependency:
+    #   propensity_30d → willingness_score → persona cluster → ModelAgent ERV
+    # The willingness model must predict engagement from contact behaviour alone.
 ]
 
 DEFAULT_MODEL_DIR = Path(

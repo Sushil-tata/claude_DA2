@@ -99,6 +99,7 @@ class ClusterBusinessValidator:
         min_cluster_size_pct: float       = DEFAULT_MIN_CLUSTER_SIZE_PCT,
         stat_alpha: float                 = DEFAULT_STAT_ALPHA,
         primary_metric: str               = "recovery_180d",
+        holdout_pct: float                = 0.20,
     ):
         """
         Args:
@@ -107,14 +108,20 @@ class ClusterBusinessValidator:
                                         Default: 0.05 (5pp). See CONFIGURATION.
             min_cluster_size_pct:       Min fraction of segment per cluster.
                                         Default: 0.05 (5%). See CONFIGURATION.
-            stat_alpha:                 p-value threshold for Kruskal-Wallis.
+            stat_alpha:                 p-value threshold for Kruskal-Wallis
+                                        AFTER Bonferroni correction.
             primary_metric:             Recovery metric used as the primary
                                         differentiation check. Default: recovery_180d.
+            holdout_pct:                Fraction of data held out for out-of-sample
+                                        validation. Default: 0.20 (20%).
+                                        Set to 0.0 to validate on full dataset
+                                        (not recommended — in-sample bias).
         """
         self.min_pairwise_recovery_diff = min_pairwise_recovery_diff
         self.min_cluster_size_pct       = min_cluster_size_pct
         self.stat_alpha                 = stat_alpha
         self.primary_metric             = primary_metric
+        self.holdout_pct                = holdout_pct
 
     def validate(
         self,
@@ -146,6 +153,29 @@ class ClusterBusinessValidator:
         seg_label     = segment or "ALL"
         failure_reasons = []
         available_metrics = [m for m in BUSINESS_METRICS if m in df.columns]
+
+        # ── Out-of-sample holdout split ───────────────────────────────────────
+        # All business metrics are computed on held-out data, NOT training data.
+        # In-sample validation overstates cluster separation because the clusters
+        # were optimised on this data. Holdout measures generalisation.
+        if self.holdout_pct > 0.0 and len(df) >= 20:
+            holdout_n = max(1, int(len(df) * self.holdout_pct))
+            # Random holdout (no date column guaranteed in validator scope)
+            rng        = np.random.default_rng(seed=42)
+            holdout_idx = rng.choice(df.index, size=holdout_n, replace=False)
+            val_df      = df.loc[holdout_idx]
+            logger.info(
+                f"[Segment {seg_label}] Out-of-sample validation | "
+                f"holdout_n={holdout_n:,} ({self.holdout_pct:.0%} of {len(df):,})"
+            )
+        else:
+            val_df = df
+            if self.holdout_pct > 0.0:
+                logger.warning(
+                    f"[Segment {seg_label}] Not enough data for holdout split "
+                    f"(n={len(df)} < 20). Validating on full dataset."
+                )
+        df = val_df   # all checks below use out-of-sample data
 
         if not available_metrics:
             raise ValueError(
@@ -197,7 +227,11 @@ class ClusterBusinessValidator:
                 f"Recommendation: reduce n_clusters or collect more labelled data."
             )
 
-        # ── Check 3: Statistical significance per metric ──────────────────────
+        # ── Check 3: Statistical significance per metric (Bonferroni-corrected) ─
+        # We test multiple metrics simultaneously — without correction, we would
+        # expect ~5% false positives at alpha=0.05. Bonferroni multiplies each
+        # raw p-value by the number of tests, controlling family-wise error rate.
+        n_tests      = len(available_metrics)
         stat_results = {}
         for metric in available_metrics:
             groups = [
@@ -206,22 +240,30 @@ class ClusterBusinessValidator:
                 if len(df.loc[df[cluster_col] == c, metric].dropna()) >= 5
             ]
             if len(groups) < 2:
-                stat_results[metric] = {"stat": None, "p_value": None, "significant": False}
+                stat_results[metric] = {
+                    "stat": None, "p_value": None,
+                    "p_value_bonferroni": None, "significant": False,
+                }
                 continue
 
-            stat, p = stats.kruskal(*groups)
-            significant = p < self.stat_alpha
+            stat, p_raw = stats.kruskal(*groups)
+            p_bonferroni = min(float(p_raw) * n_tests, 1.0)   # Bonferroni correction
+            significant  = p_bonferroni < self.stat_alpha
             stat_results[metric] = {
-                "stat":        round(float(stat), 4),
-                "p_value":     round(float(p), 6),
-                "significant": significant,
+                "stat":               round(float(stat), 4),
+                "p_value":            round(float(p_raw), 6),
+                "p_value_bonferroni": round(p_bonferroni, 6),
+                "n_tests_corrected":  n_tests,
+                "significant":        significant,
             }
 
             if metric == self.primary_metric and not significant:
                 failure_reasons.append(
-                    f"Kruskal-Wallis test NOT significant for {metric}: "
-                    f"p={p:.4f} > {self.stat_alpha}. "
-                    f"Clusters do not differ on primary recovery metric."
+                    f"Kruskal-Wallis NOT significant for {metric} "
+                    f"(Bonferroni-corrected): "
+                    f"p_raw={p_raw:.4f}, p_corrected={p_bonferroni:.4f} "
+                    f"> alpha={self.stat_alpha} (n_tests={n_tests}). "
+                    f"Clusters do not reliably differ on primary recovery metric."
                 )
 
         # ── Check 4: Effect size — are differences economically meaningful? ───

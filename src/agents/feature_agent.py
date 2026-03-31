@@ -497,7 +497,27 @@ class FeatureAgent(BaseAgent):
         )
 
         # ── Derive BEHAVIOURAL_PERSONA (cluster model; rule-based fallback) ───
-        df["behavioural_persona"] = self._derive_persona(df)
+        # predict_with_confidence returns both persona label and confidence ratio
+        persona_result = self._derive_persona(df)
+        if isinstance(persona_result, pd.DataFrame):
+            df["behavioural_persona"] = persona_result["behavioural_persona"].values
+            df["persona_confidence"]  = persona_result["persona_confidence"].values
+        else:
+            df["behavioural_persona"] = persona_result
+            df["persona_confidence"]  = 1.0   # rule-based: no confidence metric
+
+        # ── Trajectory features — persona stability over time ─────────────────
+        # persona_previous: persona label from previous execution
+        # days_in_current_persona: consecutive days in the current persona
+        # persona_assigned_date: when the current persona was first assigned
+        # These require reading yesterday's feature_output — fail silently if absent.
+        df = self._add_trajectory_features(df)
+
+        # ── Vulnerable / Hardship flag (BOT compliance dimension) ─────────────
+        # Orthogonal to SIGNAL_SEGMENT and BEHAVIOURAL_PERSONA.
+        # Identifies accounts showing signs of severe financial hardship.
+        # DecisionAgent and ConstraintAgent apply additional guardrails for these.
+        df["vulnerable_flag"] = df.apply(self._vulnerable_flag, axis=1)
 
         # ── Composite segment key (SIGNAL_SEGMENT + BEHAVIOURAL_PERSONA) ──────
         df["final_segment"] = df["signal_segment"] + "_" + df["behavioural_persona"]
@@ -518,17 +538,23 @@ class FeatureAgent(BaseAgent):
 
         signal_dist  = df["signal_segment"].value_counts().to_dict()
         persona_dist = df["behavioural_persona"].value_counts().to_dict()
+        n_vulnerable = int(df["vulnerable_flag"].sum()) if "vulnerable_flag" in df.columns else 0
+        mean_confidence = round(float(df["persona_confidence"].mean()), 3) \
+            if "persona_confidence" in df.columns else None
         self.log(
             f"Feature output ready | rows={len(df):,} | "
-            f"signal_segments={signal_dist} | personas={persona_dist}"
+            f"signal_segments={signal_dist} | personas={persona_dist} | "
+            f"vulnerable={n_vulnerable:,} | persona_confidence_mean={mean_confidence}"
         )
         return {
-            "rows_written":         len(df),
-            "feature_columns":      len(df.columns),
-            "erv_band_dist":        df["erv_band"].value_counts().to_dict(),
-            "recovery_tier_dist":   df["recovery_tier"].value_counts().to_dict(),
-            "signal_segment_dist":  signal_dist,
-            "behavioural_persona_dist": persona_dist,
+            "rows_written":              len(df),
+            "feature_columns":           len(df.columns),
+            "erv_band_dist":             df["erv_band"].value_counts().to_dict(),
+            "recovery_tier_dist":        df["recovery_tier"].value_counts().to_dict(),
+            "signal_segment_dist":       signal_dist,
+            "behavioural_persona_dist":  persona_dist,
+            "vulnerable_accounts":       n_vulnerable,
+            "persona_confidence_mean":   mean_confidence,
         }
 
     # ── SIGNAL_SEGMENT derivation ─────────────────────────────────────────────
@@ -589,7 +615,7 @@ class FeatureAgent(BaseAgent):
 
     # ── BEHAVIOURAL_PERSONA derivation ────────────────────────────────────────
 
-    def _derive_persona(self, df: pd.DataFrame) -> pd.Series:
+    def _derive_persona(self, df: pd.DataFrame):
         """
         Attempts to use fitted PersonaClusterTrainer models first.
         Falls back to rule-based thresholds if models are not found.
@@ -597,6 +623,10 @@ class FeatureAgent(BaseAgent):
         Cluster-based approach is preferred — it derives behavioural identity
         from data, not from manually defined rules.
         Rule-based fallback exists only for cold-start (no trained model yet).
+
+        Returns:
+            DataFrame with columns [behavioural_persona, persona_confidence]
+            when cluster models are found; pd.Series of labels otherwise.
         """
         any_model = any(
             (self.persona_model_dir / f"{seg}_persona_model.pkl").exists()
@@ -604,8 +634,8 @@ class FeatureAgent(BaseAgent):
         )
 
         if any_model:
-            self.log("Using fitted cluster models for BEHAVIOURAL_PERSONA")
-            return self._persona_trainer.predict(df)
+            self.log("Using fitted cluster models for BEHAVIOURAL_PERSONA (+ confidence)")
+            return self._persona_trainer.predict_with_confidence(df)
 
         self.log(
             "No fitted persona cluster models found at "
@@ -669,6 +699,132 @@ class FeatureAgent(BaseAgent):
         if w <= WILLINGNESS_THRESHOLD and c > CAPACITY_THRESHOLD:
             return "Sporadic"
         return "Disconnected"
+
+    # ── Trajectory features ───────────────────────────────────────────────────
+
+    def _add_trajectory_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Adds persona stability features by comparing today's persona against
+        the most recent historical feature_output stored in AgentMemory.
+
+        Columns added:
+            persona_previous:       persona label from the most recent prior run
+                                    (null if no history available)
+            persona_assigned_date:  date when current persona streak began
+                                    (execution_date if persona changed or no history)
+            days_in_current_persona: consecutive days in the current persona
+                                    (1 if new or changed; grows each day it stays)
+
+        Falls back gracefully if no prior feature_output is found — these
+        columns will be null/1 on the first run.
+
+        CONFIGURATION: AgentMemory.read("feature_output_prev") reads the most
+        recent prior partition. If your Delta table uses date-partitioned writes,
+        this returns yesterday's data automatically.
+        """
+        df = df.copy()
+
+        # Defaults — applied when no history is available
+        df["persona_previous"]       = None
+        df["persona_assigned_date"]  = self.execution_date
+        df["days_in_current_persona"] = 1
+
+        if "account_id" not in df.columns:
+            self.log(
+                "No account_id column — skipping trajectory features.",
+                level="warning",
+            )
+            return df
+
+        try:
+            prev = self.memory.read("feature_output_prev")
+            if hasattr(prev, "toPandas"):
+                prev = prev.toPandas()
+
+            if prev is None or prev.empty:
+                return df
+
+            persona_cols = ["account_id", "behavioural_persona",
+                            "persona_assigned_date", "days_in_current_persona"]
+            prev_avail   = [c for c in persona_cols if c in prev.columns]
+            if "account_id" not in prev_avail or "behavioural_persona" not in prev_avail:
+                return df
+
+            prev = prev[prev_avail].rename(
+                columns={"behavioural_persona": "persona_previous"}
+            )
+            df = df.merge(prev, on="account_id", how="left", suffixes=("", "_prev"))
+
+            # Carry forward persona_assigned_date and days_in_current_persona
+            # when persona has NOT changed; reset to today when it changed.
+            same_persona = df["behavioural_persona"] == df["persona_previous"]
+
+            # days_in_current_persona: increment when persona unchanged
+            if "days_in_current_persona_prev" in df.columns:
+                df["days_in_current_persona"] = df["days_in_current_persona_prev"].where(
+                    same_persona, other=1
+                ).fillna(1).astype(int) + same_persona.astype(int)
+                df = df.drop(columns=["days_in_current_persona_prev"])
+
+            # persona_assigned_date: keep prior date when unchanged, set today when changed
+            if "persona_assigned_date_prev" in df.columns:
+                df["persona_assigned_date"] = df["persona_assigned_date_prev"].where(
+                    same_persona, other=self.execution_date
+                ).fillna(self.execution_date)
+                df = df.drop(columns=["persona_assigned_date_prev"])
+
+            n_changed = int((~same_persona & df["persona_previous"].notna()).sum())
+            self.log(
+                f"Trajectory features: {n_changed:,} accounts changed persona "
+                f"since last run | "
+                f"mean_days_in_persona={df['days_in_current_persona'].mean():.1f}"
+            )
+        except Exception as e:
+            self.log(
+                f"Trajectory feature computation failed (non-blocking): {e}. "
+                "persona_previous and days_in_current_persona will be null/1.",
+                level="warning",
+            )
+
+        return df
+
+    # ── Vulnerable / hardship flag ────────────────────────────────────────────
+
+    @staticmethod
+    def _vulnerable_flag(row) -> int:
+        """
+        Binary flag for accounts showing signs of severe financial hardship.
+
+        Orthogonal to SIGNAL_SEGMENT and BEHAVIOURAL_PERSONA — a customer can
+        be Cooperative AND vulnerable (willing and able but under severe stress).
+
+        Used by ConstraintAgent and DecisionAgent to apply BOT-compliant
+        guardrails: no aggressive settlement offers, escalate to human review,
+        restrict to low-cost contact channels only.
+
+        Rules (any one triggers the flag):
+            1. dpd_current >= 180         — severely delinquent
+            2. months_delinquent >= 12    — chronically delinquent (1+ year)
+            3. broken_promise_count_3m >= 3 — repeated broken PTPs (distress signal)
+            4. ncb_total_revolving_util >= 0.95 — near-maxed credit (financial crisis)
+            5. days_since_last_payment >= 365   — no payment in 12+ months
+
+        Returns:
+            1 if any hardship indicator is present, 0 otherwise.
+        """
+        dpd           = row.get("dpd_current",               0) or 0
+        months_dlq    = row.get("months_delinquent",          0) or 0
+        broken_ptps   = row.get("broken_promise_count_3m",    0) or 0
+        revolving_util = row.get("ncb_total_revolving_util",  0.0) or 0.0
+        days_no_pay   = row.get("days_since_last_payment",    0) or 0
+
+        if (dpd           >= 180  or
+                months_dlq    >= 12   or
+                broken_ptps   >= 3    or
+                revolving_util >= 0.95 or
+                days_no_pay   >= 365):
+            return 1
+        return 0
 
     # ── Existing derived feature logic ────────────────────────────────────────
 
