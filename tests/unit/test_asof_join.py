@@ -1,206 +1,233 @@
 """
-Test as-of join logic using pandas (no Spark required).
+Unit tests for as-of joins and leakage detection (no Spark dependency).
 """
+
 import pytest
 import pandas as pd
 from datetime import datetime, timedelta
-from decision_agent.data.asof_join import PointInTimeJoiner
+import sys
+from pathlib import Path
+
+# Add src to path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
+
+from decision_agent.data.asof_join import AsOfJoiner, LeakageDetector
 
 
-def test_asof_join_pandas():
-    """Test as-of join with pandas DataFrames"""
-    # Create left DataFrame (labels with prediction timestamps)
-    left_data = {
-        "customer_id": [1, 1, 2, 2],
-        "prediction_date": [
-            datetime(2024, 1, 5),
-            datetime(2024, 1, 10),
-            datetime(2024, 1, 6),
-            datetime(2024, 1, 12)
-        ],
-        "label": [1, 0, 1, 0]
-    }
-    left_df = pd.DataFrame(left_data)
-
-    # Create right DataFrame (features with feature timestamps)
-    right_data = {
-        "customer_id": [1, 1, 1, 2, 2],
-        "feature_date": [
-            datetime(2024, 1, 1),
-            datetime(2024, 1, 4),
-            datetime(2024, 1, 8),
-            datetime(2024, 1, 3),
-            datetime(2024, 1, 5)
-        ],
-        "feature_value": [10, 20, 30, 15, 25]
-    }
-    right_df = pd.DataFrame(right_data)
-
-    # Perform as-of join
-    joiner = PointInTimeJoiner(spark=None)
-    result = joiner.as_of_join(
-        left_df,
-        right_df,
-        entity_key="customer_id",
-        left_timestamp="prediction_date",
-        right_timestamp="feature_date"
-    )
-
-    # Verify results
-    assert len(result) == 4
-
-    # For customer 1, prediction on 2024-01-05 should get feature from 2024-01-04
-    row1 = result[(result["customer_id"] == 1) & (result["prediction_date"] == datetime(2024, 1, 5))]
-    assert len(row1) == 1
-    assert row1.iloc[0]["feature_value"] == 20  # Feature from 2024-01-04
-
-    # For customer 1, prediction on 2024-01-10 should get feature from 2024-01-08
-    row2 = result[(result["customer_id"] == 1) & (result["prediction_date"] == datetime(2024, 1, 10))]
-    assert len(row2) == 1
-    assert row2.iloc[0]["feature_value"] == 30  # Feature from 2024-01-08
-
-
-def test_asof_join_no_leakage():
-    """Test that as-of join doesn't use future data"""
-    # Create scenario where feature is after prediction date
-    left_data = {
-        "customer_id": [1],
-        "prediction_date": [datetime(2024, 1, 5)],
-        "label": [1]
-    }
-    left_df = pd.DataFrame(left_data)
-
-    # Feature is AFTER prediction date
-    right_data = {
-        "customer_id": [1],
-        "feature_date": [datetime(2024, 1, 10)],  # Future date
-        "feature_value": [100]
-    }
-    right_df = pd.DataFrame(right_data)
-
-    joiner = PointInTimeJoiner(spark=None)
-    result = joiner.as_of_join(
-        left_df,
-        right_df,
-        entity_key="customer_id",
-        left_timestamp="prediction_date",
-        right_timestamp="feature_date"
-    )
-
-    # Should have no match (feature_value should be NaN)
-    assert len(result) == 1
-    assert pd.isna(result.iloc[0]["feature_value"])
-
-
-def test_asof_join_with_lookback_window():
-    """Test as-of join with lookback window constraint"""
-    left_data = {
-        "customer_id": [1],
-        "prediction_date": [datetime(2024, 1, 30)],
-        "label": [1]
-    }
-    left_df = pd.DataFrame(left_data)
-
-    # Features at different dates
-    right_data = {
-        "customer_id": [1, 1],
-        "feature_date": [
-            datetime(2024, 1, 1),   # 29 days ago - outside window
-            datetime(2024, 1, 15)   # 15 days ago - inside window
-        ],
-        "feature_value": [10, 20]
-    }
-    right_df = pd.DataFrame(right_data)
-
-    joiner = PointInTimeJoiner(spark=None)
-    result = joiner.as_of_join(
-        left_df,
-        right_df,
-        entity_key="customer_id",
-        left_timestamp="prediction_date",
-        right_timestamp="feature_date",
-        lookback_window_days=20  # Only look back 20 days
-    )
-
-    # Should get feature from 2024-01-15 (inside window)
-    assert len(result) == 1
-    assert result.iloc[0]["feature_value"] == 20
-
-
-def test_validate_no_leakage_detection():
-    """Test leakage detection logic"""
-    # Create features DataFrame
-    features_data = {
-        "entity_id": [1, 2, 3],
-        "feature_timestamp": [
-            datetime(2024, 1, 1),
-            datetime(2024, 1, 2),
-            datetime(2024, 1, 3)
-        ],
-        "feature_value": [10, 20, 30]
-    }
-    features_df = pd.DataFrame(features_data)
-
-    # Create labels DataFrame where one has leakage
-    labels_data = {
-        "entity_id": [1, 2, 3],
-        "label_timestamp": [
-            datetime(2024, 1, 2),  # OK: feature is before label
-            datetime(2024, 1, 1),  # LEAKAGE: feature is after label
-            datetime(2024, 1, 4)   # OK: feature is before label
-        ],
-        "label": [1, 0, 1]
-    }
-    labels_df = pd.DataFrame(labels_data)
-
-    joiner = PointInTimeJoiner(spark=None)
-
-    # Should detect leakage
-    with pytest.raises(ValueError, match="DATA LEAKAGE DETECTED"):
-        joiner.validate_no_leakage(
-            features_df,
-            labels_df,
-            feature_timestamp="feature_timestamp",
-            label_timestamp="label_timestamp",
-            entity_key="entity_id"
+class TestAsOfJoiner:
+    """Test suite for AsOfJoiner."""
+    
+    @pytest.fixture
+    def sample_predictions(self):
+        """Create sample predictions DataFrame."""
+        return pd.DataFrame({
+            'customer_id': ['A', 'B', 'A', 'B'],
+            'prediction_date': pd.to_datetime([
+                '2024-01-15', '2024-01-15', '2024-01-20', '2024-01-20'
+            ]),
+            'request_id': [1, 2, 3, 4]
+        })
+    
+    @pytest.fixture
+    def sample_features(self):
+        """Create sample features DataFrame."""
+        return pd.DataFrame({
+            'customer_id': ['A', 'A', 'B', 'B', 'A'],
+            'feature_date': pd.to_datetime([
+                '2024-01-10', '2024-01-18', '2024-01-12',
+                '2024-01-19', '2024-01-14'
+            ]),
+            'credit_score': [700, 720, 650, 660, 710]
+        })
+    
+    def test_as_of_join_basic(self, sample_predictions, sample_features):
+        """Test basic as-of join functionality."""
+        joiner = AsOfJoiner()
+        
+        result = joiner.as_of_join(
+            sample_predictions,
+            sample_features,
+            left_on='customer_id',
+            right_on='customer_id',
+            left_timestamp='prediction_date',
+            right_timestamp='feature_date'
         )
+        
+        # Check we got results
+        assert len(result) == len(sample_predictions)
+        
+        # Check columns exist
+        assert 'credit_score' in result.columns
+        assert 'prediction_date' in result.columns
+    
+    def test_as_of_join_respects_timestamp_order(
+        self, sample_predictions, sample_features
+    ):
+        """Test that as-of join only uses past data."""
+        joiner = AsOfJoiner()
+        
+        result = joiner.as_of_join(
+            sample_predictions,
+            sample_features,
+            left_on='customer_id',
+            right_on='customer_id',
+            left_timestamp='prediction_date',
+            right_timestamp='feature_date'
+        )
+        
+        # For each row, feature_date should be <= prediction_date
+        result_clean = result.dropna(subset=['feature_date'])
+        
+        assert all(
+            result_clean['feature_date'] <= result_clean['prediction_date']
+        ), "As-of join should only use past features"
+    
+    def test_point_in_time_snapshot(self):
+        """Test point-in-time snapshot creation."""
+        # Create historical data
+        df = pd.DataFrame({
+            'customer_id': ['A', 'A', 'B', 'B', 'A'],
+            'updated_at': pd.to_datetime([
+                '2024-01-10', '2024-01-20', '2024-01-15',
+                '2024-01-25', '2024-01-30'
+            ]),
+            'balance': [1000, 1200, 500, 550, 1300]
+        })
+        
+        joiner = AsOfJoiner()
+        
+        # Get snapshot as of 2024-01-22
+        snapshot = joiner.point_in_time_snapshot(
+            df,
+            entity_col='customer_id',
+            timestamp_col='updated_at',
+            as_of_date='2024-01-22'
+        )
+        
+        # Should have one row per customer
+        assert len(snapshot) == 2
+        
+        # Check we got the latest values before cutoff
+        customer_a = snapshot[snapshot['customer_id'] == 'A']
+        assert customer_a['balance'].values[0] == 1200  # Jan 20 value
+        
+        customer_b = snapshot[snapshot['customer_id'] == 'B']
+        assert customer_b['balance'].values[0] == 500  # Jan 15 value
+    
+    def test_point_in_time_snapshot_filters_future_data(self):
+        """Test that snapshot excludes future data."""
+        df = pd.DataFrame({
+            'customer_id': ['A', 'A'],
+            'updated_at': pd.to_datetime(['2024-01-10', '2024-02-10']),
+            'value': [100, 200]
+        })
+        
+        joiner = AsOfJoiner()
+        
+        snapshot = joiner.point_in_time_snapshot(
+            df,
+            entity_col='customer_id',
+            timestamp_col='updated_at',
+            as_of_date='2024-01-15'
+        )
+        
+        # Should only get Jan 10 record
+        assert len(snapshot) == 1
+        assert snapshot['value'].values[0] == 100
+    
+    def test_windowed_aggregation(self):
+        """Test windowed aggregation with point-in-time safety."""
+        predictions = pd.DataFrame({
+            'customer_id': ['A', 'B'],
+            'prediction_date': pd.to_datetime(['2024-01-31', '2024-01-31'])
+        })
+        
+        transactions = pd.DataFrame({
+            'customer_id': ['A', 'A', 'A', 'B', 'B'],
+            'transaction_date': pd.to_datetime([
+                '2024-01-05', '2024-01-15', '2024-01-25',
+                '2024-01-10', '2024-01-20'
+            ]),
+            'amount': [100, 200, 150, 50, 75]
+        })
+        
+        joiner = AsOfJoiner()
+        
+        result = joiner.windowed_aggregation_asof(
+            predictions,
+            transactions,
+            entity_col='customer_id',
+            left_timestamp='prediction_date',
+            right_timestamp='transaction_date',
+            lookback_days=30,
+            agg_col='amount',
+            agg_funcs=['sum', 'mean', 'count']
+        )
+        
+        # Check aggregated features created
+        assert 'amount_30d_sum' in result.columns
+        assert 'amount_30d_mean' in result.columns
+        assert 'amount_30d_count' in result.columns
+        
+        # Check values for customer A
+        customer_a = result[result['customer_id'] == 'A']
+        assert customer_a['amount_30d_sum'].values[0] == 450  # 100+200+150
+        assert customer_a['amount_30d_count'].values[0] == 3
 
 
-def test_validate_no_leakage_clean_data():
-    """Test leakage validation with clean data"""
-    # Create features DataFrame
-    features_data = {
-        "entity_id": [1, 2, 3],
-        "feature_timestamp": [
-            datetime(2024, 1, 1),
-            datetime(2024, 1, 2),
-            datetime(2024, 1, 3)
-        ],
-        "feature_value": [10, 20, 30]
-    }
-    features_df = pd.DataFrame(features_data)
+class TestLeakageDetector:
+    """Test suite for LeakageDetector."""
+    
+    def test_no_leakage_detected(self):
+        """Test case with no leakage."""
+        features = pd.DataFrame({
+            'customer_id': ['A', 'B'],
+            'feature_timestamp': pd.to_datetime(['2024-01-10', '2024-01-15']),
+            'feature_value': [100, 200]
+        })
+        
+        labels = pd.DataFrame({
+            'customer_id': ['A', 'B'],
+            'label_timestamp': pd.to_datetime(['2024-01-20', '2024-01-25']),
+            'label': [1, 0]
+        })
+        
+        detector = LeakageDetector()
+        
+        result = detector.detect_leakage(
+            features,
+            labels,
+            feature_timestamp='feature_timestamp',
+            label_timestamp='label_timestamp'
+        )
+        
+        assert result['leakage_detected'] == False
+        assert result['leakage_rows'] == 0
+    
+    def test_leakage_detected_raises_error(self):
+        """Test that leakage is detected and raises error."""
+        features = pd.DataFrame({
+            'customer_id': ['A', 'B'],
+            'feature_timestamp': pd.to_datetime(['2024-01-25', '2024-01-15']),
+            'feature_value': [100, 200]
+        })
+        
+        labels = pd.DataFrame({
+            'customer_id': ['A', 'B'],
+            'label_timestamp': pd.to_datetime(['2024-01-20', '2024-01-25']),
+            'label': [1, 0]
+        })
+        
+        detector = LeakageDetector()
+        
+        with pytest.raises(ValueError, match="DATA LEAKAGE DETECTED"):
+            detector.detect_leakage(
+                features,
+                labels,
+                feature_timestamp='feature_timestamp',
+                label_timestamp='label_timestamp'
+            )
 
-    # Create labels DataFrame with no leakage
-    labels_data = {
-        "entity_id": [1, 2, 3],
-        "label_timestamp": [
-            datetime(2024, 1, 5),
-            datetime(2024, 1, 6),
-            datetime(2024, 1, 7)
-        ],
-        "label": [1, 0, 1]
-    }
-    labels_df = pd.DataFrame(labels_data)
 
-    joiner = PointInTimeJoiner(spark=None)
-
-    # Should pass validation
-    result = joiner.validate_no_leakage(
-        features_df,
-        labels_df,
-        feature_timestamp="feature_timestamp",
-        label_timestamp="label_timestamp",
-        entity_key="entity_id"
-    )
-
-    assert result is True
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

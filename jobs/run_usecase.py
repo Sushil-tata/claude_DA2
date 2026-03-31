@@ -1,22 +1,22 @@
-#!/usr/bin/env python3
 """
-Main entry point for running decision agent use cases.
+Main entry point for decision agent use cases.
+
+Loads YAML config, validates against schema, routes to appropriate pipeline.
 
 Usage:
     python jobs/run_usecase.py --config conf/use_cases/income_estimation.yaml
     python jobs/run_usecase.py --config conf/use_cases/income_estimation.yaml --dry-run
-    python jobs/run_usecase.py --config conf/use_cases/income_estimation.yaml --execution-date 2024-12-01
 """
+
 import argparse
 import sys
 import logging
 from pathlib import Path
-from datetime import datetime
 
-# Add src to path
+# Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from decision_agent.config.config_loader import load_config
+from decision_agent.utils.config_loader import ConfigLoader
 from decision_agent.orchestrator.router import route_use_case, list_available_use_cases
 
 logging.basicConfig(
@@ -27,136 +27,99 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-    """Main execution function"""
+    """Main execution function."""
     parser = argparse.ArgumentParser(
-        description="Run decision agent use case pipeline",
+        description="Decision Agent Platform - Use Case Runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run income estimation with synthetic data
   python jobs/run_usecase.py --config conf/use_cases/income_estimation.yaml
-
-  # Dry run to validate config
   python jobs/run_usecase.py --config conf/use_cases/income_estimation.yaml --dry-run
-
-  # Run with specific execution date
-  python jobs/run_usecase.py --config conf/use_cases/income_estimation.yaml --execution-date 2024-12-01
-
-  # List available use cases
-  python jobs/run_usecase.py --list
+  python jobs/run_usecase.py --list-use-cases
         """
     )
 
     parser.add_argument(
         "--config",
         type=str,
-        help="Path to use case YAML configuration file"
-    )
-
-    parser.add_argument(
-        "--execution-date",
-        type=str,
-        default=datetime.now().strftime("%Y-%m-%d"),
-        help="Execution date for pipeline (default: today)"
+        help="Path to use case YAML configuration"
     )
 
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Validate configuration without executing pipeline"
+        help="Validate config only, don't execute pipeline"
     )
 
     parser.add_argument(
-        "--list",
+        "--list-use-cases",
         action="store_true",
-        help="List available use cases"
-    )
-
-    parser.add_argument(
-        "--local",
-        action="store_true",
-        help="Run in local mode (no Databricks connection required)"
+        help="List all available use cases and exit"
     )
 
     args = parser.parse_args()
 
-    # List available use cases
-    if args.list:
+    # List use cases if requested
+    if args.list_use_cases:
+        print("\n" + "="*80)
+        print("AVAILABLE USE CASES")
+        print("="*80)
         use_cases = list_available_use_cases()
-        print("\nAvailable use cases:")
-        for uc in use_cases:
-            print(f"  - {uc}")
+        for use_case_id, description in use_cases.items():
+            print(f"  {use_case_id:25s} - {description}")
         print()
         return 0
 
-    # Validate arguments
+    # Config path is required for non-list operations
     if not args.config:
-        parser.error("--config is required (or use --list to see available use cases)")
+        parser.error("--config is required (or use --list-use-cases)")
 
-    config_path = Path(args.config)
-    if not config_path.exists():
-        logger.error(f"Config file not found: {config_path}")
+    # Find schema path (relative to this file)
+    project_root = Path(__file__).parent.parent
+    schema_path = project_root / "schemas" / "config_schemas" / "use_case_config.schema.json"
+
+    if not schema_path.exists():
+        logger.error(f"Schema not found: {schema_path}")
         return 1
 
+    # Load and validate configuration
+    logger.info("="*80)
+    logger.info("DECISION AGENT PLATFORM - USE CASE RUNNER")
+    logger.info("="*80)
+
     try:
-        # Load and validate configuration
-        logger.info(f"Loading configuration from: {config_path}")
-        config = load_config(str(config_path), execution_date=args.execution_date)
+        config_loader = ConfigLoader(str(schema_path))
+        config = config_loader.load_use_case(args.config)
 
-        logger.info(f"Configuration loaded successfully:")
-        logger.info(f"  Use Case: {config['use_case_id']}")
-        logger.info(f"  Version: {config['version']}")
-        logger.info(f"  Description: {config.get('description', 'N/A')}")
-        logger.info(f"  Execution Date: {args.execution_date}")
+        logger.info(f"\nUse Case: {config['use_case_id']}")
+        logger.info(f"Version: {config['version']}")
+        logger.info(f"Description: {config.get('description', 'N/A')}")
 
-        # Dry run: validate and exit
         if args.dry_run:
-            logger.info("✓ Configuration is valid (dry-run mode)")
-            logger.info("Pipeline steps that would execute:")
-            logger.info("  1. Load/generate data")
-            logger.info("  2. Create temporal splits")
-            logger.info("  3. Compute features")
-            logger.info("  4. Train model")
-            logger.info("  5. Validate model")
-            logger.info("  6. Score test set")
-            logger.info("  7. Write decisions to Delta Lake")
+            logger.info("\n✓ DRY RUN: Configuration is valid")
+            logger.info("Pipeline would execute with the following config:")
+            logger.info(f"  - Features: {len(config['features']['feature_list'])} features")
+            logger.info(f"  - Model: {config['model']['algorithm']}")
+            logger.info(f"  - Output: {config['output']['table_name']}")
             return 0
 
         # Execute pipeline
-        logger.info(f"Starting pipeline execution...")
-        logger.info("=" * 80)
+        logger.info("\n" + "="*80)
+        logger.info("EXECUTING PIPELINE")
+        logger.info("="*80)
 
-        # Route to appropriate use case pipeline
-        spark = None
-        if not args.local:
-            try:
-                from decision_agent.utils.spark_utils import get_spark_session
-                spark = get_spark_session()
-                logger.info("✓ Spark session initialized")
-            except Exception as e:
-                logger.warning(f"Could not initialize Spark: {e}")
-                logger.info("Running in local mode (limited functionality)")
+        results = route_use_case(config["use_case_id"], config)
 
-        results = route_use_case(
-            use_case_id=config['use_case_id'],
-            config=config,
-            spark=spark
-        )
-
-        # Log results
-        logger.info("=" * 80)
-        logger.info("Pipeline execution completed successfully!")
-        logger.info("\nResults Summary:")
-        for key, value in results.items():
-            logger.info(f"  {key}: {value}")
+        logger.info("\n" + "="*80)
+        logger.info("PIPELINE EXECUTION COMPLETE")
+        logger.info("="*80)
+        logger.info(f"Status: {results.get('status', 'unknown')}")
+        logger.info(f"Message: {results.get('message', 'N/A')}")
 
         return 0
 
     except FileNotFoundError as e:
-        logger.error(f"File not found: {e}")
-        return 1
-    except ValueError as e:
-        logger.error(f"Configuration error: {e}")
+        logger.error(f"Configuration file not found: {e}")
         return 1
     except Exception as e:
         logger.error(f"Pipeline execution failed: {e}", exc_info=True)
