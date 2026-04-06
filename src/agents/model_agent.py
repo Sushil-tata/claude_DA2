@@ -140,50 +140,104 @@ ACTION_TO_CHANNEL = {
     "HOLD":          "HOLD",
 }
 
-# ── SIGNAL_SEGMENT strategy differentiation ──────────────────────────────────
-# Each segment has a distinct objective that modifies how ERV is optimised.
-# This is the operational expression of the segment — not just a feature.
+# ── RECOVERABILITY STRATEGY (primary strategic axis — charge-off specific) ────
+# Keyed by RECOVERABILITY_TIER from RecoverabilitySegmenter.
+# This drives the ERV horizon, action eligibility, and discount range.
 #
-# A (CardX + Bureau): Maximise recovery AMOUNT — customer has high signal quality,
-#    keep discount low, extract maximum value. Penalise high discounts.
+# Design rule: RECOVERABILITY_TIER is the outermost decision layer.
+#   → It determines WHAT type of recovery is possible and over WHAT horizon.
+#   → SIGNAL_SEGMENT then calibrates model confidence and action cost tolerance.
+#   → BEHAVIOURAL_PERSONA refines discount tolerance and channel within the tier.
 #
-# B (CardX only): Balanced — moderate discount acceptable if it raises P(pay).
-#    Standard ERV optimisation with no penalty.
+# erv_horizon_days: propensity model horizon to use for this tier.
+#   TIER_1: 90d  — recoverable accounts respond quickly to the right action.
+#   TIER_2: 180d — moderate recovery needs more time, patient approach.
+#   TIER_3: 360d — low recovery; long-horizon settlement only viable option.
+#   TIER_4: None — no ERV calculation; stop spend.
 #
-# C (Bureau only): Reactivation — customer is known to bureau but disengaged
-#    from CardX. Accept higher discount to re-establish contact. Reward contact.
+# discount_range: (min_discount, max_discount) enforced at action selection.
+#   TIER_1: cap at 35% — don't over-discount recoverable accounts (value leakage).
+#   TIER_2: up to 50% — flexible to unlock payment.
+#   TIER_3: up to 60% (BOT cap) — deep discount required for low-recovery accounts.
+#   TIER_4: no settlement offers.
+
+RECOVERABILITY_STRATEGY = {
+    "TIER_1_HIGH": {
+        "objective":         "maximise_recovery_speed",
+        "erv_horizon_days":  90,
+        "discount_penalty":  0.7,    # penalise high discount — these accounts will pay
+        "discount_max":      0.35,   # cap at 35% — preserve value
+        "allowed_actions":   {"AGENT_CALL", "AGENCY", "DIGITAL_NUDGE", "HOLD"},
+        "agency_eligible":   True,
+        "legal_eligible":    False,  # legal rarely needed for TIER_1 — agency works
+        "description":       "High recovery — agency month 1–3, firm settlement",
+    },
+    "TIER_2_MODERATE": {
+        "objective":         "maximise_recovery_probability",
+        "erv_horizon_days":  180,
+        "discount_penalty":  1.0,    # standard
+        "discount_max":      0.50,
+        "allowed_actions":   {"AGENT_CALL", "AGENCY", "DIGITAL_NUDGE", "HOLD"},
+        "agency_eligible":   True,
+        "legal_eligible":    False,
+        "description":       "Moderate recovery — flexible settlement, 180d horizon",
+    },
+    "TIER_3_LOW": {
+        "objective":         "cost_efficient_recovery",
+        "erv_horizon_days":  360,
+        "discount_penalty":  1.3,    # reward higher discounts — deep discount needed
+        "discount_max":      0.60,   # BOT cap
+        "allowed_actions":   {"DIGITAL_NUDGE", "HOLD", "LEGAL"},
+        "agency_eligible":   False,  # agency fees uneconomic for low-recovery accounts
+        "legal_eligible":    True,   # legal review for high-balance TIER_3
+        "description":       "Low recovery — digital + legal for high balance only",
+    },
+    "TIER_4_DORMANT": {
+        "objective":         "portfolio_resolution",
+        "erv_horizon_days":  None,   # no ERV — stop spend
+        "discount_penalty":  1.0,
+        "discount_max":      0.0,
+        "allowed_actions":   {"HOLD"},
+        "agency_eligible":   False,
+        "legal_eligible":    False,
+        "description":       "Non-recoverable — HOLD, flag for portfolio sale",
+    },
+}
+
+# ── SIGNAL_SEGMENT strategy — now a CONFIDENCE MODIFIER, not primary axis ────
+# SIGNAL_SEGMENT (A/B/C/D) calibrates action cost tolerance and model confidence.
+# It is applied ON TOP of RECOVERABILITY_STRATEGY as a discount_penalty multiplier.
+# The segment no longer drives allowed_actions — the recoverability tier does.
 #
-# D (No signal): Exploration — no reliable signal. Use low-cost actions only.
-#    Cap at DIGITAL_NUDGE or HOLD. High-cost actions (AGENT_CALL, LEGAL) suppressed.
-#
-# discount_penalty: multiplied against gross ERV to penalise high discounts.
-#   1.0 = no penalty, 0.7 = 30% ERV haircut per unit of discount offered.
-# allowed_actions: restricts which actions are evaluated for this segment.
+# A (rich signal): trust the model; normal cost tolerance.
+# B (CardX only): slight upward discount adjustment for uncertainty.
+# C (Bureau only): higher discount tolerance — less predictable internally.
+# D (No signal):  low-cost only, don't override TIER_3/4 with expensive actions.
 
 SEGMENT_STRATEGY = {
     "A": {
         "objective":        "maximise_amount",
-        "discount_penalty": 0.6,   # penalise high discounts — preserve recovery amount
+        "discount_penalty": 0.6,
         "allowed_actions":  {"DIGITAL_NUDGE", "AGENT_CALL", "HOLD"},
-        "description":      "Optimise recovery amount — minimal discount",
+        "description":      "Rich signal — preserve value, minimal discount",
     },
     "B": {
         "objective":        "balanced",
-        "discount_penalty": 1.0,   # no penalty — standard ERV
+        "discount_penalty": 1.0,
         "allowed_actions":  {"DIGITAL_NUDGE", "AGENT_CALL", "AGENCY", "HOLD"},
         "description":      "Balanced ERV optimisation",
     },
     "C": {
         "objective":        "reactivation",
-        "discount_penalty": 1.3,   # reward higher discounts — reactivation is the goal
+        "discount_penalty": 1.3,
         "allowed_actions":  {"DIGITAL_NUDGE", "AGENT_CALL", "AGENCY", "HOLD"},
-        "description":      "Reactivation focus — accept higher discount to re-engage",
+        "description":      "Reactivation focus — accept higher discount",
     },
     "D": {
         "objective":        "exploration",
         "discount_penalty": 1.0,
-        "allowed_actions":  {"DIGITAL_NUDGE", "HOLD"},  # low-cost only
-        "description":      "Exploration — low-cost actions, no agency/legal",
+        "allowed_actions":  {"DIGITAL_NUDGE", "HOLD"},
+        "description":      "No signal — low-cost only",
     },
 }
 
@@ -604,27 +658,59 @@ class ModelAgent(BaseAgent):
           LEGAL is only selected over AGENCY if
           ERV(LEGAL) > ERV(AGENCY) + legal_uplift_threshold.
         """
-        # propensity_30d (P_1M) is the primary decisioning signal
-        # propensity_180d (P_6M) used only for AGENCY/LEGAL (longer-horizon actions)
-        p30          = row.get("propensity_30d",  0.0) or 0.0
-        p180         = row.get("propensity_180d", 0.0) or 0.0
-        seg          = row.get("signal_segment",  "D")
-        persona      = row.get("behavioural_persona", "Unknown")
-        alpha        = self.action_alphas.get(seg, 2.5)
+        # ── Three-layer strategy resolution ───────────────────────────────────
+        # Layer 1 (primary):   RECOVERABILITY_TIER  → ERV horizon, action set, discount cap
+        # Layer 2 (secondary): SIGNAL_SEGMENT       → model confidence, discount penalty
+        # Layer 3 (refinement):BEHAVIOURAL_PERSONA  → discount tolerance tweak, channel
+        #
+        # This order reflects the charge-off reality:
+        # First ask "CAN we recover this?" (tier), then "HOW confident are our models?"
+        # (segment), then "HOW does this customer respond?" (persona).
+
+        recov_tier   = row.get("recoverability_tier",  "TIER_3_LOW")
+        seg          = row.get("signal_segment",        "D")
+        persona      = row.get("behavioural_persona",   "Unknown")
         aid          = row.get("account_id")
+        alpha        = self.action_alphas.get(seg, 2.5)
 
-        # ── Combine segment strategy + persona modifier ────────────────────────
-        # Segment defines the baseline objective and action set.
-        # Persona refines the discount tolerance and action eligibility.
-        strategy     = SEGMENT_STRATEGY.get(seg, SEGMENT_STRATEGY["B"])
+        # Layer 1: Recoverability tier sets primary constraints
+        recov_strat  = RECOVERABILITY_STRATEGY.get(recov_tier, RECOVERABILITY_STRATEGY["TIER_3_LOW"])
+        erv_horizon  = recov_strat["erv_horizon_days"]   # None = TIER_4, no ERV
+        disc_max     = recov_strat["discount_max"]
+
+        # TIER_4: no action, no ERV — return HOLD immediately
+        if erv_horizon is None:
+            return {
+                "action": "HOLD", "d_optimal": 0.0,
+                "erv_net": 0.0, "erv_gross": 0.0,
+                "action_cost": 0, "tau": 1.0,
+                "erv_by_action": {"HOLD": 0.0},
+                "erv_horizon_days": None,
+                "recoverability_tier": recov_tier,
+            }
+
+        # Select propensity aligned to ERV horizon
+        if erv_horizon <= 90:
+            p_primary = row.get("propensity_90d",  row.get("propensity_30d", 0.0)) or 0.0
+        elif erv_horizon <= 180:
+            p_primary = row.get("propensity_180d", 0.0) or 0.0
+        else:
+            p_primary = row.get("propensity_180d", 0.0) or 0.0   # use 180d as proxy for 360d
+        p30  = row.get("propensity_30d",  0.0) or 0.0
+        p180 = row.get("propensity_180d", 0.0) or 0.0
+
+        # Layer 2: Signal segment sets discount penalty (confidence modifier)
+        seg_strat    = SEGMENT_STRATEGY.get(seg, SEGMENT_STRATEGY["B"])
+        disc_penalty = recov_strat["discount_penalty"] * seg_strat["discount_penalty"]
+
+        # Layer 3: Persona refines discount tolerance
         modifier     = PERSONA_STRATEGY_MODIFIER.get(persona, PERSONA_STRATEGY_MODIFIER["Unknown"])
+        disc_penalty = disc_penalty * modifier["discount_penalty_multiplier"]
 
-        # Apply persona modifier to discount_penalty
-        disc_penalty = strategy["discount_penalty"] * modifier["discount_penalty_multiplier"]
-
-        # Merge allowed_actions: start from segment, add persona extras, remove persona forces
+        # Final allowed_actions: recoverability tier is authoritative
+        # Persona can only REMOVE actions (force_remove), never ADD beyond tier's set
         allowed = (
-            strategy["allowed_actions"] | modifier["extra_actions_allowed"]
+            recov_strat["allowed_actions"] | modifier["extra_actions_allowed"]
         ) - modifier["actions_force_remove"]
 
         # E(recovery_amount) per horizon — from AmountModelTrainer or fallback
@@ -654,36 +740,45 @@ class ModelAgent(BaseAgent):
             "d_optimal": 0.0, "action_cost": 0,
         }
 
-        # ── DIGITAL_NUDGE — P_1M + amount_30d ────────────────────────────────
+        # ── Action ERV computation aligned to recoverability horizon ─────────
+        # p_primary is aligned to the ERV horizon for this tier:
+        #   TIER_1 (90d)  → propensity_90d
+        #   TIER_2 (180d) → propensity_180d
+        #   TIER_3 (360d) → propensity_180d (proxy; 360d model not yet available)
+        # Using the tier-aligned propensity prevents TIER_3 from appearing
+        # profitable at 30d when 360d recovery probability is actually very low.
+
+        # ── DIGITAL_NUDGE — tier-aligned propensity ───────────────────────────
         if "DIGITAL_NUDGE" in allowed:
             erv_by_action["DIGITAL_NUDGE"] = self._best_discounted_erv(
-                p_base=p30, balance=amount_30d, alpha=alpha * 0.5,
+                p_base=p_primary * 0.8, balance=amount_30d, alpha=alpha * 0.5,
                 action="DIGITAL_NUDGE", elast_curves=elast_curves,
-                discount_penalty=disc_penalty,
+                discount_penalty=disc_penalty, discount_cap=disc_max,
             )
 
-        # ── AGENT_CALL — P_1M + amount_30d ───────────────────────────────────
+        # ── AGENT_CALL — tier-aligned propensity ─────────────────────────────
         if "AGENT_CALL" in allowed:
             erv_by_action["AGENT_CALL"] = self._best_discounted_erv(
-                p_base=p30, balance=amount_30d, alpha=alpha,
+                p_base=p_primary, balance=amount_30d, alpha=alpha,
                 action="AGENT_CALL", elast_curves=elast_curves,
-                discount_penalty=disc_penalty,
+                discount_penalty=disc_penalty, discount_cap=disc_max,
             )
 
-        # ── AGENCY — P_6M + amount_180d, evaluated before LEGAL ──────────────
+        # ── AGENCY — P_6M + amount_180d ───────────────────────────────────────
         if "AGENCY" in allowed:
             erv_by_action["AGENCY"] = self._best_discounted_erv(
                 p_base=p180 * 0.6, balance=amount_180d, alpha=alpha * 1.2,
                 action="AGENCY", elast_curves=elast_curves,
-                discount_penalty=disc_penalty,
+                discount_penalty=disc_penalty, discount_cap=disc_max,
             )
 
         # ── LEGAL — P_6M + amount_180d, escalation only ──────────────────────
-        if "LEGAL" in allowed:
+        # Legal eligible only for TIER_3 with high balance, per RECOVERABILITY_STRATEGY
+        if "LEGAL" in allowed and recov_strat.get("legal_eligible", False):
             erv_by_action["LEGAL"] = self._best_discounted_erv(
                 p_base=p180 * 0.4, balance=amount_180d, alpha=0.5,
                 action="LEGAL", elast_curves=elast_curves,
-                discount_penalty=disc_penalty,
+                discount_penalty=disc_penalty, discount_cap=disc_max,
             )
 
         # ── Agency-first: LEGAL must beat AGENCY by threshold ─────────────────
@@ -707,12 +802,14 @@ class ModelAgent(BaseAgent):
         best        = erv_by_action[best_action]
 
         return {
-            "action":       best_action,
-            "d_optimal":    best["d_optimal"],
-            "erv_net":      best["erv_net"],
-            "erv_gross":    best["erv_gross"],
-            "action_cost":  best["action_cost"],
-            "tau":          tau,
+            "action":               best_action,
+            "d_optimal":            best["d_optimal"],
+            "erv_net":              best["erv_net"],
+            "erv_gross":            best["erv_gross"],
+            "action_cost":          best["action_cost"],
+            "tau":                  tau,
+            "erv_horizon_days":     erv_horizon,
+            "recoverability_tier":  recov_tier,
             "erv_by_action": {
                 a: round(erv_by_action[a]["erv_net"], 2)
                 for a in erv_by_action
@@ -727,6 +824,7 @@ class ModelAgent(BaseAgent):
         action: str,
         elast_curves: dict = None,
         discount_penalty: float = 1.0,
+        discount_cap: float = 0.60,
     ) -> dict:
         """
         Finds d in DISCOUNT_GRID that maximises net ERV for a given action.

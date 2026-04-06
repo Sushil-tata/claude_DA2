@@ -126,6 +126,7 @@ import pandas as pd
 from agents.base_agent import AgentBlockedException, BaseAgent
 import importlib.util as _ilu
 import pathlib as _pl
+
 _pct_spec = _ilu.spec_from_file_location(
     "persona_cluster_trainer",
     _pl.Path(__file__).parent.parent / "models" / "persona_cluster_trainer.py",
@@ -134,6 +135,14 @@ _pct_mod = _ilu.module_from_spec(_pct_spec)
 _pct_spec.loader.exec_module(_pct_mod)
 PersonaClusterTrainer = _pct_mod.PersonaClusterTrainer
 
+_rcs_spec = _ilu.spec_from_file_location(
+    "recoverability_segmenter",
+    _pl.Path(__file__).parent.parent / "models" / "recoverability_segmenter.py",
+)
+_rcs_mod = _ilu.module_from_spec(_rcs_spec)
+_rcs_spec.loader.exec_module(_rcs_mod)
+RecoverabilitySegmenter = _rcs_mod.RecoverabilitySegmenter
+
 logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -141,9 +150,10 @@ logger = logging.getLogger(__name__)
 # See CONFIGURATION INSTRUCTIONS above before changing this value.
 DEFAULT_BUREAU_SIGNAL_LAG_DAYS = 60
 
-DEFAULT_PERSONA_MODEL_DIR     = Path(os.environ.get("PERSONA_MODEL_DIR",     "models/persona_clusters"))
-DEFAULT_WILLINGNESS_MODEL_DIR = Path(os.environ.get("WILLINGNESS_MODEL_DIR", "models/willingness_model"))
-DEFAULT_CAPACITY_MODEL_DIR    = Path(os.environ.get("CAPACITY_MODEL_DIR",    "models/capacity_model"))
+DEFAULT_PERSONA_MODEL_DIR         = Path(os.environ.get("PERSONA_MODEL_DIR",         "models/persona_clusters"))
+DEFAULT_WILLINGNESS_MODEL_DIR     = Path(os.environ.get("WILLINGNESS_MODEL_DIR",     "models/willingness_model"))
+DEFAULT_CAPACITY_MODEL_DIR        = Path(os.environ.get("CAPACITY_MODEL_DIR",        "models/capacity_model"))
+DEFAULT_RECOVERABILITY_MODEL_DIR  = Path(os.environ.get("RECOVERABILITY_MODEL_DIR",  "models/recoverability"))
 
 # Enterprise feature table — set via env var or constructor param.
 # This is the Delta table your DS team writes 100+ features to.
@@ -186,12 +196,13 @@ class FeatureAgent(BaseAgent):
         execution_date: str,
         memory,
         dry_run: bool = False,
-        bureau_signal_lag_days: int    = DEFAULT_BUREAU_SIGNAL_LAG_DAYS,
-        persona_model_dir: Path        = DEFAULT_PERSONA_MODEL_DIR,
-        willingness_model_dir: Path    = DEFAULT_WILLINGNESS_MODEL_DIR,
-        capacity_model_dir: Path       = DEFAULT_CAPACITY_MODEL_DIR,
-        enterprise_feature_table: str  = DEFAULT_ENTERPRISE_FEATURE_TABLE,
-        enterprise_join_keys: list     = None,
+        bureau_signal_lag_days: int       = DEFAULT_BUREAU_SIGNAL_LAG_DAYS,
+        persona_model_dir: Path           = DEFAULT_PERSONA_MODEL_DIR,
+        willingness_model_dir: Path       = DEFAULT_WILLINGNESS_MODEL_DIR,
+        capacity_model_dir: Path          = DEFAULT_CAPACITY_MODEL_DIR,
+        recoverability_model_dir: Path    = DEFAULT_RECOVERABILITY_MODEL_DIR,
+        enterprise_feature_table: str     = DEFAULT_ENTERPRISE_FEATURE_TABLE,
+        enterprise_join_keys: list        = None,
     ):
         """
         Args:
@@ -220,6 +231,10 @@ class FeatureAgent(BaseAgent):
                                       Set ENTERPRISE_FEATURE_TABLE env var to
                                       configure without code changes.
                                       Leave None to skip the join.
+            recoverability_model_dir: Fitted RecoverabilitySegmenter model directory.
+                                      Rule-based scoring is used automatically if
+                                      no model exists (cold start safe).
+                                      Set RECOVERABILITY_MODEL_DIR env var.
             enterprise_join_keys:     Columns to join on between model_scores
                                       and enterprise_feature_table.
                                       Default: ['account_id', 'score_date'].
@@ -231,15 +246,21 @@ class FeatureAgent(BaseAgent):
             memory=memory,
             dry_run=dry_run,
         )
-        self.bureau_signal_lag_days    = bureau_signal_lag_days
-        self.persona_model_dir         = Path(persona_model_dir)
-        self.willingness_model_dir     = Path(willingness_model_dir)
-        self.capacity_model_dir        = Path(capacity_model_dir)
-        self.enterprise_feature_table  = enterprise_feature_table
-        self.enterprise_join_keys      = enterprise_join_keys or DEFAULT_ENTERPRISE_JOIN_KEYS
-        self._persona_trainer          = PersonaClusterTrainer(model_dir=self.persona_model_dir)
-        self._willingness_trainer      = None
-        self._capacity_trainer         = None
+        self.bureau_signal_lag_days       = bureau_signal_lag_days
+        self.persona_model_dir            = Path(persona_model_dir)
+        self.willingness_model_dir        = Path(willingness_model_dir)
+        self.capacity_model_dir           = Path(capacity_model_dir)
+        self.recoverability_model_dir     = Path(recoverability_model_dir)
+        self.enterprise_feature_table     = enterprise_feature_table
+        self.enterprise_join_keys         = enterprise_join_keys or DEFAULT_ENTERPRISE_JOIN_KEYS
+        self._persona_trainer             = PersonaClusterTrainer(model_dir=self.persona_model_dir)
+        self._recoverability_segmenter    = RecoverabilitySegmenter(
+            model_dir=self.recoverability_model_dir
+            if (self.recoverability_model_dir / "recoverability_model.pkl").exists()
+            else None
+        )
+        self._willingness_trainer         = None
+        self._capacity_trainer            = None
         self._try_load_score_models()
         self.log(
             f"bureau_signal_lag_days={self.bureau_signal_lag_days} | "
@@ -496,6 +517,19 @@ class FeatureAgent(BaseAgent):
             lambda r: self._signal_segment(r, self.bureau_signal_lag_days), axis=1
         )
 
+        # ── Derive RECOVERABILITY_TIER (primary strategic segmentation) ───────
+        # This is the most important segmentation for charge-off portfolios.
+        # It answers: "Is this account structurally recoverable and through
+        # what mechanism?" — BEFORE asking "how does this customer behave?"
+        #
+        # Uses: pre-CO DPD trajectory + bureau structural position +
+        #       payment history + post-CO engagement.
+        # Rule-based by default (cold-start safe). Model-based when
+        # RecoverabilitySegmenter.fit(df_with_outcomes) has been run.
+        #
+        # Configure: RECOVERABILITY_MODEL_DIR env variable.
+        df = self._derive_recoverability(df)
+
         # ── Derive BEHAVIOURAL_PERSONA (cluster model; rule-based fallback) ───
         # predict_with_confidence returns both persona label and confidence ratio
         persona_result = self._derive_persona(df)
@@ -536,25 +570,36 @@ class FeatureAgent(BaseAgent):
         if not self.dry_run:
             self.memory.write("feature_output", df)
 
-        signal_dist  = df["signal_segment"].value_counts().to_dict()
-        persona_dist = df["behavioural_persona"].value_counts().to_dict()
-        n_vulnerable = int(df["vulnerable_flag"].sum()) if "vulnerable_flag" in df.columns else 0
-        mean_confidence = round(float(df["persona_confidence"].mean()), 3) \
-            if "persona_confidence" in df.columns else None
+        signal_dist          = df["signal_segment"].value_counts().to_dict()
+        persona_dist         = df["behavioural_persona"].value_counts().to_dict()
+        recov_tier_dist      = df["recoverability_tier"].value_counts().to_dict() \
+                               if "recoverability_tier" in df.columns else {}
+        n_vulnerable         = int(df["vulnerable_flag"].sum()) \
+                               if "vulnerable_flag" in df.columns else 0
+        mean_confidence      = round(float(df["persona_confidence"].mean()), 3) \
+                               if "persona_confidence" in df.columns else None
+        n_tier1              = int((df.get("recoverability_tier", "") == "TIER_1_HIGH").sum())
+        n_tier4              = int((df.get("recoverability_tier", "") == "TIER_4_DORMANT").sum())
+
         self.log(
             f"Feature output ready | rows={len(df):,} | "
             f"signal_segments={signal_dist} | personas={persona_dist} | "
+            f"recoverability={recov_tier_dist} | "
+            f"tier1_high={n_tier1:,} | tier4_dormant={n_tier4:,} | "
             f"vulnerable={n_vulnerable:,} | persona_confidence_mean={mean_confidence}"
         )
         return {
-            "rows_written":              len(df),
-            "feature_columns":           len(df.columns),
-            "erv_band_dist":             df["erv_band"].value_counts().to_dict(),
-            "recovery_tier_dist":        df["recovery_tier"].value_counts().to_dict(),
-            "signal_segment_dist":       signal_dist,
-            "behavioural_persona_dist":  persona_dist,
-            "vulnerable_accounts":       n_vulnerable,
-            "persona_confidence_mean":   mean_confidence,
+            "rows_written":                len(df),
+            "feature_columns":             len(df.columns),
+            "erv_band_dist":               df["erv_band"].value_counts().to_dict(),
+            "recovery_tier_dist":          df["recovery_tier"].value_counts().to_dict(),
+            "signal_segment_dist":         signal_dist,
+            "behavioural_persona_dist":    persona_dist,
+            "recoverability_tier_dist":    recov_tier_dist,
+            "tier1_high_accounts":         n_tier1,
+            "tier4_dormant_accounts":      n_tier4,
+            "vulnerable_accounts":         n_vulnerable,
+            "persona_confidence_mean":     mean_confidence,
         }
 
     # ── SIGNAL_SEGMENT derivation ─────────────────────────────────────────────
@@ -612,6 +657,62 @@ class FeatureAgent(BaseAgent):
         if not has_cardx and has_bureau:
             return "C"
         return "D"
+
+    # ── RECOVERABILITY_TIER derivation ────────────────────────────────────────
+
+    def _derive_recoverability(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Derives RECOVERABILITY_TIER, RECOVERABILITY_SCORE, RECOVERABILITY_SUBTYPE,
+        and the four scoring dimension scores.
+
+        This is the PRIMARY STRATEGIC segmentation for charge-off accounts.
+        It is derived BEFORE BEHAVIOURAL_PERSONA and drives:
+          - ERV optimisation horizon (90d / 180d / 360d / none)
+          - Agency placement eligibility
+          - Discount range constraints
+          - Legal queue routing
+
+        Columns added to df:
+            recoverability_tier      — TIER_1_HIGH / TIER_2_MODERATE /
+                                       TIER_3_LOW / TIER_4_DORMANT
+            recoverability_score     — int 0–12 (total of four dimensions)
+            recov_dim1_trajectory    — DPD trajectory dimension (0–3)
+            recov_dim2_payment       — Pre-CO payment engagement (0–3)
+            recov_dim3_bureau        — External bureau capacity (0–3)
+            recov_dim4_post_co       — Post-charge-off engagement (0–3)
+            recoverability_subtype   — Profile name (e.g. SHOCK_RECOVERY)
+            recoverability_drivers   — Pipe-separated top factors
+
+        Falls back gracefully if scoring fails — defaults to TIER_3_LOW.
+        """
+        df = df.copy()
+        try:
+            tier_df = self._recoverability_segmenter.score(df)
+            for col in tier_df.columns:
+                df[col] = tier_df[col].values
+
+            tier_dist   = df["recoverability_tier"].value_counts().to_dict()
+            subtype_dist = df["recoverability_subtype"].value_counts().to_dict()
+            self.log(
+                f"Recoverability tiers: {tier_dist} | "
+                f"subtypes: {subtype_dist} | "
+                f"mean_score={df['recoverability_score'].mean():.1f}"
+            )
+        except Exception as e:
+            self.log(
+                f"Recoverability scoring failed: {e} — defaulting to TIER_3_LOW. "
+                "Check that pre-CO trajectory features are present in feature_output.",
+                level="warning",
+            )
+            df["recoverability_tier"]    = "TIER_3_LOW"
+            df["recoverability_score"]   = 2
+            df["recoverability_subtype"] = "FALLBACK"
+            df["recoverability_drivers"] = "scoring_error"
+            for col in ["recov_dim1_trajectory", "recov_dim2_payment",
+                        "recov_dim3_bureau", "recov_dim4_post_co"]:
+                df[col] = 0
+
+        return df
 
     # ── BEHAVIOURAL_PERSONA derivation ────────────────────────────────────────
 
