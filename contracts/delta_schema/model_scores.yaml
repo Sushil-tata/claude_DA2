@@ -1,0 +1,168 @@
+# Delta Lake Schema Contract: recovery.model_scores
+# Written by: recovery-engine-v2
+# Read by:    Feature Agent, Model Agent, Constraint Agent, Decision Agent, Explain Agent
+# Version:    1.0.0
+
+table: recovery.model_scores
+partition_by: score_date
+primary_key: [account_id, score_date]
+
+columns:
+  account_id:
+    type: string
+    nullable: false
+    pii: false
+    description: Anonymised account identifier — safe to pass to claude_reasoner
+
+  score_date:
+    type: date
+    nullable: false
+    description: Date the scoring run was executed (partition key)
+
+  signal_quadrant:
+    type: string
+    nullable: false
+    enum: [A, B, C, D]
+    description: >
+      A = High propensity + High ERV (prioritise with settlement offer)
+      B = High propensity + Low ERV  (digital self-serve nudge)
+      C = Low propensity  + High ERV (agent call + escalation)
+      D = Low propensity  + Low ERV  (hold / monitor only)
+
+  segment_label:
+    type: string
+    nullable: true
+    description: Behavioural segment name. Null for Quadrant D (insufficient signal)
+
+  propensity_30d:
+    type: float
+    range: [0.0, 1.0]
+    nullable: false
+
+  propensity_90d:
+    type: float
+    range: [0.0, 1.0]
+    nullable: false
+
+  propensity_180d:
+    type: float
+    range: [0.0, 1.0]
+    nullable: false
+
+  low_confidence_flag:
+    type: boolean
+    nullable: false
+    description: True when model confidence is low (always True for Quadrant D)
+
+  # Settlement discount elasticity grid
+  e_amount_d20:
+    type: float
+    range: [0.0, 1.0]
+    nullable: true
+    description: E[Recovery Amount | 20% discount offered] as fraction of outstanding balance
+
+  e_amount_d30:
+    type: float
+    range: [0.0, 1.0]
+    nullable: true
+
+  e_amount_d40:
+    type: float
+    range: [0.0, 1.0]
+    nullable: true
+
+  e_amount_d50:
+    type: float
+    range: [0.0, 1.0]
+    nullable: true
+
+  e_amount_d60:
+    type: float
+    range: [0.0, 1.0]
+    nullable: true
+
+  p_accept_d20:
+    type: float
+    range: [0.0, 1.0]
+    nullable: true
+    description: P(customer accepts | discount = 20%) from elasticity model
+
+  p_accept_d30:
+    type: float
+    range: [0.0, 1.0]
+    nullable: true
+
+  p_accept_d40:
+    type: float
+    range: [0.0, 1.0]
+    nullable: true
+
+  p_accept_d50:
+    type: float
+    range: [0.0, 1.0]
+    nullable: true
+
+  p_accept_d60:
+    type: float
+    range: [0.0, 1.0]
+    nullable: true
+
+  erv_d20:
+    type: float
+    nullable: true
+    description: Expected Recovery Value at 20% discount (THB)
+
+  erv_d30:
+    type: float
+    nullable: true
+
+  erv_d40:
+    type: float
+    nullable: true
+
+  erv_d50:
+    type: float
+    nullable: true
+
+  erv_d60:
+    type: float
+    nullable: true
+
+  d_optimal:
+    type: float
+    range: [0.20, 0.65]
+    nullable: false
+    description: Recommended discount level that maximises ERV
+
+  erv_at_d_optimal:
+    type: float
+    nullable: false
+    description: ERV at the recommended discount (THB)
+
+  model_version:
+    type: string
+    nullable: false
+    description: MLflow model version tag e.g. recovery-engine-v2.1.3
+
+  experiment_id:
+    type: string
+    nullable: false
+    description: MLflow experiment ID for this scoring run
+
+# PII policy
+pii_blacklist:
+  - name
+  - phone
+  - phone_number
+  - mobile
+  - address
+  - national_id
+  - id_card
+  - passport
+  - email
+  - date_of_birth
+  - dob
+  description: >
+    NONE of the above columns may appear in this table.
+    account_id is an anonymised surrogate key and is permitted.
+    claude_reasoner.py enforces this at runtime before any API call.
