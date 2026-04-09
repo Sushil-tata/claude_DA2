@@ -90,6 +90,24 @@ DEFAULT_MIN_PAIRWISE_RECOVERY_DIFF = 0.05   # 5pp on recovery_180d
 DEFAULT_MIN_CLUSTER_SIZE_PCT       = 0.05   # 5% of segment
 DEFAULT_STAT_ALPHA                 = 0.05
 
+# Item 4: explicit minimum stability threshold (≥70% of accounts must retain
+# the same persona month-over-month for clusters to be considered stable).
+MIN_STABILITY_THRESHOLD = 0.70
+
+# Item 8: minimum acceptable Spearman rank-order correlation between cluster
+# composite rank (1=High-Engagement, 4=Dormant) and mean recovery_180d.
+# Expected direction: negative (rank 1 = highest recovery, rank 4 = lowest).
+# We check |correlation| > threshold — direction validated separately.
+MIN_RANK_ORDER_SPEARMAN = 0.50
+
+# Persona label → rank position (1=best, 4=worst) for rank-order validation.
+PERSONA_RANK_POSITIONS = {
+    "High-Engagement Chronic":  1,
+    "Sudden-Shock Distressed":  2,
+    "Structural Defaulter":     3,
+    "Dormant":                  4,
+}
+
 
 class ClusterBusinessValidator:
 
@@ -288,6 +306,49 @@ class ClusterBusinessValidator:
                 f"Difference is statistically significant but economically trivial."
             )
 
+        # ── Check 5: Rank-order Spearman (Item 8) ────────────────────────────
+        # The composite cluster ranking (High-Engagement=1 … Dormant=4) must be
+        # MONOTONICALLY aligned with recovery_180d.  A rank-1 cluster with lower
+        # recovery than a rank-3 cluster means the composite formula is mis-ranked.
+        # We compute Spearman(rank_position, mean_recovery_180d) and require
+        # |rho| > MIN_RANK_ORDER_SPEARMAN (0.50).  Expected direction: negative
+        # (lower rank-position number = higher recovery).
+        spearman_rho      = None
+        spearman_passed   = True
+        clusters_with_rank = {
+            c: PERSONA_RANK_POSITIONS[c]
+            for c in clusters
+            if c in PERSONA_RANK_POSITIONS
+        }
+        if len(clusters_with_rank) >= 2 and self.primary_metric in df.columns:
+            rank_positions  = []
+            mean_recoveries = []
+            for c, pos in clusters_with_rank.items():
+                vals = df.loc[df[cluster_col] == c, self.primary_metric].dropna()
+                if len(vals) >= 5:
+                    rank_positions.append(pos)
+                    mean_recoveries.append(float(vals.mean()))
+
+            if len(rank_positions) >= 2:
+                rho, _ = stats.spearmanr(rank_positions, mean_recoveries)
+                spearman_rho = round(float(rho), 4)
+                # Expect negative rho (rank 1 = highest recovery); check |rho| >= threshold
+                spearman_passed = abs(spearman_rho) >= MIN_RANK_ORDER_SPEARMAN
+                if not spearman_passed:
+                    failure_reasons.append(
+                        f"Rank-order Spearman check FAILED: |rho| = {abs(spearman_rho):.3f} "
+                        f"< {MIN_RANK_ORDER_SPEARMAN}. Cluster composite ranking is not "
+                        f"monotonically aligned with {self.primary_metric}. "
+                        f"Inspect _assign_persona_labels composite weights."
+                    )
+                elif spearman_rho > 0:
+                    # rho positive = higher rank-position → higher recovery (inverted)
+                    logger.warning(
+                        f"[Segment {seg_label}] Spearman rho={spearman_rho:.3f} is positive: "
+                        f"Dormant cluster has higher recovery than High-Engagement. "
+                        f"Composite ranking direction may be inverted."
+                    )
+
         # ── Determine recommendation ──────────────────────────────────────────
         passed = len(failure_reasons) == 0
 
@@ -322,6 +383,8 @@ class ClusterBusinessValidator:
             "primary_metric_by_cluster":   primary_by_cluster,
             "max_pairwise_diff":           round(max_pairwise_diff, 4),
             "cohens_d":                    round(cohens_d, 4),
+            "spearman_rank_rho":           spearman_rho,          # Item 8
+            "spearman_rank_passed":        spearman_passed,        # Item 8
             "stat_test_results":           stat_results,
             "cluster_sizes":               cluster_sizes,
             "cluster_profiles":            profiles.to_dict(),
@@ -382,11 +445,15 @@ class ClusterBusinessValidator:
         df_t2: pd.DataFrame,
         cluster_col: str = "behavioural_persona",
         id_col:      str = "account_id",
-        max_transition_pct: float = 0.30,
+        max_transition_pct: float = 1.0 - MIN_STABILITY_THRESHOLD,
     ) -> dict:
         """
         Validates cluster stability between two time periods by computing
         a persona transition matrix on accounts present in both periods.
+
+        Stability threshold (Item 4): ≥70% of accounts must retain the same
+        persona month-over-month (MIN_STABILITY_THRESHOLD = 0.70).
+        Default max_transition_pct = 0.30 enforces this threshold.
 
         Why this matters:
           Good behavioural clusters should be relatively stable — a customer
@@ -404,7 +471,7 @@ class ClusterBusinessValidator:
             id_col:              Account identifier column for the join.
             max_transition_pct:  Maximum acceptable fraction of accounts that
                                  changed persona between t1 and t2.
-                                 Default: 0.30 (30% churn threshold).
+                                 Default: 1 - MIN_STABILITY_THRESHOLD = 0.30.
 
         Returns:
             dict with:
@@ -476,19 +543,21 @@ class ClusterBusinessValidator:
                 }
 
         # ── Overall stability ─────────────────────────────────────────────────
-        n_stable         = int((merged["persona_t1"] == merged["persona_t2"]).sum())
+        n_stable          = int((merged["persona_t1"] == merged["persona_t2"]).sum())
         overall_stability = round(float(n_stable / n_matched), 4)
-        passed           = overall_stability >= (1.0 - max_transition_pct)
+        stability_threshold = 1.0 - max_transition_pct   # ≥70% per MIN_STABILITY_THRESHOLD
+        passed            = overall_stability >= stability_threshold
 
         if passed:
             recommendation = (
-                f"STABLE — {overall_stability:.1%} of accounts kept same persona. "
+                f"STABLE — {overall_stability:.1%} of accounts kept same persona "
+                f"(threshold ≥{stability_threshold:.0%}). "
                 f"Clusters represent stable behavioural identity."
             )
         else:
             recommendation = (
                 f"UNSTABLE — only {overall_stability:.1%} kept same persona "
-                f"(threshold: {1 - max_transition_pct:.1%}). "
+                f"(required ≥{stability_threshold:.0%}, Item 4 threshold). "
                 f"Investigate: (1) are outcome proxies in CLUSTER_FEATURES? "
                 f"(2) population drift? (3) insufficient cluster data?"
             )

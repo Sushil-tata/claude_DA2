@@ -166,7 +166,6 @@ CLUSTER_FEATURES = [
     "first_delinquency_months_ago",   # age of problem — fresh vs chronic defaulter
 
     # ── Group B: Payment Behaviour and Trajectory (pre-charge-off) ───────────
-    # Direction and quality of payment, not just current state.
     "payment_ratio_trend_6m",         # slope of payment/balance ratio over 6M
     "payment_velocity_3m",            # rate of change in payment amount
     "payment_acceleration_3m",        # second derivative of payment amounts
@@ -174,10 +173,12 @@ CLUSTER_FEATURES = [
     "avg_payment_ratio_12m",          # average payment coverage — structural capacity
     "payment_decay_ratio",            # avg_payment_last_3M / avg_payment_6to12M
     "last_payment_months_before_co",  # recency of last payment before CO
-    "PTP_kept_rate_12m",              # % of promises-to-pay kept — stable trait
+    "PTP_kept_rate_12m",              # % of promises-to-pay kept in 12M — stable trait
     "PTP_broken_rate_12m",            # % broken — strategic vs distressed defaulter
     "payment_count_last_12m_pre_co",  # count of payments in final 12M
-    "self_initiated_contact_ratio_12m",  # % contacts that were customer-initiated
+    # self_initiated_contact_ratio_12m REMOVED — denominator includes all contacts,
+    # so higher bank outreach deflates ratio even if customer behaviour unchanged.
+    # Item 9 verdict: policy-influenced → removed.
 
     # ── Group C: Credit Utilisation and Financial Position ───────────────────
     "utilization_trend_6m",           # slope of utilisation over 6M
@@ -199,29 +200,46 @@ CLUSTER_FEATURES = [
     "bureau_total_debt",              # total outstanding debt — structural burden
     "bureau_enquiry_velocity_3m",     # credit enquiry rate — financial search pre-CO
 
-    # ── Group E: Early Post-CO Signals (reduced per Amendment 3) ────────────
-    # Only purely customer-initiated signals. rpc_in_first_30d and
-    # days_to_first_rpc removed: both depend on outreach volume (policy-driven).
-    "paid_in_first_30d",              # binary: any payment in first 30 days post-CO
-    "paid_in_first_60d",              # binary: any payment in first 60 days post-CO
-    "days_to_first_payment",          # speed of payment post-CO (null → 999)
+    # ── Group E: REMOVED in Phase 1 (Item 2) ─────────────────────────────────
+    # paid_in_first_30d, paid_in_first_60d, days_to_first_payment removed.
+    # Even purely customer-initiated early payment is too close to the outcome
+    # label (recovery_180d) — it turns clustering into early-payer vs non-payer,
+    # which is a propensity proxy. Reintroduce in Phase 2 with explicit controls
+    # (propensity-residualised or as a separate stratification step).
+
+    # ── Group F: Exposure Dimension (Item 3) ──────────────────────────────────
+    # Absolute exposure matters for strategy — a THB 5k dormant account and a
+    # THB 500k dormant account require completely different treatment economics.
+    # Derived in _prepare_features() if not already present.
+    "log_balance_at_co",              # log(1 + outstanding_balance_at_co) — heavy tail
+    "balance_bucket",                 # ordinal bucket: 0–5k/5–20k/20–50k/50–100k/100k+
+
+    # ── Group G: Affordability Proxy (Item 6) ────────────────────────────────
+    # Ratio of payment capacity to total debt burden — structural affordability signal.
+    # Derived in _prepare_features() if not already present.
+    "payment_to_debt_ratio",          # avg_payment_12m / (bureau_total_debt + 1)
+
+    # ── Multicollinearity note (Item 7) ──────────────────────────────────────
+    # Highly correlated features (r > 0.8) are dropped in _prepare_features()
+    # before clustering. Typical culprits: months_in_s2 vs months_in_s3,
+    # avg_payment_ratio vs min_payment_ratio, ncb_total_delinquent_pct vs
+    # ncb_accounts_delinquent_count. PCA is available as use_pca=True flag
+    # but is NOT default — PCA centroids are uninterpretable in feature space.
 
     # ⚠ EXPLICITLY EXCLUDED:
-    #   rpc_in_first_30d              — Amendment 3: policy-driven (call volume dependent)
-    #   days_to_first_rpc             — Amendment 3: depends on how many times bank called
-    #   dpd_current                   — point-in-time, not trajectory
-    #   days_since_last_payment       — recent tactical signal → propensity only
-    #   contact_success_rate_3m       — correlated with propensity target → propensity
-    #   digital_open_rate_3m          — short-horizon → propensity only
-    #   broken_promise_count_3m       — 3M too short; use PTP_broken_rate_12m above
-    #   contact_attempts_total        — treatment intensity, not customer behaviour
-    #   days_since_last_offer         — treatment exposure → elasticity only
-    #   prior_discount_max            — governance matrix: Elast ✓, Seg ✗
-    #   n_prior_settlements_declined  — governance matrix: Elast ✓, Seg ✗
-    #   propensity_30d/90d/180d       — outcome proxies
-    #   willingness_score/capacity_score — deprecated
-    #   recoverability_tier           — model output (circular)
-    #   erv_at_d_optimal              — terminal output (never an input)
+    #   paid_in_first_30d/60d / days_to_first_payment — Group E removed Phase 1
+    #   self_initiated_contact_ratio_12m  — policy-influenced (Item 9)
+    #   rpc_in_first_30d / days_to_first_rpc  — Amendment 3
+    #   dpd_current                       — point-in-time severity
+    #   days_since_last_payment           — recent tactical → propensity only
+    #   contact_success_rate_3m           — propensity-correlated → propensity only
+    #   digital_open_rate_3m              — short-horizon → propensity only
+    #   contact_attempts_total            — treatment intensity
+    #   prior_discount_max                — Elast ✓, Seg ✗
+    #   n_prior_settlements_declined      — Elast ✓, Seg ✗
+    #   propensity_30d/90d/180d           — outcome proxies
+    #   recovery_30d/90d/180d             — target labels (never cluster on outcome)
+    #   erv_at_d_optimal                  — terminal output
 ]
 
 # Cluster label names assigned by behavioural composite rank (high → low).
@@ -253,6 +271,7 @@ HEAVY_TAILED_FEATURES: frozenset = frozenset({
     "cure_durability_avg_days",
     "cure_durability_min_days",
     "first_delinquency_months_ago",
+    "log_balance_at_co",   # Item 3 — log-transformed balance, heavy right tail
 })
 
 # Phase 1: binary split per Amendment 4.
@@ -539,6 +558,50 @@ class PersonaClusterTrainer:
                           "robust_cols": [...], "standard_cols": [...]}
         stored to ensure transform() at inference uses the same column split.
         """
+        df = df.copy()
+
+        # ── Derived features (Groups F and G) ────────────────────────────────
+        # Compute before selecting CLUSTER_FEATURES so derived cols are available.
+        if "log_balance_at_co" not in df.columns and "outstanding_balance_at_co" in df.columns:
+            df["log_balance_at_co"] = np.log1p(
+                df["outstanding_balance_at_co"].clip(lower=0).fillna(0)
+            )
+
+        if "balance_bucket" not in df.columns and "outstanding_balance_at_co" in df.columns:
+            df["balance_bucket"] = pd.cut(
+                df["outstanding_balance_at_co"].fillna(0),
+                bins=[0, 5_000, 20_000, 50_000, 100_000, np.inf],
+                labels=[0, 1, 2, 3, 4],
+                include_lowest=True,
+            ).astype(float)
+
+        if "payment_to_debt_ratio" not in df.columns:
+            avg_pay   = df.get("avg_payment_ratio_12m", pd.Series(0.0, index=df.index)).fillna(0)
+            total_debt = df.get("bureau_total_debt",    pd.Series(1.0, index=df.index)).fillna(1).clip(lower=1)
+            df["payment_to_debt_ratio"] = avg_pay / total_debt
+
+        # ── Per-account missingness check (Item 5) ───────────────────────────
+        # Accounts with too many null signal features are routed to rule-based
+        # Dormant assignment and excluded from clustering.
+        MISSINGNESS_THRESHOLD = 0.60   # >60% of clustering features null → fallback
+        cluster_cols = [c for c in CLUSTER_FEATURES if not c.startswith("#")]
+        null_fractions = df[
+            [c for c in cluster_cols if c in df.columns]
+        ].isnull().mean(axis=1)
+        high_missingness_mask = null_fractions > MISSINGNESS_THRESHOLD
+        if high_missingness_mask.any():
+            import warnings
+            warnings.warn(
+                f"_prepare_features: {high_missingness_mask.sum()} accounts "
+                f"exceed missingness threshold ({MISSINGNESS_THRESHOLD:.0%} null) "
+                "and will receive rule-based 'Dormant' assignment.",
+                UserWarning,
+                stacklevel=2,
+            )
+        # Store mask on df so caller can retrieve it; we still process all rows
+        # (missing values are imputed below) and callers can filter post-prediction.
+        df["_high_missingness"] = high_missingness_mask.astype(int)
+
         available = [c for c in CLUSTER_FEATURES if c in df.columns]
         X = df[available].copy()
 
@@ -547,10 +610,10 @@ class PersonaClusterTrainer:
         # Binary flags preserve the "never" signal after imputation.
         MISSING_INDICATOR_COLS = [
             "last_payment_months_before_co",  # null = never paid before CO
-            "days_to_first_payment",          # null = no payment post-CO
+            "days_to_first_payment",          # null = no payment post-CO (removed from features, kept for safety)
             "cure_durability_avg_days",       # null = account never cured
             "PTP_kept_rate_12m",              # null = no PTPs ever made
-            "self_initiated_contact_ratio_12m",  # null = no inbound contact history
+            # self_initiated_contact_ratio_12m removed (Item 9 — policy-influenced)
         ]
         for col in MISSING_INDICATOR_COLS:
             if col in X.columns:
@@ -584,7 +647,7 @@ class PersonaClusterTrainer:
             "PTP_kept_rate_12m":              0.0,   # no PTPs → 0% kept
             "PTP_broken_rate_12m":            0.0,   # no PTPs → 0% broken
             "payment_count_last_12m_pre_co":  0,
-            "self_initiated_contact_ratio_12m": 0.0,
+            # self_initiated_contact_ratio_12m removed (Item 9 — policy-influenced)
             # Group C — Utilisation
             "utilization_trend_6m":           0.0,
             "utilization_volatility_12m":     0.0,
@@ -615,6 +678,26 @@ class PersonaClusterTrainer:
                 X[col] = X[col].fillna(DOMAIN_FILL[col])
             else:
                 X[col] = X[col].fillna(X[col].median())
+
+        # ── Multicollinearity drop (Item 7, r > 0.8) ─────────────────────────
+        # Applied only during fit (scaler is None) so train/inference use the same
+        # column set. At inference, the saved scaler's feature_cols is the reference.
+        if scaler is None:
+            numeric_X = X[[c for c in X.columns if not c.startswith("_missing_")]]
+            corr_matrix = numeric_X.corr().abs()
+            upper = corr_matrix.where(
+                np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+            )
+            to_drop = [col for col in upper.columns if (upper[col] > 0.80).any()]
+            if to_drop:
+                import warnings
+                warnings.warn(
+                    f"_prepare_features: dropping {len(to_drop)} highly correlated "
+                    f"features (r > 0.80): {to_drop}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                X = X.drop(columns=to_drop)
 
         feature_cols = X.columns.tolist()
 
@@ -663,37 +746,82 @@ class PersonaClusterTrainer:
         self, df: pd.DataFrame, labels: np.ndarray
     ) -> dict:
         """
-        Ranks clusters by a BEHAVIOURAL composite score and maps to persona names.
+        Ranks clusters using a 3-component normalised composite (Item 1 — BLOCKER fix).
 
-        Composite (per master spec Section 2):
-            score = PTP_kept_rate_12m
-                  + (1 − delinquency_episode_count_24m / max_episodes)
-                  − PTP_broken_rate_12m
+        Components (each min-max normalised to [0, 1] before summing):
+
+          behavioural_score  = PTP_kept_rate_12m
+                               − PTP_broken_rate_12m
+                               − delinquency_episode_count_24m_normalised
+
+          capacity_score     = ncb_other_accounts_current   (normalised)
+                               + ncb_mortgage_current        (normalised)
+                               − ncb_total_revolving_util    (normalised)
+
+          trajectory_score   = −dpd_trajectory_slope_6m     (normalised)
+                               − dpd_acceleration_6m         (normalised)
+                               (negative because higher slope/accel = worse)
+
+          FINAL_SCORE = behavioural_score + capacity_score + trajectory_score
+
+        All three components are equally weighted initially.
+        Higher FINAL_SCORE → more engaged / more capacity → ranked higher.
 
         Rank 0 (highest) → High-Engagement Chronic
         Rank 1 → Sudden-Shock Distressed
         Rank 2 → Structural Defaulter
         Rank 3 → Dormant
 
-        Uses only long-horizon behavioural features (12–24M).
+        Uses only long-horizon behavioural + bureau features (12–24M).
         No propensity, no recovery outcome, no model scores.
         """
         df = df.copy()
         df["_cluster"] = labels
 
-        ptp_kept  = df.get("PTP_kept_rate_12m",             pd.Series(0.0, index=df.index)).fillna(0)
-        episodes  = df.get("delinquency_episode_count_24m", pd.Series(1.0, index=df.index)).fillna(1)
-        ptp_broken = df.get("PTP_broken_rate_12m",          pd.Series(0.0, index=df.index)).fillna(0)
+        def _norm(series: pd.Series) -> pd.Series:
+            """Min-max normalise to [0, 1]; returns 0.5 if constant."""
+            lo, hi = series.min(), series.max()
+            if hi == lo:
+                return pd.Series(0.5, index=series.index)
+            return (series - lo) / (hi - lo)
 
-        max_episodes = max(float(episodes.max()), 1.0)
+        def _get(col: str, default: float) -> pd.Series:
+            return df.get(col, pd.Series(default, index=df.index)).fillna(default)
 
-        df["_score"] = (
-            ptp_kept
-            + (1.0 - episodes / max_episodes)
-            - ptp_broken
+        # ── Behavioural component ─────────────────────────────────────────────
+        ptp_kept      = _get("PTP_kept_rate_12m",            0.0)
+        ptp_broken    = _get("PTP_broken_rate_12m",          0.0)
+        episodes      = _get("delinquency_episode_count_24m", 1.0)
+        episodes_norm = _norm(episodes)
+
+        behavioural_score = _norm(ptp_kept) - _norm(ptp_broken) - episodes_norm
+
+        # ── Capacity component (bureau) ───────────────────────────────────────
+        other_current   = _get("ncb_other_accounts_current", 0.0)
+        mortgage_curr   = _get("ncb_mortgage_current",       0.0)
+        revolving_util  = _get("ncb_total_revolving_util",   1.0)
+
+        capacity_score = (
+            _norm(other_current)
+            + _norm(mortgage_curr)
+            - _norm(revolving_util)
         )
 
-        cluster_means = df.groupby("_cluster")["_score"].mean().sort_values(ascending=False)
+        # ── Trajectory component ──────────────────────────────────────────────
+        # Higher slope/acceleration = deteriorating faster = WORSE → negate
+        dpd_slope = _get("dpd_trajectory_slope_6m", 0.0)
+        dpd_accel = _get("dpd_acceleration_6m",     0.0)
+
+        trajectory_score = -_norm(dpd_slope) - _norm(dpd_accel)
+
+        # ── Final composite ───────────────────────────────────────────────────
+        df["_final_score"] = behavioural_score + capacity_score + trajectory_score
+
+        cluster_means = (
+            df.groupby("_cluster")["_final_score"]
+            .mean()
+            .sort_values(ascending=False)
+        )
         n = min(len(cluster_means), len(PERSONA_RANK_LABELS))
         return {
             int(cluster): PERSONA_RANK_LABELS[rank]
