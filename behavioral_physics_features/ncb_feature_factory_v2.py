@@ -1009,30 +1009,39 @@ def build_physics_family_features(panel_df: DataFrame) -> DataFrame:
 def run_ncb_feature_factory_v2(
     spark: SparkSession,
     schema_name: str,
-    bridge_df: DataFrame
+    bridge_df: DataFrame,
+    cardx_monthly_df: Optional[DataFrame] = None,
+    cardx_first_delinquency_df: Optional[DataFrame] = None,
 ) -> DataFrame:
     """
     Main execution function - assembles all feature sets.
 
     Execution order:
-    1. load_bureau_tables
-    2. build_bureau_panel
-    3. build_dpd_states
-    4. build_payment_features
-    5. build_trajectory_features
-    6. build_lender_ecology_features
-    7. build_enquiry_features
-    8. build_advanced_physics_features
-    9. build_physics_family_features
-    10. Join all on ref_no
+    1.  load_bureau_tables
+    2.  build_bureau_panel
+    3.  build_dpd_states
+    4.  build_payment_features
+    5.  build_trajectory_features
+    6.  build_lender_ecology_features
+    7.  build_enquiry_features
+    8.  build_advanced_physics_features
+    9.  build_physics_family_features
+    10. run_stage_dynamics         (NEW — bureau_stage_dynamics.py)
+    11. Join all on ref_no
 
     Args:
-        spark: SparkSession
-        schema_name: NCB schema (e.g., "cdx_mdz_prd.cdx_persist_mnf_res_db")
-        bridge_df: Bridge DataFrame with ref_no, receive_dt, as_of_month
+        spark:                      SparkSession
+        schema_name:                NCB schema (e.g., "cdx_mdz_prd.cdx_persist_mnf_res_db")
+        bridge_df:                  Bridge DataFrame with ref_no, receive_dt, as_of_month
+        cardx_monthly_df:           Optional — CardX internal monthly DPD data.
+                                    If provided, enables cross-lender consistency features.
+                                    Required columns: ref_no, asofdate, cardx_dpd, cardx_state
+        cardx_first_delinquency_df: Optional — ref_no, cardx_first_delinquency_month.
+                                    Enables pre-existing bureau stress features.
 
     Returns:
-        Final DataFrame with ref_no, as_of_month, and ~377 features
+        Final DataFrame with ref_no, as_of_month, and ~500 features
+        (~377 original + ~120 stage dynamics)
     """
     print("="*80)
     print("NCB FEATURE FACTORY V2 - Single-File Architecture")
@@ -1078,8 +1087,20 @@ def run_ncb_feature_factory_v2(
     print("\n[9/10] Building physics family features...")
     family_features = build_physics_family_features(physics_features)
 
-    # 10. Join all feature sets
-    print("\n[10/10] Assembling final feature set...")
+    # 10. Stage dynamics (within-stage and cross-stage, bureau_stage_dynamics.py)
+    print("\n[10/11] Building stage dynamics (within-stage temporal features)...")
+    from behavioral_physics_features.bureau_stage_dynamics import run_stage_dynamics
+    stage_dynamics_features = run_stage_dynamics(
+        spark=spark,
+        state_df=dpd_states,
+        history_df=history,
+        account_df=account,
+        cardx_monthly_df=cardx_monthly_df,
+        cardx_first_delinquency_df=cardx_first_delinquency_df,
+    )
+
+    # 11. Join all feature sets
+    print("\n[11/11] Assembling final feature set...")
 
     # Start with panel
     final_df = panel.select(CFG["ref_col"], "as_of_month")
@@ -1088,11 +1109,12 @@ def run_ncb_feature_factory_v2(
     # Using left joins to preserve all customers
 
     feature_sets = [
-        (dpd_states, "DPD states"),
-        (payment_features, "Payment features"),
-        (lender_features, "Lender ecology"),
-        (enquiry_features, "Enquiry features"),
-        (family_features, "Physics families")
+        (dpd_states,             "DPD states"),
+        (payment_features,       "Payment features"),
+        (lender_features,        "Lender ecology"),
+        (enquiry_features,       "Enquiry features"),
+        (family_features,        "Physics families"),
+        (stage_dynamics_features,"Stage dynamics (NEW)"),
     ]
 
     for feature_df, feature_name in feature_sets:
