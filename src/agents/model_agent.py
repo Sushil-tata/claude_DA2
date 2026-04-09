@@ -140,159 +140,110 @@ ACTION_TO_CHANNEL = {
     "HOLD":          "HOLD",
 }
 
-# ── RECOVERABILITY STRATEGY (primary strategic axis — charge-off specific) ────
-# Keyed by RECOVERABILITY_TIER from RecoverabilitySegmenter.
-# This drives the ERV horizon, action eligibility, and discount range.
+# ── CLUSTER STRATEGY (primary strategic axis) ─────────────────────────────────
+# Keyed by behavioural_persona (cluster label from PersonaClusterTrainer).
+# Cluster label reflects the structural behavioural identity derived from
+# 12–24M pre-CO trajectory and bureau features — NOT short-term propensity.
 #
-# Design rule: RECOVERABILITY_TIER is the outermost decision layer.
-#   → It determines WHAT type of recovery is possible and over WHAT horizon.
-#   → SIGNAL_SEGMENT then calibrates model confidence and action cost tolerance.
-#   → BEHAVIOURAL_PERSONA refines discount tolerance and channel within the tier.
+# Three-layer resolution in _select_best_action:
+#   Layer 1: behavioural_persona → CLUSTER_STRATEGY (ERV horizon, action set, discount cap)
+#   Layer 2: signal_segment      → SEGMENT_CONFIDENCE_MODIFIER (discount penalty, cost tolerance)
+#   Layer 3: Dormant+LIMITED     → immediate HOLD override (no ERV, no spend)
 #
-# erv_horizon_days: propensity model horizon to use for this tier.
-#   TIER_1: 90d  — recoverable accounts respond quickly to the right action.
-#   TIER_2: 180d — moderate recovery needs more time, patient approach.
-#   TIER_3: 360d — low recovery; long-horizon settlement only viable option.
-#   TIER_4: None — no ERV calculation; stop spend.
+# erv_horizon_days: which propensity model to use.
+#   90d  → propensity_90d  (Sudden-Shock: responds quickly to right intervention)
+#   180d → propensity_180d (Chronic/Structural: longer time needed)
+#   360d → propensity_180d as proxy (Dormant: 360d model not yet built)
 #
-# discount_range: (min_discount, max_discount) enforced at action selection.
-#   TIER_1: cap at 35% — don't over-discount recoverable accounts (value leakage).
-#   TIER_2: up to 50% — flexible to unlock payment.
-#   TIER_3: up to 60% (BOT cap) — deep discount required for low-recovery accounts.
-#   TIER_4: no settlement offers.
+# Uplift note (Amendment 1): before any action, check uplift_score > threshold.
+#   High propensity + low uplift → SUPPRESS (account will self-cure).
+#   Low propensity + high uplift → PRIORITISE despite low propensity score.
+#   The CLUSTER_STRATEGY here governs action type; uplift governs whether to act at all.
 
-RECOVERABILITY_STRATEGY = {
-    "TIER_1_HIGH": {
-        "objective":         "maximise_recovery_speed",
-        "erv_horizon_days":  90,
-        "discount_penalty":  0.7,    # penalise high discount — these accounts will pay
-        "discount_max":      0.35,   # cap at 35% — preserve value
-        "allowed_actions":   {"AGENT_CALL", "AGENCY", "DIGITAL_NUDGE", "HOLD"},
-        "agency_eligible":   True,
-        "legal_eligible":    False,  # legal rarely needed for TIER_1 — agency works
-        "description":       "High recovery — agency month 1–3, firm settlement",
+CLUSTER_STRATEGY = {
+    "Sudden-Shock Distressed": {
+        "objective":        "maximise_recovery_speed",
+        "erv_horizon_days": 90,
+        "discount_penalty": 0.7,    # was paying — don't over-discount, they will settle
+        "discount_max":     0.35,   # cap at 35% — preserve value
+        "allowed_actions":  {"AGENT_CALL", "AGENCY", "DIGITAL_NUDGE", "HOLD"},
+        "agency_eligible":  True,
+        "legal_eligible":   False,
+        "description":      "Sudden onset — firm settlement, agency month 1–3",
     },
-    "TIER_2_MODERATE": {
-        "objective":         "maximise_recovery_probability",
-        "erv_horizon_days":  180,
-        "discount_penalty":  1.0,    # standard
-        "discount_max":      0.50,
-        "allowed_actions":   {"AGENT_CALL", "AGENCY", "DIGITAL_NUDGE", "HOLD"},
-        "agency_eligible":   True,
-        "legal_eligible":    False,
-        "description":       "Moderate recovery — flexible settlement, 180d horizon",
+    "High-Engagement Chronic": {
+        "objective":        "patient_structured_settlement",
+        "erv_horizon_days": 180,
+        "discount_penalty": 1.0,    # standard — needs time, not just discount
+        "discount_max":     0.45,
+        "allowed_actions":  {"AGENT_CALL", "AGENCY", "DIGITAL_NUDGE", "HOLD"},
+        "agency_eligible":  True,
+        "legal_eligible":   False,
+        "description":      "Chronic but engaged — instalment plan preferred, 180d horizon",
     },
-    "TIER_3_LOW": {
-        "objective":         "cost_efficient_recovery",
-        "erv_horizon_days":  360,
-        "discount_penalty":  1.3,    # reward higher discounts — deep discount needed
-        "discount_max":      0.60,   # BOT cap
-        "allowed_actions":   {"DIGITAL_NUDGE", "HOLD", "LEGAL"},
-        "agency_eligible":   False,  # agency fees uneconomic for low-recovery accounts
-        "legal_eligible":    True,   # legal review for high-balance TIER_3
-        "description":       "Low recovery — digital + legal for high balance only",
+    "Structural Defaulter": {
+        "objective":        "legal_posturing_or_targeted_settlement",
+        "erv_horizon_days": 180,
+        "discount_penalty": 0.8,    # bureau capacity intact — can pay, needs pressure
+        "discount_max":     0.40,
+        "allowed_actions":  {"AGENT_CALL", "AGENCY", "DIGITAL_NUDGE", "HOLD", "LEGAL"},
+        "agency_eligible":  True,
+        "legal_eligible":   True,   # paying other lenders = legal posturing viable
+        "description":      "Bureau capacity intact — legal threat credible, firm offer",
     },
-    "TIER_4_DORMANT": {
-        "objective":         "portfolio_resolution",
-        "erv_horizon_days":  None,   # no ERV — stop spend
-        "discount_penalty":  1.0,
-        "discount_max":      0.0,
-        "allowed_actions":   {"HOLD"},
-        "agency_eligible":   False,
-        "legal_eligible":    False,
-        "description":       "Non-recoverable — HOLD, flag for portfolio sale",
-    },
-}
-
-# ── SIGNAL_SEGMENT strategy — now a CONFIDENCE MODIFIER, not primary axis ────
-# SIGNAL_SEGMENT (A/B/C/D) calibrates action cost tolerance and model confidence.
-# It is applied ON TOP of RECOVERABILITY_STRATEGY as a discount_penalty multiplier.
-# The segment no longer drives allowed_actions — the recoverability tier does.
-#
-# A (rich signal): trust the model; normal cost tolerance.
-# B (CardX only): slight upward discount adjustment for uncertainty.
-# C (Bureau only): higher discount tolerance — less predictable internally.
-# D (No signal):  low-cost only, don't override TIER_3/4 with expensive actions.
-
-SEGMENT_STRATEGY = {
-    "A": {
-        "objective":        "maximise_amount",
-        "discount_penalty": 0.6,
-        "allowed_actions":  {"DIGITAL_NUDGE", "AGENT_CALL", "HOLD"},
-        "description":      "Rich signal — preserve value, minimal discount",
-    },
-    "B": {
-        "objective":        "balanced",
-        "discount_penalty": 1.0,
-        "allowed_actions":  {"DIGITAL_NUDGE", "AGENT_CALL", "AGENCY", "HOLD"},
-        "description":      "Balanced ERV optimisation",
-    },
-    "C": {
-        "objective":        "reactivation",
-        "discount_penalty": 1.3,
-        "allowed_actions":  {"DIGITAL_NUDGE", "AGENT_CALL", "AGENCY", "HOLD"},
-        "description":      "Reactivation focus — accept higher discount",
-    },
-    "D": {
-        "objective":        "exploration",
-        "discount_penalty": 1.0,
+    "Dormant": {
+        "objective":        "minimal_spend_portfolio_resolution",
+        "erv_horizon_days": 360,
+        "discount_penalty": 1.3,    # deep discount needed to unlock any recovery
+        "discount_max":     0.60,   # BOT cap
         "allowed_actions":  {"DIGITAL_NUDGE", "HOLD"},
-        "description":      "No signal — low-cost only",
+        "agency_eligible":  False,  # agency fees uneconomic at this recovery probability
+        "legal_eligible":   False,
+        "description":      "Dormant — digital only, flag for write-off or portfolio sale",
     },
 }
 
-# ── BEHAVIOURAL_PERSONA strategy modifiers ────────────────────────────────────
-# Applied ON TOP of SEGMENT_STRATEGY. Persona captures WHO the customer is
-# (behavioural identity); segment captures WHAT signal we have.
-# Together they define both the data quality and the customer type.
-#
-# Cooperative  → preserve recovery value; customer is willing AND able.
-#                Apply a discount haircut — do not over-discount a good payer.
-# Stressed     → capacity-limited but willing. Accept more discount to unlock
-#                payment. Extend AGENCY as a restructuring option.
-# Sporadic     → able to pay but disengaged. Discount alone won't work.
-#                Keep discount neutral; focus on digital re-engagement first.
-# Disconnected → neither willing nor able. Low-cost only. HOLD until signal.
-# Unknown      → no persona data. No modification — use segment default.
-#
-# discount_penalty_multiplier: multiplied against segment discount_penalty.
-#   < 1.0 → persona makes us LESS willing to discount (value preservation).
-#   > 1.0 → persona makes us MORE willing to discount (capacity/reactivation).
-# extra_actions_allowed: ADDS actions to the segment's allowed_actions set.
-# actions_force_remove: REMOVES actions from allowed_actions regardless of segment.
+# Default fallback if persona is missing or unrecognised
+_CLUSTER_STRATEGY_DEFAULT = CLUSTER_STRATEGY["High-Engagement Chronic"]
 
-PERSONA_STRATEGY_MODIFIER = {
-    "Cooperative": {
-        "discount_penalty_multiplier": 0.8,   # 20% extra discount haircut
-        "extra_actions_allowed":       set(),
-        "actions_force_remove":        set(),
-        "description": "Willing + able — preserve value, minimise discount",
+# ── SIGNAL CONFIDENCE MODIFIER (Phase 1: binary — Amendment 4) ───────────────
+# Applied ON TOP of CLUSTER_STRATEGY as a discount penalty multiplier.
+# Reflects model confidence, not strategic intent.
+#
+# FULL_SIGNAL:    CardX + Bureau available. Trust model output; preserve value.
+# LIMITED_SIGNAL: At least one source missing. Accept higher discount uncertainty.
+#                 Do NOT escalate to expensive actions (agency, legal) for Dormant.
+
+SEGMENT_CONFIDENCE_MODIFIER = {
+    "FULL_SIGNAL": {
+        "discount_penalty_multiplier": 0.85,  # rich signal — model reliable, less discount
+        "cost_tolerance":              "high",  # expensive actions justified
+        "low_confidence_flag":         False,
+        "description":                 "Full signal — preserve value, model reliable",
     },
-    "Stressed": {
-        "discount_penalty_multiplier": 1.3,   # accept 30% more discount
-        "extra_actions_allowed":       {"AGENCY"},   # restructuring option
-        "actions_force_remove":        set(),
-        "description": "Willing, capacity-limited — accept higher discount + AGENCY",
-    },
-    "Sporadic": {
-        "discount_penalty_multiplier": 1.0,   # neutral on discount
-        "extra_actions_allowed":       set(),
-        "actions_force_remove":        set(),
-        "description": "Able but disengaged — standard discount, digital focus",
-    },
-    "Disconnected": {
-        "discount_penalty_multiplier": 1.0,
-        "extra_actions_allowed":       set(),
-        "actions_force_remove":        {"AGENT_CALL", "AGENCY", "LEGAL"},  # low-cost only
-        "description": "No signal — low-cost actions only, HOLD or DIGITAL",
-    },
-    "Unknown": {
-        "discount_penalty_multiplier": 1.0,
-        "extra_actions_allowed":       set(),
-        "actions_force_remove":        set(),
-        "description": "No persona data — use segment default unchanged",
+    "LIMITED_SIGNAL": {
+        "discount_penalty_multiplier": 1.20,  # uncertain — accept more discount
+        "cost_tolerance":              "low",  # avoid expensive actions for borderline accounts
+        "low_confidence_flag":         True,
+        "description":                 "Limited signal — higher discount tolerance, low-cost bias",
     },
 }
+
+_SEGMENT_MODIFIER_DEFAULT = SEGMENT_CONFIDENCE_MODIFIER["LIMITED_SIGNAL"]
+
+# ── ELASTICITY MODEL CONFOUNDING NOTE (Amendment 2) ──────────────────────────
+# Historical discount data is NOT randomly assigned — agents give higher discounts
+# to higher-risk accounts. This creates spurious negative correlation between
+# discount level and recovery rate.
+#
+# Phase 1 mitigations:
+#   - Include prior_discount_max, signal_segment, balance_bucket, behavioural_segment
+#     as control variables in the elasticity model (partial de-confounding)
+#   - Treat elasticity output as rank ordering of acceptance probability only
+#   - DO NOT interpret discount coefficient as causal effect of discount on acceptance
+#   - Document this limitation in the model card
+#
+# Phase 2: controlled discount randomisation or instrumental variable approach.
 
 
 class ModelAgent(BaseAgent):
@@ -659,59 +610,53 @@ class ModelAgent(BaseAgent):
           ERV(LEGAL) > ERV(AGENCY) + legal_uplift_threshold.
         """
         # ── Three-layer strategy resolution ───────────────────────────────────
-        # Layer 1 (primary):   RECOVERABILITY_TIER  → ERV horizon, action set, discount cap
-        # Layer 2 (secondary): SIGNAL_SEGMENT       → model confidence, discount penalty
-        # Layer 3 (refinement):BEHAVIOURAL_PERSONA  → discount tolerance tweak, channel
-        #
-        # This order reflects the charge-off reality:
-        # First ask "CAN we recover this?" (tier), then "HOW confident are our models?"
-        # (segment), then "HOW does this customer respond?" (persona).
+        # Layer 1 (primary):   behavioural_persona → CLUSTER_STRATEGY
+        #                       ERV horizon, action set, discount cap
+        # Layer 2 (modifier):  signal_segment → SEGMENT_CONFIDENCE_MODIFIER
+        #                       discount penalty multiplier, cost tolerance
+        # Layer 3 (override):  Dormant + LIMITED_SIGNAL → immediate HOLD
+        #                       (no uplift expected, no spend justified)
 
-        recov_tier   = row.get("recoverability_tier",  "TIER_3_LOW")
-        seg          = row.get("signal_segment",        "D")
-        persona      = row.get("behavioural_persona",   "Unknown")
-        aid          = row.get("account_id")
-        alpha        = self.action_alphas.get(seg, 2.5)
+        persona = row.get("behavioural_persona", "High-Engagement Chronic")
+        seg     = row.get("signal_segment",      "LIMITED_SIGNAL")
+        aid     = row.get("account_id")
+        alpha   = self.action_alphas.get(seg, 2.5)
 
-        # Layer 1: Recoverability tier sets primary constraints
-        recov_strat  = RECOVERABILITY_STRATEGY.get(recov_tier, RECOVERABILITY_STRATEGY["TIER_3_LOW"])
-        erv_horizon  = recov_strat["erv_horizon_days"]   # None = TIER_4, no ERV
-        disc_max     = recov_strat["discount_max"]
+        # Layer 1: cluster determines strategic objective + action envelope
+        cluster_strat = CLUSTER_STRATEGY.get(persona, _CLUSTER_STRATEGY_DEFAULT)
+        erv_horizon   = cluster_strat["erv_horizon_days"]
+        disc_max      = cluster_strat["discount_max"]
 
-        # TIER_4: no action, no ERV — return HOLD immediately
-        if erv_horizon is None:
+        # Layer 2: signal segment modifies discount penalty
+        seg_mod      = SEGMENT_CONFIDENCE_MODIFIER.get(seg, _SEGMENT_MODIFIER_DEFAULT)
+        disc_penalty = cluster_strat["discount_penalty"] * seg_mod["discount_penalty_multiplier"]
+
+        # Layer 3: Dormant + LIMITED_SIGNAL = no ERV, immediate HOLD
+        # (low-cost digital only for Dormant + FULL_SIGNAL is handled via allowed_actions)
+        if persona == "Dormant" and seg == "LIMITED_SIGNAL":
             return {
                 "action": "HOLD", "d_optimal": 0.0,
                 "erv_net": 0.0, "erv_gross": 0.0,
                 "action_cost": 0, "tau": 1.0,
                 "erv_by_action": {"HOLD": 0.0},
-                "erv_horizon_days": None,
-                "recoverability_tier": recov_tier,
+                "erv_horizon_days": erv_horizon,
+                "behavioural_persona": persona,
+                "signal_segment": seg,
             }
 
+        # Allowed actions: cluster is authoritative
+        # LIMITED_SIGNAL further restricts expensive actions for low-confidence accounts
+        allowed = set(cluster_strat["allowed_actions"])
+        if seg_mod["cost_tolerance"] == "low":
+            allowed -= {"AGENCY", "LEGAL"}   # avoid expensive actions without full signal
+
         # Select propensity aligned to ERV horizon
-        if erv_horizon <= 90:
-            p_primary = row.get("propensity_90d",  row.get("propensity_30d", 0.0)) or 0.0
-        elif erv_horizon <= 180:
-            p_primary = row.get("propensity_180d", 0.0) or 0.0
+        if erv_horizon and erv_horizon <= 90:
+            p_primary = row.get("propensity_90d", row.get("propensity_30d", 0.0)) or 0.0
         else:
-            p_primary = row.get("propensity_180d", 0.0) or 0.0   # use 180d as proxy for 360d
+            p_primary = row.get("propensity_180d", 0.0) or 0.0   # 180d for 180d/360d horizons
         p30  = row.get("propensity_30d",  0.0) or 0.0
         p180 = row.get("propensity_180d", 0.0) or 0.0
-
-        # Layer 2: Signal segment sets discount penalty (confidence modifier)
-        seg_strat    = SEGMENT_STRATEGY.get(seg, SEGMENT_STRATEGY["B"])
-        disc_penalty = recov_strat["discount_penalty"] * seg_strat["discount_penalty"]
-
-        # Layer 3: Persona refines discount tolerance
-        modifier     = PERSONA_STRATEGY_MODIFIER.get(persona, PERSONA_STRATEGY_MODIFIER["Unknown"])
-        disc_penalty = disc_penalty * modifier["discount_penalty_multiplier"]
-
-        # Final allowed_actions: recoverability tier is authoritative
-        # Persona can only REMOVE actions (force_remove), never ADD beyond tier's set
-        allowed = (
-            recov_strat["allowed_actions"] | modifier["extra_actions_allowed"]
-        ) - modifier["actions_force_remove"]
 
         # E(recovery_amount) per horizon — from AmountModelTrainer or fallback
         amounts      = self._predicted_amounts.get(aid, {})
@@ -773,8 +718,8 @@ class ModelAgent(BaseAgent):
             )
 
         # ── LEGAL — P_6M + amount_180d, escalation only ──────────────────────
-        # Legal eligible only for TIER_3 with high balance, per RECOVERABILITY_STRATEGY
-        if "LEGAL" in allowed and recov_strat.get("legal_eligible", False):
+        # Legal eligible only when cluster_strat marks it and signal is sufficient
+        if "LEGAL" in allowed and cluster_strat.get("legal_eligible", False):
             erv_by_action["LEGAL"] = self._best_discounted_erv(
                 p_base=p180 * 0.4, balance=amount_180d, alpha=0.5,
                 action="LEGAL", elast_curves=elast_curves,
@@ -808,8 +753,9 @@ class ModelAgent(BaseAgent):
             "erv_gross":            best["erv_gross"],
             "action_cost":          best["action_cost"],
             "tau":                  tau,
-            "erv_horizon_days":     erv_horizon,
-            "recoverability_tier":  recov_tier,
+            "erv_horizon_days":    erv_horizon,
+            "behavioural_persona": persona,
+            "signal_segment":      seg,
             "erv_by_action": {
                 a: round(erv_by_action[a]["erv_net"], 2)
                 for a in erv_by_action
