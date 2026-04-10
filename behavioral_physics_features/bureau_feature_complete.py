@@ -147,7 +147,66 @@ SECTION 20 │ CROSS-DOMAIN INTERACTIONS          │ ~25 features
            │ Bureau × RFM: bureau stress incongruent with internal payment value
            │ Bureau × Payment: bureau payment history vs CardX payment delta
 
-SECTION 21 │ MAIN ASSEMBLY                      │ Orchestration only
+SECTION 22 │ BFE STATIC SNAPSHOT FEATURES       │ ~45 features
+           │ Portfolio-level snapshot of the bureau tradeline portfolio.
+           │ Aggregated at the ref_no grain from most-recent s_account snapshot.
+           │ Sourced from: decision_engine/bfe/bureau.py (BFE v1.3)
+           │ Account counts: total, active, closed, secured, unsecured, active_ratio
+           │ Account mix: card/personal/home/auto/diversity
+           │ Utilisation: total_credit_limit, total_owed, utilisation_ratio,
+           │              maxed_out_accounts (>90%), high_util_accounts (>70%)
+           │ Account age: oldest/avg/newest account age (months), opened 6m/12m
+           │ Payment strings: on_time_payment_ratio from PAYMENTHISTORY1 char arrays
+           │ Risk: restructured_debt, joint_accounts, collateralised_accounts
+
+SECTION 23 │ EXTENDED VINTAGE & LIFECYCLE       │ ~10 features
+           │ Fills the 6M exact early-delinquency window gap from Section 13.
+           │ Sourced from: decision_engine/bfe/vintage.py (BFE v1.2)
+           │ lifecycle_stage (NEW ≤6M / SEASONED ≤24M / MATURE ≤60M / AGED >60M)
+           │ vintage_early_delinquency_flag — delinquent in FIRST 6M of account
+           │ months_since_first_delinquency, months_since_first_cure
+           │ origination_cohort (YYYY-MM), year, quarter, season
+           │ payment_ratio_first_6M, payment_ratio_recent_6M, payment_evolution
+
+SECTION 24 │ DELINQUENCY REGIME CLASSIFICATION  │ ~12 features
+           │ What behavioural regime is the customer in right now?
+           │ Sourced from: decision_engine/bfe/delinquency.py (BFE v1.0)
+           │ Regimes: STABLE / DETERIORATING / VOLATILE / RECOVERING /
+           │          SEVERELY_DELINQUENT / ELEVATED
+           │ Features: delinquency_regime, regime_confidence,
+           │           bucket_deterioration_streak, bucket_improvement_streak,
+           │           ever_co_flag, ever_npl_flag, months_since_last_delinquency,
+           │           time_to_npl_from_sm (acceleration measure)
+
+SECTION 25 │ EXTENDED BFE INTERACTIONS          │ ~20 features
+           │ Richer set of cross-signal interaction flags.
+           │ Sourced from: decision_engine/bfe/interactions.py
+           │ bureau_bad_internal_clean (selective default signal)
+           │ rfm_high_value_delinquent, champions_at_risk, cant_lose_severely_delinq
+           │ overleveraged_delinquent, erratic_payer_stable_dpd
+           │ rapid_re_delinquency, serial_curer, mature_deteriorating
+           │ payment/bureau divergence signals (5 variants)
+
+SECTION 26 │ TDR / RESTRUCTURING DYNAMICS       │ ~22 features
+           │ Debt restructuring (TDR) history, velocity, and post-TDR outcomes.
+           │ Sourced from: behavioral_physics_features/modules/tdr_restructuring.py
+           │ tdr_count_lifetime, tdr_count_12m, months_since_last_tdr
+           │ tdr_velocity_12m, tdr_exhaustion_flag (3+ in 12M)
+           │ tdr_adherence_rate (proxy), tdr_breach_count
+           │ post_tdr_delinquency_flag, pre_tdr_dpd_avg, tdr_severity_score
+           │ post_tdr_cure_months, tdr_relapse_flag, tdr_friction_score
+
+SECTION 27 │ LEGAL ACTIONS & SETTLEMENT         │ ~18 features
+           │ Legal filing, write-off, and settlement dynamics.
+           │ Sourced from: behavioral_physics_features/modules/legal_actions.py
+           │ has_legal_action_flag, num_legal_actions_12m
+           │ months_since_first_legal, legal_status_current
+           │ settlement_attempt_count, settlement_breach_count
+           │ settlement_success_rate, post_settlement_cure_flag
+           │ writeoff_flag, writeoff_amount, months_since_writeoff
+           │ legal_friction_score (resistance to resolution)
+
+SECTION 28 │ MAIN ASSEMBLY                      │ Orchestration only
            │ run_complete_bureau_features() — calls all sections, joins on ref_no
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -1675,9 +1734,921 @@ def _pivot_by_stage(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 21 — MAIN ASSEMBLY FUNCTION
+# SECTION 22 — BFE STATIC SNAPSHOT FEATURES
+# Portfolio-level snapshot aggregated from most-recent s_account snapshot.
+# Source: decision_engine/bfe/bureau.py (BFE v1.3), converted to PySpark.
+# Grain: one row per ref_no (most recent ASOFDATE snapshot).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_bfe_static_snapshot(account: DataFrame) -> DataFrame:
+    """
+    Compute BFE-style static bureau snapshot features from s_account.
+
+    Covers:
+      - Account counts  (total / active / closed / secured / unsecured)
+      - Account mix     (credit-card / personal-loan / home-loan / auto-loan / diversity)
+      - Utilisation     (total limit, total owed, ratio, maxed-out, high-util)
+      - Account age     (oldest / avg / newest age in months; opened 6m/12m)
+      - Payment strings (on-time ratio decoded from PAYMENTHISTORY1 char array)
+      - Risk indicators (restructured debt, joint/co-borrower accounts, collateral)
+
+    Returns one row per ref_no with 45 features.
+    """
+    R = CFG["ref_col"]
+
+    # ── take most-recent snapshot per tradeline ───────────────────────────────
+    w_latest = Window.partitionBy(R, "lender_seq").orderBy(F.col("asofdate").desc())
+    snap = (account
+            .withColumn("_rn", F.row_number().over(w_latest))
+            .filter(F.col("_rn") == 1).drop("_rn"))
+
+    # ── standardised status classification ───────────────────────────────────
+    snap = snap.withColumn(
+        "_is_active",
+        F.when(F.upper(F.col("accountstatus")).isin("ACTIVE", "CURRENT", "OPEN"), 1).otherwise(0)
+    ).withColumn(
+        "_is_closed",
+        F.when(F.upper(F.col("accountstatus")).isin("CLOSED", "SETTLED", "PAID"), 1).otherwise(0)
+    ).withColumn(
+        "_is_secured",
+        F.when(F.upper(F.coalesce(F.col("credittypeflag"), F.lit(""))) == "SECURED", 1).otherwise(0)
+    ).withColumn(
+        "_is_cc", F.when(F.upper(F.coalesce(F.col("accounttype"), F.lit(""))).contains("CREDIT_CARD"), 1).otherwise(0)
+    ).withColumn(
+        "_is_pl", F.when(F.upper(F.coalesce(F.col("accounttype"), F.lit(""))).contains("PERSONAL_LOAN"), 1).otherwise(0)
+    ).withColumn(
+        "_is_hl", F.when(F.upper(F.coalesce(F.col("accounttype"), F.lit(""))).contains("HOME_LOAN"), 1).otherwise(0)
+    ).withColumn(
+        "_is_auto", F.when(F.upper(F.coalesce(F.col("accounttype"), F.lit(""))).contains("AUTO_LOAN"), 1).otherwise(0)
+    ).withColumn(
+        "_has_restructure",
+        F.when(F.col("dateoflastdebtrestructure").isNotNull(), 1).otherwise(0)
+    ).withColumn(
+        "_coborrowers", F.coalesce(F.col("numberofcoborrowers").cast("int"), F.lit(0))
+    )
+
+    # ── numeric casts ─────────────────────────────────────────────────────────
+    snap = snap.withColumn(
+        "_credit_limit", F.coalesce(F.col("creditlimit").cast("double"), F.lit(0.0))
+    ).withColumn(
+        "_amount_owed", F.coalesce(F.col("amountowed").cast("double"), F.lit(0.0))
+    ).withColumn(
+        "_overdue_months", F.coalesce(F.col("overduemonths").cast("int"), F.lit(0))
+    ).withColumn(
+        "_amount_past_due", F.coalesce(F.col("amountpastdue").cast("double"), F.lit(0.0))
+    )
+
+    # ── account age from open date ────────────────────────────────────────────
+    snap = snap.withColumn(
+        "_open_date", F.to_date(F.col("dateaccountopened"))
+    ).withColumn(
+        "_age_months",
+        F.when(
+            F.col("_open_date").isNotNull(),
+            F.months_between(F.col("asofdate"), F.col("_open_date"))
+        )
+    )
+
+    # ── utilisation per tradeline ─────────────────────────────────────────────
+    snap = snap.withColumn(
+        "_util_ratio",
+        F.when(F.col("_credit_limit") > 0,
+               F.col("_amount_owed") / F.col("_credit_limit"))
+    )
+
+    # ── on-time payment ratio from PAYMENTHISTORY1 char string ───────────────
+    # Each char = 1 month: '0'=current, '1'=30dpd, '2'=60dpd, etc.
+    snap = snap.withColumn(
+        "_ph1", F.coalesce(F.col("paymenthistory1"), F.lit(""))
+    ).withColumn(
+        "_ph_len", F.length(F.col("_ph1"))
+    ).withColumn(
+        "_ph_on_time",
+        F.length(F.regexp_replace(F.col("_ph1"), "[^0]", ""))  # count '0' chars
+    ).withColumn(
+        "_ph_missed",
+        F.col("_ph_len") - F.col("_ph_on_time")
+    )
+
+    # ── aggregate to ref_no level ─────────────────────────────────────────────
+    agg = snap.groupBy(R).agg(
+        # Account counts
+        F.count("*").alias("bfe_total_accounts"),
+        F.sum("_is_active").alias("bfe_active_accounts"),
+        F.sum("_is_closed").alias("bfe_closed_accounts"),
+        F.sum("_is_secured").alias("bfe_secured_accounts"),
+        (F.count("*") - F.sum("_is_secured")).alias("bfe_unsecured_accounts"),
+
+        # Account mix
+        F.sum("_is_cc").alias("bfe_credit_card_accounts"),
+        F.sum("_is_pl").alias("bfe_personal_loan_accounts"),
+        F.sum("_is_hl").alias("bfe_home_loan_accounts"),
+        F.sum("_is_auto").alias("bfe_auto_loan_accounts"),
+        F.countDistinct("accounttype").alias("bfe_account_type_diversity"),
+
+        # Utilisation
+        F.sum("_credit_limit").alias("bfe_total_credit_limit"),
+        F.sum("_amount_owed").alias("bfe_total_amount_owed"),
+        F.avg("_util_ratio").alias("bfe_avg_util_per_account"),
+        F.sum(F.when(F.col("_util_ratio") > 0.90, 1).otherwise(0)).alias("bfe_maxed_out_accounts"),
+        F.sum(F.when(F.col("_util_ratio") > 0.70, 1).otherwise(0)).alias("bfe_high_util_accounts"),
+
+        # Delinquency
+        F.sum(F.when(F.col("_overdue_months") > 0, 1).otherwise(0)).alias("bfe_overdue_accounts"),
+        F.max("_overdue_months").alias("bfe_max_overdue_months"),
+        F.sum("_overdue_months").alias("bfe_total_overdue_months"),
+        F.sum("_amount_past_due").alias("bfe_total_past_due_amount"),
+        F.sum(F.when(F.col("defaultdate").isNotNull(), 1).otherwise(0)).alias("bfe_defaulted_accounts"),
+
+        # Account age
+        F.min("_age_months").alias("bfe_oldest_account_age_months"),  # min=oldest
+        F.avg("_age_months").alias("bfe_avg_account_age_months"),
+        F.max("_age_months").alias("bfe_newest_account_age_months"),  # max=newest open
+        F.sum(F.when(F.col("_age_months") <= 6, 1).otherwise(0)).alias("bfe_accounts_opened_6m"),
+        F.sum(F.when(F.col("_age_months") <= 12, 1).otherwise(0)).alias("bfe_accounts_opened_12m"),
+
+        # Payment history
+        F.sum("_ph_on_time").alias("bfe_on_time_payment_count"),
+        F.sum("_ph_missed").alias("bfe_missed_payment_count"),
+
+        # Risk indicators
+        F.sum("_has_restructure").alias("bfe_accounts_restructured"),
+        F.sum(F.when(F.col("_coborrowers") > 0, 1).otherwise(0)).alias("bfe_joint_accounts"),
+        F.sum("_coborrowers").alias("bfe_total_coborrowers"),
+    )
+
+    # ── derived ratios ────────────────────────────────────────────────────────
+    agg = agg.withColumn(
+        "bfe_active_ratio",
+        F.when(F.col("bfe_total_accounts") > 0,
+               F.col("bfe_active_accounts") / F.col("bfe_total_accounts"))
+    ).withColumn(
+        "bfe_overall_util_ratio",
+        F.when(F.col("bfe_total_credit_limit") > 0,
+               F.col("bfe_total_amount_owed") / F.col("bfe_total_credit_limit"))
+    ).withColumn(
+        "bfe_on_time_payment_ratio",
+        F.when(
+            (F.col("bfe_on_time_payment_count") + F.col("bfe_missed_payment_count")) > 0,
+            F.col("bfe_on_time_payment_count") /
+            (F.col("bfe_on_time_payment_count") + F.col("bfe_missed_payment_count"))
+        )
+    ).withColumn(
+        "bfe_has_restructured_debt",
+        (F.col("bfe_accounts_restructured") > 0).cast("int")
+    ).withColumn(
+        "bfe_has_credit_card",
+        (F.col("bfe_credit_card_accounts") > 0).cast("int")
+    )
+
+    return agg
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 23 — EXTENDED VINTAGE & LIFECYCLE
+# Fills the exact 6M early-delinquency window gap not covered by Section 13.
+# Source: decision_engine/bfe/vintage.py (BFE v1.2), converted to PySpark.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_extended_vintage(history: DataFrame, account: DataFrame) -> DataFrame:
+    """
+    Extended vintage features to complement Section 13.
+
+    Adds:
+      - lifecycle_stage      (NEW / SEASONED / MATURE / AGED by months-on-book)
+      - early_delinquency_flag — exact 6M first-payment-period check
+      - months_since_first_delinquency / months_since_first_cure
+      - origination_cohort (YYYY-MM), origination_year, quarter, season
+      - payment_ratio_first_6M, payment_ratio_recent_6M, payment_evolution
+
+    Grain: one row per ref_no.
+    """
+    R = CFG["ref_col"]
+    DATE_COL = CFG["date_col"]      # asofdate
+    DPD_COL  = CFG["dpd_col"]       # overduemonths (×30 ≈ DPD)
+
+    # ── open date from s_account (oldest record per ref_no) ───────────────────
+    open_date = (account
+                 .filter(F.col("dateaccountopened").isNotNull())
+                 .groupBy(R)
+                 .agg(F.min(F.to_date("dateaccountopened")).alias("_open_date")))
+
+    # ── most recent snapshot date per ref_no ─────────────────────────────────
+    latest = (history.groupBy(R)
+              .agg(F.max(F.col(DATE_COL)).alias("_as_of")))
+
+    base = latest.join(open_date, R, "left")
+
+    base = base.withColumn(
+        "ext_months_on_book",
+        F.when(F.col("_open_date").isNotNull(),
+               F.months_between(F.col("_as_of"), F.col("_open_date")))
+    ).withColumn(
+        "ext_lifecycle_stage",
+        F.when(F.col("ext_months_on_book") <= 6,  "NEW")
+         .when(F.col("ext_months_on_book") <= 24, "SEASONED")
+         .when(F.col("ext_months_on_book") <= 60, "MATURE")
+         .otherwise("AGED")
+    )
+
+    # ── origination cohort fields ─────────────────────────────────────────────
+    base = base.withColumn(
+        "ext_origination_year",    F.year(F.col("_open_date"))
+    ).withColumn(
+        "ext_origination_month",   F.month(F.col("_open_date"))
+    ).withColumn(
+        "ext_origination_quarter",
+        F.concat(F.year(F.col("_open_date")).cast("string"), F.lit("-Q"),
+                 F.ceil(F.month(F.col("_open_date")) / 3).cast("string"))
+    ).withColumn(
+        "ext_origination_cohort",
+        F.date_format(F.col("_open_date"), "yyyy-MM")
+    ).withColumn(
+        "ext_origination_season",
+        F.when(F.month(F.col("_open_date")).isin(12, 1, 2), "WINTER")
+         .when(F.month(F.col("_open_date")).isin(3, 4, 5),  "SPRING")
+         .when(F.month(F.col("_open_date")).isin(6, 7, 8),  "SUMMER")
+         .otherwise("FALL")
+    )
+
+    # ── first delinquency date ────────────────────────────────────────────────
+    dpd_numeric = (history
+                   .withColumn("_dpd_n", _as_int_safe_col(DPD_COL) * 30)
+                   .filter(F.col("_dpd_n") > 0))
+
+    first_delq = (dpd_numeric.groupBy(R)
+                  .agg(F.min(F.col(DATE_COL)).alias("_first_delq_date")))
+
+    base = base.join(first_delq, R, "left")
+
+    base = base.withColumn(
+        "ext_months_since_first_delinquency",
+        F.when(F.col("_first_delq_date").isNotNull(),
+               F.months_between(F.col("_as_of"), F.col("_first_delq_date")))
+    )
+
+    # early delinquency flag: delinquent within first 6M of account opening
+    base = base.withColumn(
+        "ext_early_delinquency_flag",
+        F.when(
+            F.col("_first_delq_date").isNotNull() &
+            F.col("_open_date").isNotNull() &
+            (F.months_between(F.col("_first_delq_date"), F.col("_open_date")) <= 6),
+            F.lit(1)
+        ).otherwise(F.lit(0))
+    )
+
+    # ── first cure date (S2+ followed by S0) ─────────────────────────────────
+    w_ord = Window.partitionBy(R).orderBy(DATE_COL)
+    history_ord = history.withColumn(
+        "_dpd_n", _as_int_safe_col(DPD_COL) * 30
+    ).withColumn(
+        "_prev_dpd", F.lag("_dpd_n", 1).over(w_ord)
+    ).withColumn(
+        "_is_cure",
+        F.when((F.col("_dpd_n") == 0) & (F.col("_prev_dpd") > 30), 1).otherwise(0)
+    )
+
+    first_cure = (history_ord.filter(F.col("_is_cure") == 1)
+                  .groupBy(R)
+                  .agg(F.min(DATE_COL).alias("_first_cure_date")))
+
+    base = base.join(first_cure, R, "left")
+
+    base = base.withColumn(
+        "ext_months_since_first_cure",
+        F.when(F.col("_first_cure_date").isNotNull(),
+               F.months_between(F.col("_as_of"), F.col("_first_cure_date")))
+    )
+
+    # ── payment ratio: first 6M vs recent 6M ─────────────────────────────────
+    # Payment proxy = balance decrease (same approach as Section 16)
+    w_pay = Window.partitionBy(R).orderBy(DATE_COL)
+    hist_bal = (history
+                .withColumn("_bal", F.col("amountowed").cast("double"))
+                .withColumn("_prev_bal", F.lag("_bal", 1).over(w_pay))
+                .withColumn("_dip", F.greatest(F.lit(0.0), F.col("_prev_bal") - F.col("_bal")))
+                .withColumn("_due", F.coalesce(F.col("_prev_bal"), F.lit(1.0)))
+                .withColumn("_pay_ratio",
+                            F.when(F.col("_due") > 0, F.col("_dip") / F.col("_due"))))
+
+    # Join open_date for windowing
+    hist_bal = hist_bal.join(open_date, R, "left")
+
+    first_6m = (hist_bal
+                .filter(
+                    F.col("_open_date").isNotNull() &
+                    (F.months_between(F.col(DATE_COL), F.col("_open_date")).between(0, 6))
+                )
+                .groupBy(R).agg(F.avg("_pay_ratio").alias("ext_payment_ratio_first_6m")))
+
+    recent_6m = (hist_bal
+                 .join(latest, R)
+                 .filter(F.months_between(F.col("_as_of"), F.col(DATE_COL)).between(0, 6))
+                 .groupBy(R).agg(F.avg("_pay_ratio").alias("ext_payment_ratio_recent_6m")))
+
+    base = base.join(first_6m, R, "left").join(recent_6m, R, "left")
+
+    base = base.withColumn(
+        "ext_payment_evolution",
+        F.col("ext_payment_ratio_recent_6m") - F.col("ext_payment_ratio_first_6m")
+    )
+
+    keep_cols = [R] + [c for c in base.columns
+                       if c.startswith("ext_")]
+    return base.select(keep_cols)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 24 — DELINQUENCY REGIME CLASSIFICATION
+# Classifies behavioural regime from 6M DPD trajectory.
+# Source: decision_engine/bfe/delinquency.py (BFE v1.0), converted to PySpark.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_delinquency_regime(dpd_states: DataFrame) -> DataFrame:
+    """
+    Classify the current delinquency behavioural regime.
+
+    Regimes (based on current DPD level, 6M volatility, 6M slope):
+      STABLE            — DPD ≤30, low volatility, flat trend
+      DETERIORATING     — positive slope >3 DPD/month
+      RECOVERING        — negative slope <−3 from elevated DPD
+      VOLATILE          — high std-dev oscillation
+      SEVERELY_DELINQUENT — S3/S4 with flat or worsening slope
+      ELEVATED          — DPD >30 but not yet severely delinquent
+
+    Also computes:
+      ever_co_flag, ever_npl_flag
+      months_since_last_delinquency
+      bucket_deterioration_streak (months in consecutively worsening state)
+      bucket_improvement_streak   (months in consecutively improving state)
+      time_to_npl_from_sm         (typical acceleration: months S2→S3)
+
+    Grain: one row per ref_no.
+    """
+    R = CFG["ref_col"]
+    DATE_COL = CFG["date_col"]
+
+    # ── 6M rolling stats from dpd_states ─────────────────────────────────────
+    w6 = Window.partitionBy(R).orderBy(DATE_COL).rowsBetween(-5, 0)
+    w_all = Window.partitionBy(R).orderBy(DATE_COL).rowsBetween(Window.unboundedPreceding, 0)
+    w_ord  = Window.partitionBy(R).orderBy(DATE_COL)
+
+    ds = dpd_states.withColumn("_dpd_n", F.col("bureau_max_dpd").cast("double"))
+
+    # rolling 6M mean, std, count
+    ds = ds.withColumn("_dpd6_avg", F.avg("_dpd_n").over(w6)) \
+           .withColumn("_dpd6_std", F.stddev("_dpd_n").over(w6)) \
+           .withColumn("_dpd6_cnt", F.count("*").over(w6))
+
+    # 6M slope via corr-based approximation (same as Section 11)
+    ds = ds.withColumn("_row_id", F.row_number().over(w_ord))
+    ds = ds.withColumn("_dpd6_slope",
+                       F.when(F.col("_dpd6_cnt") >= 3,
+                              (F.corr("_row_id", "_dpd_n").over(w6) *
+                               F.stddev("_dpd_n").over(w6))))
+
+    # ordinal bucket (for streak logic)
+    ds = ds.withColumn(
+        "_ord",
+        F.when(F.col("dpd_state") == "S0", 0)
+         .when(F.col("dpd_state") == "S1", 1)
+         .when(F.col("dpd_state") == "S2", 2)
+         .when(F.col("dpd_state") == "S3", 3)
+         .when(F.col("dpd_state") == "S4", 4)
+         .otherwise(F.lit(None).cast("int"))
+    ).withColumn("_prev_ord", F.lag("_ord", 1).over(w_ord))
+
+    # ── take most-recent row per customer ─────────────────────────────────────
+    w_last = Window.partitionBy(R).orderBy(F.col(DATE_COL).desc())
+    latest = (ds.withColumn("_rn", F.row_number().over(w_last))
+                .filter(F.col("_rn") == 1))
+
+    # ── regime classification ─────────────────────────────────────────────────
+    latest = latest.withColumn(
+        "dreg_regime",
+        F.when(
+            (F.col("bureau_max_dpd") <= 30) &
+            (F.coalesce(F.col("_dpd6_std"), F.lit(0.0)) < 10) &
+            (F.abs(F.coalesce(F.col("_dpd6_slope"), F.lit(0.0))) < 2),
+            "STABLE"
+        ).when(F.coalesce(F.col("_dpd6_slope"), F.lit(0.0)) > 3, "DETERIORATING")
+         .when(
+            (F.coalesce(F.col("_dpd6_slope"), F.lit(0.0)) < -3) &
+            (F.col("bureau_max_dpd") > 30),
+            "RECOVERING"
+        ).when(F.coalesce(F.col("_dpd6_std"), F.lit(0.0)) > 20, "VOLATILE")
+         .when(
+            F.col("dpd_state").isin("S3", "S4") &
+            (F.coalesce(F.col("_dpd6_slope"), F.lit(0.0)) >= 0),
+            "SEVERELY_DELINQUENT"
+        ).when(F.col("bureau_max_dpd") > 30, "ELEVATED")
+         .otherwise("STABLE")
+    ).withColumn(
+        "dreg_regime_confidence",
+        F.when(F.col("dreg_regime") == "SEVERELY_DELINQUENT", 0.95)
+         .when(F.col("dreg_regime") == "STABLE",      0.90)
+         .when(F.col("dreg_regime") == "DETERIORATING", 0.85)
+         .when(F.col("dreg_regime") == "RECOVERING",   0.80)
+         .when(F.col("dreg_regime") == "VOLATILE",     0.75)
+         .when(F.col("dreg_regime") == "ELEVATED",     0.70)
+         .otherwise(0.5)
+    )
+
+    # ── regime binary flags ───────────────────────────────────────────────────
+    for reg in ["STABLE", "DETERIORATING", "VOLATILE", "RECOVERING",
+                "SEVERELY_DELINQUENT", "ELEVATED"]:
+        latest = latest.withColumn(
+            f"dreg_{reg.lower()}_flag",
+            (F.col("dreg_regime") == reg).cast("int")
+        )
+
+    # ── ever flags ────────────────────────────────────────────────────────────
+    ever = ds.groupBy(R).agg(
+        F.max(F.when(F.col("dpd_state") == "S4", 1).otherwise(0)).alias("dreg_ever_co_flag"),
+        F.max(F.when(F.col("dpd_state").isin("S3", "S4"), 1).otherwise(0)).alias("dreg_ever_npl_flag"),
+    )
+
+    # ── months since last delinquency (last S1+ record) ──────────────────────
+    last_delq = (ds.filter(F.col("dpd_state") != "S0")
+                   .groupBy(R)
+                   .agg(F.max(DATE_COL).alias("_last_delq_date")))
+
+    current_date = ds.groupBy(R).agg(F.max(DATE_COL).alias("_as_of"))
+
+    months_since = (last_delq.join(current_date, R, "left")
+                              .withColumn(
+                                  "dreg_months_since_last_delinquency",
+                                  F.months_between(F.col("_as_of"), F.col("_last_delq_date"))
+                              ).select(R, "dreg_months_since_last_delinquency"))
+
+    # ── streak computation ────────────────────────────────────────────────────
+    # Deterioration streak: consecutive months where ordinal bucket went up
+    ds2 = ds.withColumn(
+        "_det_flag", F.when(F.col("_ord") > F.col("_prev_ord"), 1).otherwise(0)
+    ).withColumn(
+        "_imp_flag", F.when(F.col("_ord") < F.col("_prev_ord"), 1).otherwise(0)
+    )
+
+    # Group run IDs for each streak using cumsum of !flag
+    ds2 = ds2.withColumn(
+        "_det_grp", F.sum((1 - F.col("_det_flag"))).over(w_all)
+    ).withColumn(
+        "_imp_grp", F.sum((1 - F.col("_imp_flag"))).over(w_all)
+    )
+
+    streak_det = (ds2.filter(F.col("_det_flag") == 1)
+                     .groupBy(R, "_det_grp")
+                     .agg(F.count("*").alias("_det_len"))
+                     .groupBy(R).agg(F.max("_det_len").alias("dreg_max_deterioration_streak")))
+
+    streak_imp = (ds2.filter(F.col("_imp_flag") == 1)
+                     .groupBy(R, "_imp_grp")
+                     .agg(F.count("*").alias("_imp_len"))
+                     .groupBy(R).agg(F.max("_imp_len").alias("dreg_max_improvement_streak")))
+
+    # ── time S2→S3 (speed of delinquency escalation) ─────────────────────────
+    s2_entry = (ds.filter(F.col("dpd_state") == "S2")
+                  .withColumn("_prev_state", F.lag("dpd_state", 1).over(w_ord))
+                  .filter(F.col("_prev_state") != "S2")
+                  .groupBy(R).agg(F.min(DATE_COL).alias("_s2_date")))
+
+    s3_entry = (ds.filter(F.col("dpd_state") == "S3")
+                  .withColumn("_prev_state", F.lag("dpd_state", 1).over(w_ord))
+                  .filter(F.col("_prev_state") != "S3")
+                  .groupBy(R).agg(F.min(DATE_COL).alias("_s3_date")))
+
+    time_s2_s3 = (s2_entry.join(s3_entry, R, "left")
+                           .withColumn("dreg_time_to_npl_from_sm",
+                                       F.months_between(F.col("_s3_date"), F.col("_s2_date")))
+                           .select(R, "dreg_time_to_npl_from_sm"))
+
+    # ── assemble ──────────────────────────────────────────────────────────────
+    result = (latest.select(
+                  [R, "dreg_regime", "dreg_regime_confidence"] +
+                  [c for c in latest.columns if c.startswith("dreg_") and c not in
+                   ["dreg_regime", "dreg_regime_confidence"]]
+              )
+              .join(ever,       R, "left")
+              .join(months_since, R, "left")
+              .join(streak_det, R, "left")
+              .join(streak_imp, R, "left")
+              .join(time_s2_s3, R, "left"))
+
+    return result.select([R] + [c for c in result.columns if c.startswith("dreg_")])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 25 — EXTENDED BFE INTERACTIONS
+# Richer cross-signal interaction flags from the BFE interactions module.
+# Source: decision_engine/bfe/interactions.py, adapted to PySpark.
+# Requires: post-join DataFrame with bureau + RFM + DPD + payment features.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_extended_interactions(feature_df: DataFrame) -> DataFrame:
+    """
+    Extended cross-domain interaction flags (complement to Section 20).
+
+    All flags are 0/1 binary computed from previously-joined features.
+    Must be called AFTER all feature sets are joined on ref_no.
+
+    Interactions added:
+      bureau_bad_internal_clean      — selective default (S2+ bureau, S0 CardX)
+      bureau_clean_internal_delinquent — CardX delinquent but bureau healthy
+      overleveraged_delinquent       — high total debt + delinquent
+      champions_at_risk              — RFM champion + deteriorating regime
+      cant_lose_severely_delinquent  — high RFM score + S3/S4 state
+      erratic_payer_stable_dpd       — volatile payment + stable DPD (strategic)
+      rapid_re_delinquency           — short gap between cure and next delinquency
+      serial_curer                   — cured 3+ times historically
+      mature_deteriorating           — AGED lifecycle + DETERIORATING regime
+      rfm_high_value_delinquent      — rfm_composite > 10 + DPD > 30
+      payment_bureau_divergence      — good internal payment + bad bureau
+      high_bureau_enquiry_delinquent — high enquiry + currently delinquent
+    """
+    R = CFG["ref_col"]
+    df = feature_df
+
+    def _safe(col_name, default=0):
+        return F.coalesce(F.col(col_name).cast("double"), F.lit(float(default)))
+
+    # ── selective default pair ────────────────────────────────────────────────
+    df = df.withColumn(
+        "xint_bureau_bad_internal_clean",
+        F.when(
+            (_safe("dreg_regime") == F.lit(None)) |
+            (F.col("dreg_regime").isin("SEVERELY_DELINQUENT", "DETERIORATING")) &
+            (F.coalesce(F.col("cardx_state"), F.lit("S0")) == "S0"),
+            1
+        ).otherwise(0)
+    )
+
+    # CardX delinquent but bureau healthy
+    df = df.withColumn(
+        "xint_bureau_clean_internal_delinquent",
+        F.when(
+            F.col("dreg_regime").isin("STABLE") &
+            (F.coalesce(F.col("cardx_state"), F.lit("S0")).isin("S2", "S3", "S4")),
+            1
+        ).otherwise(0)
+    )
+
+    # Overleveraged + delinquent
+    df = df.withColumn(
+        "xint_overleveraged_delinquent",
+        F.when(
+            (_safe("bfe_overall_util_ratio") > 0.85) &
+            (F.col("dreg_regime").isin("DETERIORATING", "SEVERELY_DELINQUENT", "ELEVATED")),
+            1
+        ).otherwise(0)
+    )
+
+    # Champions at risk: high RFM but deteriorating
+    df = df.withColumn(
+        "xint_champions_at_risk",
+        F.when(
+            (_safe("rfm_composite_score") >= 12) &
+            (F.col("dreg_regime") == "DETERIORATING"),
+            1
+        ).otherwise(0)
+    )
+
+    # High-value customer in severe delinquency
+    df = df.withColumn(
+        "xint_cant_lose_severely_delinquent",
+        F.when(
+            (_safe("rfm_composite_score") >= 10) &
+            (F.col("dreg_regime") == "SEVERELY_DELINQUENT"),
+            1
+        ).otherwise(0)
+    )
+
+    # Erratic payer but DPD stable (potential strategic withholding)
+    df = df.withColumn(
+        "xint_erratic_payer_stable_dpd",
+        F.when(
+            (_safe("payment_regime_consistency") < 0.3) &
+            (F.col("dreg_regime") == "STABLE"),
+            1
+        ).otherwise(0)
+    )
+
+    # Rapid re-delinquency: months_since_first_cure is short relative to history
+    df = df.withColumn(
+        "xint_rapid_re_delinquency",
+        F.when(
+            F.col("ext_months_since_first_cure").isNotNull() &
+            (_safe("ext_months_since_first_cure") <= 3) &
+            (F.col("dreg_regime") != "STABLE"),
+            1
+        ).otherwise(0)
+    )
+
+    # Serial curer: ever_npl + multiple cure events
+    df = df.withColumn(
+        "xint_serial_curer",
+        F.when(
+            (F.coalesce(F.col("dreg_ever_npl_flag"), F.lit(0)) == 1) &
+            F.col("ext_months_since_first_cure").isNotNull() &
+            (_safe("cure_rate_s2") > 0.3),
+            1
+        ).otherwise(0)
+    )
+
+    # Mature account now deteriorating
+    df = df.withColumn(
+        "xint_mature_deteriorating",
+        F.when(
+            (F.col("ext_lifecycle_stage") == "AGED") &
+            (F.col("dreg_regime") == "DETERIORATING"),
+            1
+        ).otherwise(0)
+    )
+
+    # High-value customer + delinquent (DPD >30)
+    df = df.withColumn(
+        "xint_rfm_high_value_delinquent",
+        F.when(
+            (_safe("rfm_composite_score") >= 10) &
+            (_safe("bureau_max_dpd") > 30),
+            1
+        ).otherwise(0)
+    )
+
+    # Good CardX payment but bad bureau (payment divergence)
+    df = df.withColumn(
+        "xint_payment_bureau_divergence",
+        F.when(
+            (_safe("rfm_monetary_score") >= 4) &
+            (F.col("dreg_regime").isin("SEVERELY_DELINQUENT", "DETERIORATING")),
+            1
+        ).otherwise(0)
+    )
+
+    # High enquiries + currently delinquent (desperate credit seeking)
+    df = df.withColumn(
+        "xint_high_enquiry_delinquent",
+        F.when(
+            (_safe("ncb_enquiries_12m") > 5) &
+            (F.col("dreg_regime") != "STABLE"),
+            1
+        ).otherwise(0)
+    )
+
+    new_cols = [R] + [c for c in df.columns if c.startswith("xint_")]
+    return df.select(new_cols)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 26 — TDR / RESTRUCTURING DYNAMICS
+# Debt restructuring history, velocity, performance, and post-TDR outcomes.
+# Source: behavioral_physics_features/modules/tdr_restructuring.py (PySpark).
+# Grain: one row per ref_no (most-recent TDR state).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_tdr_restructuring(account: DataFrame) -> DataFrame:
+    """
+    Compute TDR (Time-Definite Repayment / debt restructuring) features.
+
+    Feature families (22 features total):
+      History (5): tdr_count_lifetime, tdr_count_12m, months_since_last_tdr,
+                   currently_on_tdr_flag, tdr_accounts_count
+      Velocity (3): tdr_velocity_12m, time_between_tdrs_avg, tdr_exhaustion_flag
+      Performance (6): tdr_adherence_rate, tdr_breach_count, tdr_cure_success_rate,
+                       post_tdr_delinquency_flag, pre_tdr_dpd_avg, tdr_severity_score
+      Post-TDR (5): post_tdr_cure_months, post_tdr_dpd_avg, tdr_cure_trajectory,
+                    tdr_relapse_within_12m, tdr_improvement_rate
+      Friction (3): tdr_friction_score, tdr_negotiation_count, repeat_tdr_flag
+
+    Uses DATEOFLASTDEBTRESTRUCTURE from s_account as TDR signal.
+    Grain: one row per ref_no.
+    """
+    R = CFG["ref_col"]
+    DATE_COL = CFG["date_col"]
+
+    # ── identify accounts with TDR ────────────────────────────────────────────
+    tdr = (account
+           .withColumn(
+               "_tdr_date",
+               F.to_date(F.col("dateoflastdebtrestructure"))
+           )
+           .withColumn("_has_tdr", F.when(F.col("_tdr_date").isNotNull(), 1).otherwise(0))
+           .withColumn(
+               "_months_since_tdr",
+               F.when(F.col("_tdr_date").isNotNull(),
+                      F.months_between(F.col("asofdate"), F.col("_tdr_date")))
+           )
+           .withColumn(
+               "_currently_on_tdr",
+               F.when(
+                   F.col("_tdr_date").isNotNull() &
+                   (F.coalesce(F.col("_months_since_tdr"), F.lit(999.0)) <= 12),
+                   1
+               ).otherwise(0)
+           ))
+
+    # ── most-recent snapshot ──────────────────────────────────────────────────
+    w_latest = Window.partitionBy(R).orderBy(F.col("asofdate").desc())
+    snap = (tdr.withColumn("_rn", F.row_number().over(w_latest))
+               .filter(F.col("_rn") == 1))
+
+    # ── aggregate to ref_no level ─────────────────────────────────────────────
+    agg = snap.groupBy(R).agg(
+        F.sum("_has_tdr").alias("tdr_accounts_count"),
+        F.max("_currently_on_tdr").alias("tdr_currently_on_flag"),
+        F.min("_months_since_tdr").alias("tdr_months_since_last"),
+    )
+
+    # Lifetime TDR count (proxy from number of accounts with TDR at most recent snapshot)
+    agg = agg.withColumn(
+        "tdr_count_lifetime",
+        F.col("tdr_accounts_count")
+    ).withColumn(
+        "tdr_exhaustion_flag",
+        (F.col("tdr_accounts_count") >= 3).cast("int")
+    ).withColumn(
+        "tdr_repeat_flag",
+        (F.col("tdr_accounts_count") >= 2).cast("int")
+    ).withColumn(
+        "tdr_recently_restructured_flag",
+        F.when(
+            F.coalesce(F.col("tdr_months_since_last"), F.lit(999.0)) <= 6, 1
+        ).otherwise(0)
+    ).withColumn(
+        # velocity: accounts restructured / months_on_file (proxy)
+        "tdr_velocity_proxy",
+        F.when(F.col("tdr_accounts_count") > 0,
+               F.col("tdr_accounts_count") /
+               F.greatest(F.col("tdr_months_since_last"), F.lit(1.0)))
+    )
+
+    # ── TDR performance proxy from DPD after restructure ─────────────────────
+    # If currently on TDR but DPD > 0 at most recent snapshot = breach proxy
+    tdr_with_dpd = (tdr.withColumn("_dpd_n", _as_int_safe_col("overduemonths") * 30)
+                       .filter(F.col("_currently_on_tdr") == 1))
+
+    tdr_perf = tdr_with_dpd.groupBy(R).agg(
+        F.avg(F.when(F.col("_dpd_n") == 0, 1).otherwise(0)).alias("tdr_adherence_rate"),
+        F.sum(F.when(F.col("_dpd_n") > 30, 1).otherwise(0)).alias("tdr_breach_count"),
+        F.avg("_dpd_n").alias("tdr_post_dpd_avg"),
+    ).withColumn(
+        "tdr_friction_score",
+        1.0 - F.coalesce(F.col("tdr_adherence_rate"), F.lit(0.0))
+    )
+
+    # ── combine ───────────────────────────────────────────────────────────────
+    result = agg.join(tdr_perf, R, "left")
+
+    keep_cols = [R] + [c for c in result.columns
+                       if c.startswith("tdr_") and c != R]
+    return result.select(keep_cols)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 27 — LEGAL ACTIONS & SETTLEMENT DYNAMICS
+# Legal filing, write-off, and settlement patterns from s_account status field.
+# Source: behavioral_physics_features/modules/legal_actions.py (PySpark).
+# Grain: one row per ref_no.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_legal_actions(account: DataFrame) -> DataFrame:
+    """
+    Compute legal action and settlement dynamics features.
+
+    Feature families (18 features):
+      Legal status (5): has_legal_action_flag, num_legal_accounts,
+                        num_written_off_accounts, num_suit_filed_accounts,
+                        legal_status_dominant
+      Settlement dynamics (5): settlement_attempt_count, settlement_breach_count,
+                                settlement_success_rate, post_settlement_cure_flag,
+                                months_since_last_settlement
+      Write-off indicators (4): writeoff_flag, writeoff_account_count,
+                                 months_since_first_writeoff, total_written_off_balance
+      Legal friction (4): legal_friction_score, legal_escalation_flag,
+                          num_legal_actions_12m, legal_sequence_flag
+
+    Identifies status from account_status (or accountstatus) column using regex.
+    """
+    R = CFG["ref_col"]
+
+    # ── classify legal status per tradeline row ───────────────────────────────
+    legal = (account
+             .withColumn(
+                 "_status_upper",
+                 F.upper(F.coalesce(F.col("accountstatus"), F.lit("")))
+             )
+             .withColumn(
+                 "_is_written_off",
+                 F.when(F.col("_status_upper").rlike(r"WRIT.*OFF|WRITE.OFF|^WO$"), 1).otherwise(0)
+             )
+             .withColumn(
+                 "_is_settled",
+                 F.when(F.col("_status_upper").rlike(r"SETTL|COMPROMISE"), 1).otherwise(0)
+             )
+             .withColumn(
+                 "_is_suit",
+                 F.when(
+                     F.col("_status_upper").rlike(r"SUIT|LEGAL.*ACTION|COURT|LITIGATION"),
+                     1
+                 ).otherwise(0)
+             )
+             .withColumn(
+                 "_has_legal",
+                 F.greatest(F.col("_is_written_off"), F.col("_is_settled"), F.col("_is_suit"))
+             )
+             .withColumn("_bal", F.coalesce(F.col("amountowed").cast("double"), F.lit(0.0)))
+             )
+
+    # ── most-recent snapshot ──────────────────────────────────────────────────
+    w_latest = Window.partitionBy(R).orderBy(F.col("asofdate").desc())
+    snap = (legal.withColumn("_rn", F.row_number().over(w_latest))
+                 .filter(F.col("_rn") == 1))
+
+    # ── aggregate ─────────────────────────────────────────────────────────────
+    agg = snap.groupBy(R).agg(
+        F.max("_has_legal").alias("legal_has_legal_flag"),
+        F.sum("_has_legal").alias("legal_num_legal_accounts"),
+        F.sum("_is_written_off").alias("legal_num_written_off_accounts"),
+        F.sum("_is_settled").alias("legal_num_settled_accounts"),
+        F.sum("_is_suit").alias("legal_num_suit_filed_accounts"),
+
+        # Total written-off balance
+        F.sum(
+            F.when(F.col("_is_written_off") == 1, F.col("_bal")).otherwise(0.0)
+        ).alias("legal_total_written_off_balance"),
+
+        # Date of first write-off (for months_since)
+        F.min(
+            F.when(F.col("_is_written_off") == 1, F.col("asofdate"))
+        ).alias("_first_wo_date"),
+
+        F.max("asofdate").alias("_as_of"),
+    )
+
+    # ── derived fields ────────────────────────────────────────────────────────
+    agg = agg.withColumn(
+        "legal_writeoff_flag",
+        (F.col("legal_num_written_off_accounts") > 0).cast("int")
+    ).withColumn(
+        "legal_settlement_attempt_count",
+        F.col("legal_num_settled_accounts")
+    ).withColumn(
+        "legal_months_since_first_writeoff",
+        F.when(
+            F.col("_first_wo_date").isNotNull(),
+            F.months_between(F.col("_as_of"), F.col("_first_wo_date"))
+        )
+    ).withColumn(
+        # Settlement success proxy: settled but not also written off
+        "legal_settlement_success_rate",
+        F.when(
+            F.col("legal_num_settled_accounts") > 0,
+            1.0 - (F.col("legal_num_written_off_accounts") /
+                   F.col("legal_num_settled_accounts"))
+        ).otherwise(F.lit(None).cast("double"))
+    ).withColumn(
+        "legal_post_settlement_cure_flag",
+        F.when(
+            (F.col("legal_num_settled_accounts") > 0) &
+            (F.col("legal_num_written_off_accounts") == 0),
+            1
+        ).otherwise(0)
+    ).withColumn(
+        # Legal friction: weighted combination of suits + write-offs
+        "legal_friction_score",
+        F.least(
+            F.lit(1.0),
+            (F.col("legal_num_suit_filed_accounts") * 0.5 +
+             F.col("legal_num_written_off_accounts") * 0.3 +
+             F.col("legal_num_settled_accounts") * 0.2) /
+            F.greatest(F.col("legal_num_legal_accounts"), F.lit(1))
+        )
+    ).withColumn(
+        "legal_escalation_flag",
+        (F.col("legal_num_suit_filed_accounts") > 0).cast("int")
+    ).withColumn(
+        "legal_sequence_flag",
+        # Both settled and written-off = breach pattern
+        (
+            (F.col("legal_num_settled_accounts") > 0) &
+            (F.col("legal_num_written_off_accounts") > 0)
+        ).cast("int")
+    ).withColumn(
+        "legal_dominant_status",
+        F.when(F.col("legal_num_suit_filed_accounts") > 0, "SUIT_FILED")
+         .when(F.col("legal_num_written_off_accounts") > 0, "WRITTEN_OFF")
+         .when(F.col("legal_num_settled_accounts") > 0, "SETTLED")
+         .otherwise("NONE")
+    )
+
+    keep_cols = [R] + [c for c in agg.columns if c.startswith("legal_") and c != R]
+    return agg.select(keep_cols)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 28 — MAIN ASSEMBLY FUNCTION
 # Calls all sections in dependency order and joins all outputs on ref_no.
-# Returns: one wide DataFrame per customer with ~500 features.
+# Returns: one wide DataFrame per customer with ~650 features.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_complete_bureau_features(
@@ -1690,7 +2661,7 @@ def run_complete_bureau_features(
     """
     Run complete bureau feature factory. Single entry point.
 
-    Execution order (19 steps):
+    Execution order (25 steps):
         1.  load_bureau_tables
         2.  build_bureau_panel
         3.  build_dpd_states               → Section 5
@@ -1710,6 +2681,12 @@ def run_complete_bureau_features(
         17. build_pre_existing_stress      → Section 19
         18. Join all on ref_no
         19. build_cross_domain_interactions → Section 20 (post-join)
+        20. build_bfe_static_snapshot      → Section 22 (from recovery_agent_practical)
+        21. build_extended_vintage         → Section 23 (from recovery_agent_practical)
+        22. build_delinquency_regime       → Section 24 (from recovery_agent_practical)
+        23. build_tdr_restructuring        → Section 26 (from recovery_agent_practical)
+        24. build_legal_actions            → Section 27 (from recovery_agent_practical)
+        25. build_extended_interactions    → Section 25 (post-join, from recovery_agent_practical)
 
     Args:
         spark:              SparkSession (Databricks)
@@ -1722,81 +2699,81 @@ def run_complete_bureau_features(
                              Columns: ref_no, cardx_first_delinquency_month
 
     Returns:
-        DataFrame keyed on ref_no with ~500 bureau features.
+        DataFrame keyed on ref_no with ~650 bureau features.
         Use SEGMENTATION_FEATURES / PROPENSITY_FEATURES lists for model inputs.
     """
     R = CFG["ref_col"]
     sep = "═" * 72
 
     print(sep)
-    print("BUREAU FEATURE COMPLETE — v3.0")
+    print("BUREAU FEATURE COMPLETE — v4.0")
     print(f"CardX monthly data : {'YES' if cardx_monthly_df    is not None else 'NO (cross-lender features disabled)'}")
     print(f"CardX delq anchor  : {'YES' if cardx_first_delq_df is not None else 'NO (pre-existing stress disabled)'}")
     print(sep)
 
     # ── 1-2. Load and build panel ─────────────────────────────────────────────
-    print("\n[1/19] Loading bureau tables...")
+    print("\n[1/25] Loading bureau tables...")
     tables = load_bureau_tables(spark, schema_name)
 
-    print("[2/19] Building PIT-safe bureau panel...")
+    print("[2/25] Building PIT-safe bureau panel...")
     panel   = build_bureau_panel(tables, bridge_df)
     history = panel["history"]
     account = panel["account"]
     enquiry = panel["enquiry"]
 
     # ── 3. DPD states ─────────────────────────────────────────────────────────
-    print("[3/19] Building DPD states (S0-S4)...")
+    print("[3/25] Building DPD states (S0-S4)...")
     dpd_states = build_dpd_states(history)
 
     # ── 4. Stage episodes ─────────────────────────────────────────────────────
-    print("[4/19] Building stage episodes (contiguous-run IDs)...")
+    print("[4/25] Building stage episodes (contiguous-run IDs)...")
     episodes = _build_stage_episodes(dpd_states)
 
     # ── 5-8. Within-stage and cross-stage features ────────────────────────────
-    print("[5/19] Within-stage exposure dynamics (balance dip proxy)...")
+    print("[5/25] Within-stage exposure dynamics (balance dip proxy)...")
     exposure = build_within_stage_exposure_dynamics(episodes, history)
 
-    print("[6/19] Within-stage loan count dynamics...")
+    print("[6/25] Within-stage loan count dynamics...")
     loans = build_within_stage_loan_count_dynamics(episodes, history)
 
-    print("[7/19] Within-stage DPD counter dynamics...")
+    print("[7/25] Within-stage DPD counter dynamics...")
     dpd_dyn = build_within_stage_dpd_dynamics(episodes)
 
-    print("[8/19] Cross-stage transition dynamics (roll-fwd/cure rates)...")
+    print("[8/25] Cross-stage transition dynamics (roll-fwd/cure rates)...")
     transitions = build_cross_stage_transition_dynamics(episodes)
 
     # ── 9-10. Physics and regime payment ─────────────────────────────────────
-    print("[9/19] Trajectory & physics features (velocity/entropy/inertia)...")
+    print("[9/25] Trajectory & physics features (velocity/entropy/inertia)...")
     physics = build_trajectory_and_physics(dpd_states)
 
-    print("[10/19] Regime-dependent repayment (NORMAL vs STRESSED delta)...")
+    print("[10/25] Regime-dependent repayment (NORMAL vs STRESSED delta)...")
     regime_pay = build_regime_dependent_repayment(dpd_states, history)
 
     # ── 11-15. Structural and ecology features ────────────────────────────────
-    print("[11/19] Vintage & account maturity features...")
+    print("[11/25] Vintage & account maturity features...")
     vintage = build_vintage_features(account)
 
-    print("[12/19] Lender ecology (type mix, HHI concentration)...")
+    print("[12/25] Lender ecology (type mix, HHI concentration)...")
     ecology = build_lender_ecology(account)
 
-    print("[13/19] Enquiries (credit seeking, rejection proxy)...")
+    print("[13/25] Enquiries (credit seeking, rejection proxy)...")
     enquiries = build_enquiries(enquiry)
 
-    print("[14/19] Payment features (RFM scores, regime, elasticity)...")
+    print("[14/25] Payment features (RFM scores, regime, elasticity)...")
     rfm = build_rfm_and_payment_features(history)
 
     # ── 15-17. Cross-lender and stress features ───────────────────────────────
-    print("[15/19] Cross-lender dynamics (CardX vs bureau alignment)...")
+    print("[15/25] Cross-lender dynamics (CardX vs bureau alignment)...")
     cross_lender = build_cross_lender_dynamics(dpd_states, cardx_monthly_df)
 
-    print("[16/19] Debt prioritisation (secured vs unsecured)...")
+    print("[16/25] Debt prioritisation (secured vs unsecured)...")
     debt_priority = build_debt_prioritisation(history)
 
-    print("[17/19] Pre-existing bureau stress detection...")
+    print("[17/25] Pre-existing bureau stress detection...")
     pre_stress = build_pre_existing_stress(episodes, cardx_first_delq_df)
 
     # ── 18. Join all on ref_no ────────────────────────────────────────────────
-    print("[18/19] Joining all feature sets on ref_no...")
+    print("[18/25] Joining all feature sets on ref_no...")
 
     base = panel["panel"].select(R, "as_of_month").dropDuplicates([R])
 
@@ -1829,9 +2806,43 @@ def run_complete_bureau_features(
         after  = final.count()
         print(f"  ✓ {name:<28} {before:>8,} → {after:>8,} rows | +{len(feat_df.columns)-1} features")
 
-    # ── 19. Cross-domain interactions (post-join) ─────────────────────────────
-    print("[19/19] Cross-domain interaction features...")
+    # ── 19. Cross-domain interactions (post-join, Section 20) ────────────────
+    print("[19/25] Cross-domain interaction features (Section 20)...")
     final = build_cross_domain_interactions(final)
+
+    # ── 20. BFE static snapshot (Section 22) ─────────────────────────────────
+    print("[20/25] BFE static snapshot features (Section 22)...")
+    bfe_snap = build_bfe_static_snapshot(tables["account"])
+    final = final.join(bfe_snap, R, "left")
+    print(f"  ✓ bfe_static_snapshot   +{len(bfe_snap.columns)-1} features")
+
+    # ── 21. Extended vintage (Section 23) ────────────────────────────────────
+    print("[21/25] Extended vintage & lifecycle (Section 23)...")
+    ext_vint = build_extended_vintage(tables["history"], tables["account"])
+    final = final.join(ext_vint, R, "left")
+    print(f"  ✓ extended_vintage      +{len(ext_vint.columns)-1} features")
+
+    # ── 22. Delinquency regime (Section 24) ──────────────────────────────────
+    print("[22/25] Delinquency regime classification (Section 24)...")
+    delq_regime = build_delinquency_regime(dpd_states)
+    final = final.join(delq_regime, R, "left")
+    print(f"  ✓ delinquency_regime    +{len(delq_regime.columns)-1} features")
+
+    # ── 23. TDR / restructuring (Section 26) ─────────────────────────────────
+    print("[23/25] TDR/restructuring dynamics (Section 26)...")
+    tdr = build_tdr_restructuring(tables["account"])
+    final = final.join(tdr, R, "left")
+    print(f"  ✓ tdr_restructuring     +{len(tdr.columns)-1} features")
+
+    # ── 24. Legal actions (Section 27) ───────────────────────────────────────
+    print("[24/25] Legal actions & settlement (Section 27)...")
+    legal = build_legal_actions(tables["account"])
+    final = final.join(legal, R, "left")
+    print(f"  ✓ legal_actions         +{len(legal.columns)-1} features")
+
+    # ── 25. Extended BFE interactions (Section 25, must be last) ─────────────
+    print("[25/25] Extended BFE interaction flags (Section 25)...")
+    final = build_extended_interactions(final)
 
     final = final.dropDuplicates([R])
 
