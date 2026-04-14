@@ -517,12 +517,12 @@ def build_exposure_utilisation_features(
                    F.sum(BAL).alias(f"EXPOSURE_AT_RISK_{dim}"),
                ))
 
-        # FIX v2.1: UTIL_TREND_3M — (util_now - util_3m_ago) / 3
+        # UTIL_TREND_3M — (util_now - util_3m_ago) / 3  [lag(3) = 3 months prior]
         agg = agg.withColumn(
             f"UTIL_TREND_3M_{dim}",
             _safe_div(
                 F.col(f"UTIL_{dim}") -
-                F.lag(f"UTIL_{dim}", 2).over(w_cust),
+                F.lag(f"UTIL_{dim}", 3).over(w_cust),
                 F.lit(3)))
 
         results.append(agg.select(
@@ -1185,6 +1185,21 @@ def build_temporal_velocity_features(episode_df: DataFrame) -> DataFrame:
                   .groupBy(REF)
                   .agg(F.min("_months_gap").alias("ESCALATION_VELOCITY_TO_NPL")))
 
+    # ── Escalation velocity to SM ─────────────────────────────────────────────
+    sm_entry = (df.filter((F.col("episode_stage") == "SM") &
+                           F.col("_ep_first_row"))
+                .select(REF, F.col(DATE).alias("_sm_start"),
+                        F.col("episode_id").alias("_sm_ep")))
+
+    escalation_sm = (current_entry.join(sm_entry, on=REF, how="inner")
+                     .filter(F.col("_sm_ep") > F.col("_current_ep"))
+                     .withColumn("_months_gap",
+                                 F.months_between(
+                                     F.col("_sm_start"),
+                                     F.col("_current_start")))
+                     .groupBy(REF)
+                     .agg(F.min("_months_gap").alias("ESCALATION_VELOCITY_TO_SM")))
+
     # Cure velocity: NPL→CURRENT
     npl_start_df = (df.filter((F.col("episode_stage") == "NPL") &
                                F.col("_ep_first_row"))
@@ -1229,8 +1244,9 @@ def build_temporal_velocity_features(episode_df: DataFrame) -> DataFrame:
 
     base = df.select(keep_cols).dropDuplicates([REF, DATE])
 
-    base = base.join(escalation, on=REF, how="left")
-    base = base.join(cure, on=REF, how="left")
+    base = base.join(escalation,    on=REF, how="left")
+    base = base.join(escalation_sm, on=REF, how="left")
+    base = base.join(cure,          on=REF, how="left")
 
     return base.dropDuplicates([REF, DATE])
 
