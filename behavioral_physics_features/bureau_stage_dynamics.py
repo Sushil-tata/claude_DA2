@@ -1,5 +1,5 @@
 """
-Bureau Stage Dynamics Engine  v2.1
+Bureau Stage Dynamics Engine  v2.4
 ====================================
 Stage-wise behavioral indicators for recovery likelihood, payment propensity,
 and account deterioration/improvement patterns.
@@ -60,7 +60,25 @@ v2.1 Fixes vs v2.0:
     - Cat 9 TDR: Added RESTRUCTURING_SUCCESS_FLAG (needs history_df)
     - Cat 10: New temporal velocity function (was not implemented)
 
-Version : 2.1.0
+v2.2 Fixes vs v2.1:
+    - Cat 3: UTIL_TREND_3M now uses lag(3) not lag(2) — correct 3M reference
+    - Cat 10: ESCALATION_VELOCITY_TO_SM implemented (was in docstring only)
+
+v2.3 Additions:
+    - Sections 14–19: 6 new recovery dynamics sections (payment effort,
+      stage velocity, cure/re-default, balance recovery, engagement, vintage)
+    - _stage_ordinal() helper + STAGE_LABELS constant
+    - Bug 6 fix: episode builder now detects temporal gaps > 2 months
+
+v2.4 Fixes vs v2.3:
+    - Section 12: STAGE_STICKINESS_SCORE fixed (was averaging month-in-episode
+      counter instead of episode duration)
+    - Section 13: New — TIME_SINCE_RESTRUCTURING_OVERALL added (was documented
+      in Section 11 docstring but never computed)
+    - Section 11 docstring: removed TIME_SINCE_RESTRUCTURING reference
+      (moved to Section 13)
+
+Version : 2.4.0
 Author  : Behavioral Physics Team / CardX Decision Intelligence
 """
 
@@ -1079,7 +1097,6 @@ def build_restructuring_features(
     Features:
         TDR_FLAG_OVERALL                  1 if ever restructured
         TDR_COUNT_OVERALL                 # restructured accounts
-        TIME_SINCE_RESTRUCTURING_OVERALL  months since last restructure opendate
         RESTRUCTURING_SUCCESS_FLAG        1 if max DPD < 30 for 6M after restructure
     """
     tdr_accounts = (account_df
@@ -1253,9 +1270,21 @@ def build_temporal_velocity_features(episode_df: DataFrame) -> DataFrame:
             .agg(F.min("_months_gap").alias("CURE_VELOCITY_FROM_NPL")))
 
     # ── Stage stickiness: avg episode duration in 12M ─────────────────────────
+    # Pre-compute ep_length per episode, then take rolling 12M average of
+    # episode durations (only at episode-start rows to avoid counting twice)
+    _w_ep_full = Window.partitionBy(REF, "episode_id")
+    df = df.withColumn("_ep_duration", F.count("*").over(_w_ep_full))
+    _ep_dur_at_start = F.when(
+        F.col("episode_month_number") == 1, F.col("_ep_duration")
+    )
     df = df.withColumn(
         "STAGE_STICKINESS_SCORE",
-        F.avg("episode_month_number").over(w_12m))
+        _safe_div(
+            F.sum(_ep_dur_at_start).over(w_12m),
+            F.sum(F.when(F.col("episode_month_number") == 1, 1)
+                   .otherwise(0)).over(w_12m),
+            F.lit(None)))
+    df = df.drop("_ep_duration")
 
     # ── Escalation acceleration flag ──────────────────────────────────────────
     prev_dpd  = F.lag(DPD_COL).over(w_time)
@@ -1284,6 +1313,40 @@ def build_temporal_velocity_features(episode_df: DataFrame) -> DataFrame:
     base = base.join(cure,          on=REF, how="left")
 
     return base.dropDuplicates([REF, DATE])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 13 — TIME SINCE RESTRUCTURING (fills gap in section numbering)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_time_since_restructuring(
+    account_df: DataFrame,
+    as_of_date: str,
+) -> DataFrame:
+    """
+    Compute months since last restructuring (TDR) event.
+
+    This feature was documented in Section 11 (build_restructuring_features)
+    but was never computed because that function has no as_of_date parameter.
+    Extracted here as a standalone 1-feature builder.
+
+    Features:
+        TIME_SINCE_RESTRUCTURING_OVERALL  months from last TDR opendate to as_of_date
+    """
+    pit = F.to_date(F.lit(as_of_date))
+
+    tdr = (account_df
+           .filter(F.col(ACCT_TYPE).cast("string") == "90")
+           .groupBy(REF)
+           .agg(F.max("opendate").alias("_last_tdr_open")))
+
+    result = (tdr
+              .withColumn(
+                  "TIME_SINCE_RESTRUCTURING_OVERALL",
+                  F.months_between(pit, F.to_date(F.col("_last_tdr_open"))))
+              .select(REF, "TIME_SINCE_RESTRUCTURING_OVERALL"))
+
+    return result.dropDuplicates([REF])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2168,6 +2231,9 @@ def run_stage_dynamics(
     print("[12] Cat 9b — Restructuring / TDR features...")
     tdr_feats      = build_restructuring_features(account_enriched, history_df, spark)
 
+    print("[12b] Time since restructuring...")
+    tdr_timing_feats = build_time_since_restructuring(account_enriched, as_of_date)
+
     print("[13] Cat 10 — Temporal velocity features...")
     vel_feats      = build_temporal_velocity_features(episode_df)
 
@@ -2225,6 +2291,7 @@ def run_stage_dynamics(
         (closure_feats,    "account_closure"),
         (ws_feats,         "within_stage_exposure"),
         (tdr_feats,        "restructuring"),
+        (tdr_timing_feats, "tdr_timing"),
         (effort_feats,     "payment_effort"),
         (velocity_feats,   "stage_velocity"),
         (cure_feats,       "cure_redefault"),
