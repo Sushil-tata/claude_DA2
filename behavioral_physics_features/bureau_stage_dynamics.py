@@ -108,12 +108,23 @@ DIMS = [
     "OVERALL",
 ]
 
+# Stage → lowercase label used as column suffix in new sections
+STAGE_LABELS = {
+    "CURRENT": "current",
+    "X":       "x",
+    "SM":      "sm",
+    "NPL":     "npl",
+    "CO":      "co",
+    "CO_DEEP": "co_deep",
+}
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _safe_div(num, den):
-    """NULL-safe division; returns NULL on zero/null denominator."""
-    return F.when((den.isNotNull()) & (den != 0), num / den)
+def _safe_div(num, den, default=None):
+    """NULL-safe division; returns NULL (or default) on zero/null denominator."""
+    result = F.when((den.isNotNull()) & (den != 0), num / den)
+    return result.otherwise(default) if default is not None else result
 
 
 def _dim_filter(acct_type_col: str, dim: str):
@@ -153,6 +164,24 @@ def _stage_numeric(stage_col):
          .when(F.col(stage_col) == "NPL",      3)
          .when(F.col(stage_col) == "CO",       4)
          .when(F.col(stage_col) == "CO_DEEP",  5)
+         .otherwise(F.lit(None))
+    )
+
+
+def _stage_ordinal(col_name: str):
+    """
+    Map stage label string column → ordinal integer 0–5.
+    Accepts a column *name* string (unlike _stage_numeric which takes column).
+    Used by recovery dynamics sections so they share the same mapping.
+    """
+    c = F.col(col_name)
+    return (
+        F.when(c == "CURRENT", 0)
+         .when(c == "X",       1)
+         .when(c == "SM",      2)
+         .when(c == "NPL",     3)
+         .when(c == "CO",      4)
+         .when(c == "CO_DEEP", 5)
          .otherwise(F.lit(None))
     )
 
@@ -275,14 +304,20 @@ def build_stage_episodes(state_df: DataFrame) -> DataFrame:
           .withColumn(STAGE_COL,       _assign_stage(F.col(DPD_COL)))
           .withColumn("stage_numeric", _stage_numeric(STAGE_COL))
           .withColumn("_prev_stage", F.lag(STAGE_COL).over(w_time))
+          .withColumn("_prev_date",  F.lag(DATE, 1).over(w_time))
+          .withColumn("_month_gap",
+                      F.when(F.col("_prev_date").isNotNull(),
+                             F.months_between(F.col(DATE), F.col("_prev_date")))
+                       .otherwise(F.lit(None)))
           .withColumn("_stage_changed",
                       F.when(F.col("_prev_stage").isNull(), 1)
                        .when(F.col("_prev_stage") != F.col(STAGE_COL), 1)
+                       .when(F.col("_month_gap") > 2, 1)   # gap > 2M = new episode
                        .otherwise(0))
           .withColumn("episode_id",
                       F.sum("_stage_changed").over(
                           w_time.rowsBetween(Window.unboundedPreceding, 0)))
-          .drop("_prev_stage", "_stage_changed"))
+          .drop("_prev_stage", "_stage_changed", "_prev_date", "_month_gap"))
 
     w_ep = Window.partitionBy(REF, "episode_id").orderBy(DATE)
 
@@ -1252,7 +1287,804 @@ def build_temporal_velocity_features(episode_df: DataFrame) -> DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 13 — MAIN ORCHESTRATOR
+# SECTION 14 — PAYMENT EFFORT DYNAMICS PER STAGE
+# Balance-dip intensity as payment proxy, weighted by stage severity
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_payment_effort_dynamics(
+    episode_df: DataFrame,
+    history_df: DataFrame,
+) -> DataFrame:
+    """
+    Compute payment effort signals within each stage episode.
+
+    Recovery insight: A customer who makes partial payments while in NPL
+    is fundamentally different from one in NPL with zero balance movement.
+    The former has capacity or willingness that recovery can leverage.
+
+    Features per stage label (e.g. _npl, _co, _co_deep …):
+        avg_payment_effort_ratio_{stage}     dip_months / episode_months
+        avg_payment_effort_intensity_{stage} avg_dip_amount / balance_at_entry
+        max_consecutive_no_dip_{stage}       longest streak of NO balance dip
+        avg_dip_recency_{stage}              months since last dip at episode exit
+        avg_dip_acceleration_{stage}         dips_second_half - dips_first_half
+        avg_payment_momentum_{stage}         recency-weighted dip score
+        avg_pay_to_balance_ratio_{stage}     |dip| / prior_balance
+        avg_payment_volatility_{stage}       stddev of pay_to_balance_ratio
+        max_partial_pay_streak_{stage}       longest streak 0 < pay_ratio < 0.30
+    """
+    monthly = history_df.groupBy(REF, DATE).agg(
+        F.sum(BAL).alias("_total_bal"),
+    )
+
+    df = (episode_df
+          .select(REF, DATE, "episode_id", "episode_stage", "episode_month_number")
+          .join(monthly, on=[REF, DATE], how="left"))
+
+    w_ep      = Window.partitionBy(REF, "episode_id").orderBy(DATE)
+    w_ep_full = Window.partitionBy(REF, "episode_id")
+
+    df = (df
+          .withColumn("_bal_prev", F.lag("_total_bal", 1).over(w_ep))
+          .withColumn("_bal_dip",
+                      F.when(F.col("_total_bal") < F.col("_bal_prev"), 1).otherwise(0))
+          .withColumn("_dip_amount",
+                      F.when(F.col("_bal_dip") == 1,
+                             F.col("_bal_prev") - F.col("_total_bal"))
+                       .otherwise(F.lit(0.0))))
+
+    ep_len    = F.count("*").over(w_ep_full)
+    half_pt   = ep_len / 2
+
+    df = (df
+          .withColumn("_ep_len",   ep_len)
+          .withColumn("_in_first",  F.when(F.col("episode_month_number") <= half_pt, 1).otherwise(0))
+          .withColumn("_in_second", F.when(F.col("episode_month_number") >  half_pt, 1).otherwise(0)))
+
+    # Consecutive no-dip streak via island detection
+    df = (df
+          .withColumn("_no_dip",  F.when(F.col("_bal_dip") == 0, 1).otherwise(0))
+          .withColumn("_dip_grp", F.sum("_bal_dip").over(w_ep))
+          .withColumn("_no_dip_run",
+                      F.row_number().over(
+                          Window.partitionBy(REF, "episode_id", "_dip_grp")
+                                .orderBy(DATE)) * F.col("_no_dip")))
+
+    # Recency weight: recent dips score higher
+    df = df.withColumn(
+        "_dip_recency_wt",
+        F.when(F.col("_bal_dip") == 1,
+               F.col("episode_month_number").cast("double") / F.col("_ep_len"))
+         .otherwise(F.lit(0.0)))
+
+    # Months since last dip within episode
+    df = (df
+          .withColumn("_last_dip_mn",
+                      F.when(F.col("_bal_dip") == 1, F.col("episode_month_number")))
+          .withColumn("_last_dip_mn_filled",
+                      F.last("_last_dip_mn", ignorenulls=True).over(w_ep))
+          .withColumn("_dip_rec_months",
+                      F.col("episode_month_number") -
+                      F.coalesce(F.col("_last_dip_mn_filled"), F.lit(0))))
+
+    # Pay-to-balance ratio + partial-pay streak (0 < ratio < 0.30)
+    df = (df
+          .withColumn("_pay_ratio",
+                      F.when(F.col("_bal_dip") == 1,
+                             _safe_div(F.col("_dip_amount"), F.col("_bal_prev"), F.lit(0.0)))
+                       .otherwise(F.lit(0.0)))
+          .withColumn("_is_partial",
+                      F.when((F.col("_pay_ratio") > 0) & (F.col("_pay_ratio") < 0.30), 1)
+                       .otherwise(0))
+          .withColumn("_partial_brk", F.when(F.col("_is_partial") == 0, 1).otherwise(0))
+          .withColumn("_partial_grp", F.sum("_partial_brk").over(w_ep))
+          .withColumn("_partial_run",
+                      F.row_number().over(
+                          Window.partitionBy(REF, "episode_id", "_partial_grp")
+                                .orderBy(DATE)) * F.col("_is_partial")))
+
+    # Episode-level aggregation
+    ep_agg = (df.groupBy(REF, "episode_id", "episode_stage")
+              .agg(
+                  F.count("*").alias("_ep_len"),
+                  F.sum("_bal_dip").alias("_dip_cnt"),
+                  F.avg("_dip_amount").alias("_avg_dip_amt"),
+                  F.max("_no_dip_run").alias("_max_no_dip"),
+                  F.max("_dip_rec_months").alias("_dip_rec_exit"),
+                  F.sum(F.when(F.col("_in_first")  == 1, F.col("_bal_dip")).otherwise(0))
+                   .alias("_dips_first"),
+                  F.sum(F.when(F.col("_in_second") == 1, F.col("_bal_dip")).otherwise(0))
+                   .alias("_dips_second"),
+                  F.sum("_dip_recency_wt").alias("_momentum_raw"),
+                  F.first("_total_bal").alias("_bal_entry"),
+                  F.avg(F.when(F.col("_bal_dip") == 1, F.col("_pay_ratio"))).alias("_avg_pr"),
+                  F.stddev(F.when(F.col("_bal_dip") == 1, F.col("_pay_ratio"))).alias("_pay_vol"),
+                  F.max("_partial_run").alias("_partial_streak"),
+              )
+              .withColumn("_effort_ratio",
+                          _safe_div(F.col("_dip_cnt"), F.col("_ep_len"), F.lit(0.0)))
+              .withColumn("_effort_intensity",
+                          _safe_div(F.col("_avg_dip_amt"), F.col("_bal_entry"), F.lit(0.0)))
+              .withColumn("_dip_accel", F.col("_dips_second") - F.col("_dips_first"))
+              .withColumn("_momentum",
+                          _safe_div(F.col("_momentum_raw"), F.col("_dip_cnt"), F.lit(0.0))))
+
+    # Stage-level aggregation → pivot by stage
+    stage_agg = (ep_agg.groupBy(REF, "episode_stage")
+                 .agg(
+                     F.avg("_effort_ratio").alias("avg_payment_effort_ratio"),
+                     F.avg("_effort_intensity").alias("avg_payment_effort_intensity"),
+                     F.max("_max_no_dip").alias("max_consecutive_no_dip"),
+                     F.avg("_dip_rec_exit").alias("avg_dip_recency"),
+                     F.avg("_dip_accel").alias("avg_dip_acceleration"),
+                     F.avg("_momentum").alias("avg_payment_momentum"),
+                     F.avg("_avg_pr").alias("avg_pay_to_balance_ratio"),
+                     F.avg("_pay_vol").alias("avg_payment_volatility"),
+                     F.max("_partial_streak").alias("max_partial_pay_streak"),
+                 ))
+
+    metric_cols = [
+        "avg_payment_effort_ratio", "avg_payment_effort_intensity",
+        "max_consecutive_no_dip", "avg_dip_recency", "avg_dip_acceleration",
+        "avg_payment_momentum", "avg_pay_to_balance_ratio",
+        "avg_payment_volatility", "max_partial_pay_streak",
+    ]
+
+    stage_dfs = []
+    for stage, label in STAGE_LABELS.items():
+        s = stage_agg.filter(F.col("episode_stage") == stage).select(
+            REF, *[F.col(c).alias(f"{c}_{label}") for c in metric_cols])
+        stage_dfs.append(s)
+
+    result = stage_dfs[0]
+    for s in stage_dfs[1:]:
+        result = result.join(s, on=REF, how="full")
+    return result.dropDuplicates([REF])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 15 — STAGE VELOCITY & ACCELERATION
+# Speed of deterioration and cure across the delinquency lifecycle
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_stage_velocity_features(episode_df: DataFrame) -> DataFrame:
+    """
+    Stage-transition velocity and acceleration across customer lifecycle.
+
+    Recovery insight: Two customers both at NPL — one took 12 months to get
+    there (slow deterioration, structural), the other 3 months (shock). Velocity
+    tells you the TYPE of default.
+
+    Features:
+        months_current_to_sm       months from first CURRENT to first SM entry
+        months_current_to_npl      months from first CURRENT to first NPL entry
+        months_current_to_co       months from first CURRENT to first CO entry
+        months_current_to_co_deep  months from first CURRENT to first CO_DEEP entry
+        months_sm_to_co            months from first SM to first CO entry
+        max_stage_ever_reached     highest stage ordinal (0–5)
+        months_at_worst_stage      total months in worst stage
+        deterioration_velocity     max_stage_ord / months_to_reach_it
+        cure_velocity              avg (stages retreated / months in source stage)
+        stage_churn_rate           episode count / months observed
+        time_in_current_stage_months months in most recent stage
+        fastest_deterioration_speed min months between consecutive worsening transitions
+        npl_stickiness_index       avg duration of NPL episodes
+        co_stickiness_index        avg duration of CO episodes
+        co_deep_stickiness_index   avg duration of CO_DEEP episodes
+        stage_reversal_rate        cure transitions / total transitions
+        num_transitions_sm_to_npl  count SM→NPL (key regulatory gate)
+        num_transitions_npl_to_current count NPL→CURRENT (full cure — rare)
+        num_transitions_co_to_npl  count CO→NPL (partial cure)
+        stages_traversed_12m       distinct stages in most recent 12 months
+    """
+    # First entry per stage
+    first_entries = (episode_df
+                     .filter(F.col("episode_month_number") == 1)
+                     .groupBy(REF, "episode_stage")
+                     .agg(F.min(DATE).alias("first_entry_month"),
+                          F.count("*").alias("ep_count_in_stage")))
+
+    # Pivot to wide (one row per customer)
+    pivot = (first_entries
+             .groupBy(REF)
+             .pivot("episode_stage", STAGES)
+             .agg(F.min("first_entry_month")))
+    for stage in STAGES:
+        pivot = pivot.withColumnRenamed(stage, f"_fe_{stage}")
+
+    # Velocity metrics from stage entry dates
+    def _months(a_col, b_col):
+        return F.when(
+            F.col(a_col).isNotNull() & F.col(b_col).isNotNull(),
+            F.months_between(F.col(b_col), F.col(a_col)))
+
+    result = (pivot
+              .withColumn("months_current_to_sm",       _months("_fe_CURRENT", "_fe_SM"))
+              .withColumn("months_current_to_npl",      _months("_fe_CURRENT", "_fe_NPL"))
+              .withColumn("months_current_to_co",       _months("_fe_CURRENT", "_fe_CO"))
+              .withColumn("months_current_to_co_deep",  _months("_fe_CURRENT", "_fe_CO_DEEP"))
+              .withColumn("months_sm_to_co",            _months("_fe_SM",      "_fe_CO")))
+
+    # Max stage ever reached
+    max_stage = (episode_df
+                 .withColumn("_ord", _stage_ordinal("episode_stage"))
+                 .groupBy(REF)
+                 .agg(F.max("_ord").alias("max_stage_ever_reached")))
+    result = result.join(max_stage, on=REF, how="left")
+
+    # Deterioration velocity
+    result = (result
+              .withColumn("_months_to_max",
+                          F.when(F.col("max_stage_ever_reached") >= 5,
+                                 F.col("months_current_to_co_deep"))
+                           .when(F.col("max_stage_ever_reached") >= 4,
+                                 F.col("months_current_to_co"))
+                           .when(F.col("max_stage_ever_reached") >= 3,
+                                 F.col("months_current_to_npl"))
+                           .when(F.col("max_stage_ever_reached") >= 2,
+                                 F.col("months_current_to_sm")))
+              .withColumn("deterioration_velocity",
+                          F.when(F.col("_months_to_max").isNotNull() &
+                                 (F.col("_months_to_max") > 0),
+                                 F.col("max_stage_ever_reached") /
+                                 F.col("_months_to_max")))
+              .drop("_months_to_max"))
+
+    # Stage churn + total months
+    churn = (episode_df
+             .filter(F.col("episode_month_number") == 1)
+             .groupBy(REF)
+             .agg(F.count("episode_id").alias("_total_eps"),
+                  F.countDistinct("episode_stage").alias("distinct_stages_ever"))
+             .join(
+                 episode_df.groupBy(REF).agg(
+                     F.countDistinct(DATE).alias("_total_months")),
+                 on=REF, how="left")
+             .withColumn("stage_churn_rate",
+                         _safe_div(F.col("_total_eps"), F.col("_total_months"), F.lit(0.0))))
+    result = result.join(churn.drop("_total_eps", "_total_months"), on=REF, how="left")
+
+    # Time in current (most recent) stage
+    w_latest = Window.partitionBy(REF).orderBy(F.col(DATE).desc())
+    latest_ep = (episode_df
+                 .withColumn("_rn", F.row_number().over(w_latest))
+                 .filter(F.col("_rn") == 1)
+                 .select(REF,
+                         F.col("episode_stage").alias("current_stage"),
+                         F.col("episode_month_number").alias("time_in_current_stage_months")))
+    result = result.join(latest_ep, on=REF, how="left")
+
+    # Stickiness indexes (avg episode duration per stage)
+    w_ep_full = Window.partitionBy(REF, "episode_id")
+    ep_dur = (episode_df
+              .withColumn("_ep_len", F.count("*").over(w_ep_full))
+              .filter(F.col("episode_month_number") == 1))
+
+    for stage, label in [("NPL", "npl"), ("CO", "co"), ("CO_DEEP", "co_deep")]:
+        stick = (ep_dur
+                 .filter(F.col("episode_stage") == stage)
+                 .groupBy(REF)
+                 .agg(F.avg("_ep_len").alias(f"{label}_stickiness_index")))
+        result = result.join(stick, on=REF, how="left")
+
+    # Episode-level transitions
+    w_ep_ord = Window.partitionBy(REF).orderBy("episode_id")
+    ep_trans = (episode_df
+                .filter(F.col("episode_month_number") == 1)
+                .select(REF, "episode_id", "episode_stage", DATE)
+                .withColumn("next_stage", F.lead("episode_stage", 1).over(w_ep_ord))
+                .withColumn("next_date",  F.lead(DATE, 1).over(w_ep_ord))
+                .withColumn("_ord",       _stage_ordinal("episode_stage"))
+                .withColumn("_next_ord",  _stage_ordinal("next_stage"))
+                .filter(F.col("next_stage").isNotNull()))
+
+    reversal = (ep_trans
+                .groupBy(REF)
+                .agg(
+                    F.count("*").alias("_total_trans"),
+                    F.sum(F.when(F.col("_next_ord") < F.col("_ord"), 1).otherwise(0))
+                     .alias("_cure_trans"),
+                    F.sum(F.when((F.col("episode_stage") == "SM") &
+                                 (F.col("next_stage") == "NPL"), 1).otherwise(0))
+                     .alias("num_transitions_sm_to_npl"),
+                    F.sum(F.when((F.col("episode_stage") == "NPL") &
+                                 (F.col("next_stage") == "CURRENT"), 1).otherwise(0))
+                     .alias("num_transitions_npl_to_current"),
+                    F.sum(F.when((F.col("episode_stage") == "CO") &
+                                 (F.col("next_stage") == "NPL"), 1).otherwise(0))
+                     .alias("num_transitions_co_to_npl"),
+                )
+                .withColumn("stage_reversal_rate",
+                            _safe_div(F.col("_cure_trans"),
+                                      F.col("_total_trans"), F.lit(0.0)))
+                .drop("_total_trans", "_cure_trans"))
+    result = result.join(reversal, on=REF, how="left")
+
+    # Months at worst stage
+    ep_with_ord = episode_df.withColumn("_ord", _stage_ordinal("episode_stage"))
+    worst_ord_per_cust = ep_with_ord.groupBy(REF).agg(
+        F.max("_ord").alias("_worst_ord"))
+    months_at_worst = (ep_with_ord
+                       .join(worst_ord_per_cust, on=REF, how="inner")
+                       .filter(F.col("_ord") == F.col("_worst_ord"))
+                       .groupBy(REF)
+                       .agg(F.countDistinct(DATE).alias("months_at_worst_stage")))
+    result = result.join(months_at_worst, on=REF, how="left")
+
+    # Stages traversed in last 12 months
+    cust_max_dt = episode_df.groupBy(REF).agg(F.max(DATE).alias("_max_dt"))
+    stages_12m = (episode_df
+                  .join(cust_max_dt, on=REF, how="inner")
+                  .filter(F.months_between(F.col("_max_dt"), F.col(DATE)) <= 12)
+                  .groupBy(REF)
+                  .agg(F.countDistinct("episode_stage").alias("stages_traversed_12m")))
+    result = result.join(stages_12m, on=REF, how="left")
+
+    # Fastest deterioration speed + cure velocity
+    ep_trans_with_dur = (ep_trans
+                         .withColumn("_next_ep_dt", F.lead(DATE, 1).over(w_ep_ord))
+                         .withColumn("_ep_dur",
+                                     F.months_between(F.col("_next_ep_dt"), F.col(DATE))))
+
+    fastest = (ep_trans_with_dur
+               .filter((F.col("_next_ord") > F.col("_ord")) &
+                       F.col("_ep_dur").isNotNull())
+               .groupBy(REF)
+               .agg(F.min("_ep_dur").alias("fastest_deterioration_speed")))
+    result = result.join(fastest, on=REF, how="left")
+
+    cure_vel = (ep_trans_with_dur
+                .filter((F.col("_next_ord") < F.col("_ord")) &
+                        F.col("_ep_dur").isNotNull() & (F.col("_ep_dur") > 0))
+                .withColumn("_stages_ret", F.col("_ord") - F.col("_next_ord"))
+                .groupBy(REF)
+                .agg(F.avg(F.col("_stages_ret") / F.col("_ep_dur"))
+                      .alias("cure_velocity")))
+    result = result.join(cure_vel, on=REF, how="left")
+
+    # Drop first-entry pivot columns
+    for stage in STAGES:
+        result = result.drop(f"_fe_{stage}")
+
+    return result.dropDuplicates([REF])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 16 — CURE & RE-DEFAULT DYNAMICS
+# Did the customer cure then re-default? Critical for recovery strategy.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_cure_redefault_dynamics(episode_df: DataFrame) -> DataFrame:
+    """
+    Detect cure-then-re-default cycles from episode transitions.
+
+    Cure event:   episode transition from SM/NPL/CO/CO_DEEP → CURRENT/X
+    Re-default:   after a cure, re-enters SM+ within 24 months
+
+    Features:
+        cure_count_lifetime         number of cure events
+        re_default_count_lifetime   number of re-default events
+        re_default_flag             1 if any re-default
+        avg_months_to_re_default    avg months cure→re-default
+        min_months_to_re_default    fastest re-default
+        structural_re_default_flag  1 if any re-default within 6 months
+        durable_cure_flag           1 if any cure lasted 12+ months without re-default
+        cure_depth_max              highest stage ordinal cured FROM
+        avg_cure_holding_period     avg months in cured state before re-default
+        cure_to_redefault_ratio     re_default_count / cure_count
+    """
+    w = Window.partitionBy(REF).orderBy("episode_id")
+
+    eps = (episode_df
+           .filter(F.col("episode_month_number") == 1)
+           .select(REF, "episode_id", "episode_stage", DATE)
+           .withColumn("_ord",      _stage_ordinal("episode_stage"))
+           .withColumn("_prev_ord", F.lag("_ord", 1).over(w))
+           .withColumn("_next_ord", F.lead("_ord", 1).over(w))
+           .withColumn("_next_dt",  F.lead(DATE, 1).over(w)))
+
+    # Cure destination: ord <= 1 (CURRENT/X) after ord >= 2 (SM+)
+    eps = (eps
+           .withColumn("_is_cure_dest",
+                       F.when((F.col("_ord") <= 1) &
+                              (F.col("_prev_ord") >= 2), 1).otherwise(0))
+           .withColumn("_cure_src_ord",
+                       F.when(F.col("_is_cure_dest") == 1, F.col("_prev_ord")))
+           # Re-default: after cure destination, next stage goes back to SM+
+           .withColumn("_is_redefault",
+                       F.when((F.col("_is_cure_dest") == 1) &
+                              (F.col("_next_ord") >= 2), 1).otherwise(0))
+           .withColumn("_months_to_redef",
+                       F.when(F.col("_is_redefault") == 1,
+                              F.months_between(F.col("_next_dt"), F.col(DATE))))
+           .withColumn("_cure_hold_months",
+                       F.when(F.col("_is_cure_dest") == 1,
+                              F.months_between(F.col("_next_dt"), F.col(DATE)))))
+
+    result = (eps.groupBy(REF)
+              .agg(
+                  F.sum("_is_cure_dest").alias("cure_count_lifetime"),
+                  F.sum("_is_redefault").alias("re_default_count_lifetime"),
+                  F.avg("_months_to_redef").alias("avg_months_to_re_default"),
+                  F.min("_months_to_redef").alias("min_months_to_re_default"),
+                  F.max("_cure_src_ord").alias("cure_depth_max"),
+                  F.avg("_cure_hold_months").alias("avg_cure_holding_period"),
+              )
+              .withColumn("re_default_flag",
+                          F.when(F.col("re_default_count_lifetime") > 0, 1).otherwise(0))
+              .withColumn("structural_re_default_flag",
+                          F.when(F.col("min_months_to_re_default") <= 6, 1).otherwise(0))
+              .withColumn("durable_cure_flag",
+                          F.when((F.col("cure_count_lifetime") > 0) &
+                                 ((F.col("re_default_count_lifetime") == 0) |
+                                  (F.col("min_months_to_re_default") >= 12)), 1)
+                           .otherwise(0))
+              .withColumn("cure_to_redefault_ratio",
+                          _safe_div(F.col("re_default_count_lifetime"),
+                                    F.col("cure_count_lifetime"), F.lit(0.0))))
+
+    return result.dropDuplicates([REF])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 17 — BALANCE RECOVERY POTENTIAL
+# Residual capacity signals for recovery amount estimation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_balance_recovery_potential(
+    episode_df: DataFrame,
+    history_df: DataFrame,
+) -> DataFrame:
+    """
+    Balance and capacity signals that inform recovery amount potential.
+
+    Recovery insight: A customer whose total bureau balance is declining while
+    defaulting at CardX has residual capacity. One whose balance is increasing
+    everywhere is overleveraged.
+
+    Features:
+        bureau_balance_trend_6m         6M slope of total bureau balance (THB/month)
+        bureau_balance_trend_12m        12M slope of total bureau balance
+        bureau_limit_utilization_latest util = balance / limit at latest snapshot
+        available_limit_latest          total_limit - total_balance at latest
+        balance_concentration_hhi       HHI across lenders (1 = single lender)
+        deleveraging_rate_12m           (bal_12m_ago - bal_now) / bal_12m_ago
+        balance_at_worst_vs_entry       balance at worst stage / balance at first CURRENT entry
+        top_lender_balance_share        largest lender balance / total balance
+        limit_fragmentation_score       largest single lender limit / total limits
+        num_active_secured_trades       count secured tradelines at latest snapshot
+        num_active_unsecured_trades     count unsecured tradelines at latest snapshot
+    """
+    monthly = history_df.groupBy(REF, DATE).agg(
+        F.sum(BAL).alias("_tot_bal"),
+        F.sum(LIMIT).alias("_tot_lim"),
+    )
+    lender_bal = history_df.groupBy(REF, DATE, LENDER).agg(
+        F.sum(BAL).alias("_lend_bal"))
+    lender_lim = history_df.groupBy(REF, DATE, LENDER).agg(
+        F.sum(LIMIT).alias("_lend_lim"))
+
+    w_latest = Window.partitionBy(REF).orderBy(F.col(DATE).desc())
+
+    latest_month = (monthly
+                    .withColumn("_rn", F.row_number().over(w_latest))
+                    .filter(F.col("_rn") == 1)
+                    .select(REF, DATE))
+
+    # HHI = sum(share^2)
+    lend_latest = lender_bal.join(latest_month.withColumnRenamed(DATE, "_ld"),
+                                  on=REF, how="inner").filter(
+                                      F.col(DATE) == F.col("_ld")).drop("_ld")
+    tot_latest  = lend_latest.groupBy(REF).agg(F.sum("_lend_bal").alias("_tb"))
+    hhi = (lend_latest
+           .join(tot_latest, on=REF, how="left")
+           .withColumn("_share_sq",
+                       F.pow(_safe_div(F.col("_lend_bal"), F.col("_tb"), F.lit(0.0)), 2))
+           .groupBy(REF)
+           .agg(F.sum("_share_sq").alias("balance_concentration_hhi"),
+                F.max("_lend_bal").alias("_top_lend_bal"),
+                F.sum("_lend_bal").alias("_tot_for_share"))
+           .withColumn("top_lender_balance_share",
+                       _safe_div(F.col("_top_lend_bal"),
+                                 F.col("_tot_for_share"), F.lit(0.0)))
+           .drop("_top_lend_bal", "_tot_for_share"))
+
+    # Limit fragmentation
+    lim_latest = lender_lim.join(latest_month.withColumnRenamed(DATE, "_ld"),
+                                  on=REF, how="inner").filter(
+                                      F.col(DATE) == F.col("_ld")).drop("_ld")
+    frag = (lim_latest
+            .groupBy(REF)
+            .agg(F.max("_lend_lim").alias("_max_lim"),
+                 F.sum("_lend_lim").alias("_tot_lim"))
+            .withColumn("limit_fragmentation_score",
+                        _safe_div(F.col("_max_lim"), F.col("_tot_lim"), F.lit(0.0)))
+            .drop("_max_lim", "_tot_lim"))
+
+    # Active trade counts by secured/unsecured (keyword match on LENDER)
+    _sec_kw = ["MORTGAGE","GH BANK","HOUSING","TOYOTA","ISUZU",
+               "HONDA","NISSAN","AYUDHYA CAPITAL","ORIX","SRISAWAD","LEASING"]
+    _upper = F.upper(F.col(LENDER))
+    _is_sec = F.lit(False)
+    for kw in _sec_kw:
+        _is_sec = _is_sec | _upper.contains(kw)
+
+    trade_cnts = (lim_latest
+                  .withColumn("_is_sec", F.when(_is_sec, 1).otherwise(0))
+                  .groupBy(REF)
+                  .agg(
+                      F.sum(F.when(F.col("_is_sec") == 1, 1).otherwise(0))
+                       .alias("num_active_secured_trades"),
+                      F.sum(F.when(F.col("_is_sec") == 0, 1).otherwise(0))
+                       .alias("num_active_unsecured_trades"),
+                  ))
+
+    # Balance trends
+    w_cust = Window.partitionBy(REF).orderBy(DATE)
+    w6     = w_cust.rowsBetween(-5, 0)
+    w12    = w_cust.rowsBetween(-11, 0)
+
+    trends = (monthly
+              .withColumn("_bal_6m_ago",  F.first("_tot_bal").over(w6))
+              .withColumn("_bal_12m_ago", F.first("_tot_bal").over(w12))
+              .withColumn("bureau_balance_trend_6m",
+                          _safe_div(F.col("_tot_bal") - F.col("_bal_6m_ago"),
+                                    F.lit(6.0), F.lit(0.0)))
+              .withColumn("bureau_balance_trend_12m",
+                          _safe_div(F.col("_tot_bal") - F.col("_bal_12m_ago"),
+                                    F.lit(12.0), F.lit(0.0)))
+              .withColumn("bureau_limit_utilization_latest",
+                          _safe_div(F.col("_tot_bal"), F.col("_tot_lim")))
+              .withColumn("available_limit_latest",
+                          F.col("_tot_lim") - F.col("_tot_bal"))
+              .withColumn("deleveraging_rate_12m",
+                          _safe_div(F.col("_bal_12m_ago") - F.col("_tot_bal"),
+                                    F.col("_bal_12m_ago"), F.lit(0.0)))
+              .withColumn("_rn", F.row_number().over(w_latest))
+              .filter(F.col("_rn") == 1)
+              .select(REF, "bureau_balance_trend_6m", "bureau_balance_trend_12m",
+                      "bureau_limit_utilization_latest", "available_limit_latest",
+                      "deleveraging_rate_12m"))
+
+    result = (trends
+              .join(hhi,        on=REF, how="left")
+              .join(frag,       on=REF, how="left")
+              .join(trade_cnts, on=REF, how="left"))
+
+    # Balance at worst stage vs first CURRENT entry
+    ep_bal = episode_df.join(
+        monthly.select(REF, DATE, "_tot_bal"), on=[REF, DATE], how="left"
+    ).withColumn("_ord", _stage_ordinal("episode_stage"))
+
+    first_cur = (ep_bal
+                 .filter(F.col("episode_stage") == "CURRENT")
+                 .groupBy(REF)
+                 .agg(F.first("_tot_bal", ignorenulls=True).alias("_bal_first_cur")))
+
+    worst_ord_df = ep_bal.groupBy(REF).agg(F.max("_ord").alias("_worst_ord"))
+    bal_worst = (ep_bal
+                 .join(worst_ord_df, on=REF, how="inner")
+                 .filter(F.col("_ord") == F.col("_worst_ord"))
+                 .withColumn("_rn2",
+                             F.row_number().over(
+                                 Window.partitionBy(REF).orderBy(DATE)))
+                 .filter(F.col("_rn2") == 1)
+                 .select(REF, F.col("_tot_bal").alias("_bal_worst")))
+
+    bal_ratio = (first_cur
+                 .join(bal_worst, on=REF, how="full")
+                 .withColumn("balance_at_worst_vs_entry",
+                             _safe_div(F.col("_bal_worst"), F.col("_bal_first_cur")))
+                 .select(REF, "balance_at_worst_vs_entry"))
+
+    result = result.join(bal_ratio, on=REF, how="left")
+    return result.dropDuplicates([REF])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 18 — ENGAGEMENT RECENCY & DECAY SIGNALS
+# How recently did the customer show any sign of life?
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_engagement_recency_signals(
+    episode_df: DataFrame,
+    history_df: DataFrame,
+) -> DataFrame:
+    """
+    Recency and decay signals across the bureau profile.
+
+    Recovery insight: Time since last ANY positive signal (balance dip,
+    new tradeline, stage change) is the strongest predictor of contactability.
+    A customer with 9 months of silence across ALL lenders is likely unreachable.
+
+    Features:
+        months_since_last_balance_dip    months since last balance decrease (any tradeline)
+        months_since_last_new_tradeline  months since last new account
+        months_since_last_stage_change   months since last stage transition
+        balance_activity_score           proportion of last 12M with any balance change
+        dormancy_flag                    1 if zero balance changes in last 6 months
+        total_bureau_silence_months      consecutive zero-activity months at end of timeline
+    """
+    monthly = history_df.groupBy(REF, DATE).agg(
+        F.sum(BAL).alias("_tot_bal"),
+        F.countDistinct(LENDER).alias("_lend_cnt"),
+    )
+
+    w_cust   = Window.partitionBy(REF).orderBy(DATE)
+    w_latest = Window.partitionBy(REF).orderBy(F.col(DATE).desc())
+
+    monthly = (monthly
+               .withColumn("_bal_prev",  F.lag("_tot_bal", 1).over(w_cust))
+               .withColumn("_bal_chgd",
+                           F.when(F.col("_tot_bal") != F.col("_bal_prev"), 1).otherwise(0))
+               .withColumn("_bal_dip",
+                           F.when(F.col("_tot_bal") < F.col("_bal_prev"), 1).otherwise(0))
+               .withColumn("_lend_prev", F.lag("_lend_cnt", 1).over(w_cust))
+               .withColumn("_new_tl",
+                           F.when(F.col("_lend_cnt") > F.col("_lend_prev"), 1).otherwise(0)))
+
+    cust_latest = (monthly
+                   .withColumn("_rn", F.row_number().over(w_latest))
+                   .filter(F.col("_rn") == 1)
+                   .select(REF, F.col(DATE).alias("_latest_dt")))
+
+    last_dip = (monthly.filter(F.col("_bal_dip") == 1)
+                .groupBy(REF).agg(F.max(DATE).alias("_last_dip_dt")))
+    last_tl  = (monthly.filter(F.col("_new_tl") == 1)
+                .groupBy(REF).agg(F.max(DATE).alias("_last_tl_dt")))
+    last_stg = (episode_df.filter(F.col("episode_month_number") == 1)
+                .groupBy(REF).agg(F.max(DATE).alias("_last_stg_dt")))
+
+    result = (cust_latest
+              .join(last_dip, on=REF, how="left")
+              .join(last_tl,  on=REF, how="left")
+              .join(last_stg, on=REF, how="left")
+              .withColumn("months_since_last_balance_dip",
+                          F.when(F.col("_last_dip_dt").isNotNull(),
+                                 F.months_between(F.col("_latest_dt"), F.col("_last_dip_dt")))
+                           .otherwise(F.lit(999)))
+              .withColumn("months_since_last_new_tradeline",
+                          F.when(F.col("_last_tl_dt").isNotNull(),
+                                 F.months_between(F.col("_latest_dt"), F.col("_last_tl_dt")))
+                           .otherwise(F.lit(999)))
+              .withColumn("months_since_last_stage_change",
+                          F.when(F.col("_last_stg_dt").isNotNull(),
+                                 F.months_between(F.col("_latest_dt"), F.col("_last_stg_dt")))
+                           .otherwise(F.lit(999))))
+
+    # Activity score: proportion of last 12M with any balance change
+    w12 = w_cust.rowsBetween(-11, 0)
+    w6  = w_cust.rowsBetween(-5,  0)
+    act_12m = (monthly
+               .withColumn("_act_12m", F.sum("_bal_chgd").over(w12))
+               .withColumn("_cnt_12m", F.count("_bal_chgd").over(w12))
+               .withColumn("_rn", F.row_number().over(w_latest))
+               .filter(F.col("_rn") == 1)
+               .select(REF,
+                       _safe_div(F.col("_act_12m"), F.col("_cnt_12m"),
+                                 F.lit(0.0)).alias("balance_activity_score")))
+
+    dormancy = (monthly
+                .withColumn("_chg_6m", F.sum("_bal_chgd").over(w6))
+                .withColumn("_rn", F.row_number().over(w_latest))
+                .filter(F.col("_rn") == 1)
+                .select(REF,
+                        F.when(F.col("_chg_6m") == 0, 1).otherwise(0).alias("dormancy_flag")))
+
+    # Bureau silence: consecutive no-activity months at end of timeline
+    silence_df = (monthly
+                  .withColumn("_act_cumrev",
+                              F.sum("_bal_chgd").over(
+                                  Window.partitionBy(REF)
+                                        .orderBy(F.col(DATE).desc())
+                                        .rowsBetween(Window.unboundedPreceding, 0))))
+    silence_cnt = (silence_df.filter(F.col("_act_cumrev") == 0)
+                   .groupBy(REF)
+                   .agg(F.count("*").alias("total_bureau_silence_months")))
+
+    result = (result
+              .join(act_12m,    on=REF, how="left")
+              .join(dormancy,   on=REF, how="left")
+              .join(silence_cnt, on=REF, how="left")
+              .withColumn("total_bureau_silence_months",
+                          F.coalesce(F.col("total_bureau_silence_months"), F.lit(0)))
+              .drop("_latest_dt", "_last_dip_dt", "_last_tl_dt", "_last_stg_dt"))
+
+    return result.dropDuplicates([REF])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 19 — VINTAGE & SEASONING DYNAMICS
+# Where in the lifecycle was the borrower when things went wrong?
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_vintage_seasoning_features(episode_df: DataFrame) -> DataFrame:
+    """
+    Lifecycle timing features that position default within account age.
+
+    Recovery insight: A customer who defaulted 3 months after first bureau
+    appearance is likely a bust-out (low recovery probability). One who was
+    clean for 36 months before first SM entry had a life event — higher
+    recovery probability because they demonstrated long-term repayment.
+
+    Features:
+        months_observed_total              total months of bureau history
+        account_age_at_first_default       months from first obs to first SM+ entry
+        time_in_good_standing_pre_default  S0 months before first SM+ entry
+        cumulative_current_ratio           months in CURRENT / total months
+        early_life_default_flag            1 if first SM+ within 6 months of first obs
+        seasoning_at_worst_stage           months from first obs to worst stage entry
+        good_standing_to_default_ratio     good_standing_months / default_months
+    """
+    obs = episode_df.groupBy(REF).agg(
+        F.min(DATE).alias("_first_obs"),
+        F.countDistinct(DATE).alias("months_observed_total"),
+    )
+    months_cur = (episode_df
+                  .filter(F.col("episode_stage") == "CURRENT")
+                  .groupBy(REF)
+                  .agg(F.countDistinct(DATE).alias("_months_cur")))
+
+    default_stages = ["SM", "NPL", "CO", "CO_DEEP"]
+    first_def = (episode_df
+                 .filter(F.col("episode_stage").isin(default_stages) &
+                         (F.col("episode_month_number") == 1))
+                 .groupBy(REF)
+                 .agg(F.min(DATE).alias("_first_def")))
+
+    # CURRENT months strictly before first default
+    cur_pre_def = (episode_df
+                   .filter(F.col("episode_stage") == "CURRENT")
+                   .join(first_def, on=REF, how="left")
+                   .filter(F.col("_first_def").isNull() |
+                           (F.col(DATE) < F.col("_first_def")))
+                   .groupBy(REF)
+                   .agg(F.countDistinct(DATE).alias("_cur_pre_def")))
+
+    # Worst stage entry
+    ep_ord = (episode_df
+              .filter(F.col("episode_month_number") == 1)
+              .withColumn("_ord", _stage_ordinal("episode_stage")))
+    worst_per = ep_ord.groupBy(REF).agg(F.max("_ord").alias("_worst_ord"))
+    worst_entry = (ep_ord
+                   .join(worst_per, on=REF, how="inner")
+                   .filter(F.col("_ord") == F.col("_worst_ord"))
+                   .groupBy(REF)
+                   .agg(F.min(DATE).alias("_worst_entry")))
+
+    result = (obs
+              .join(months_cur,   on=REF, how="left")
+              .join(first_def,    on=REF, how="left")
+              .join(cur_pre_def,  on=REF, how="left")
+              .join(worst_entry,  on=REF, how="left")
+              .withColumn("_months_cur",     F.coalesce(F.col("_months_cur"), F.lit(0)))
+              .withColumn("_cur_pre_def",    F.coalesce(F.col("_cur_pre_def"), F.lit(0)))
+              .withColumn("cumulative_current_ratio",
+                          _safe_div(F.col("_months_cur"),
+                                    F.col("months_observed_total"), F.lit(0.0)))
+              .withColumn("account_age_at_first_default",
+                          F.when(F.col("_first_def").isNotNull(),
+                                 F.months_between(F.col("_first_def"), F.col("_first_obs"))))
+              .withColumn("time_in_good_standing_pre_default", F.col("_cur_pre_def"))
+              .withColumn("early_life_default_flag",
+                          F.when(F.col("account_age_at_first_default").isNotNull() &
+                                 (F.col("account_age_at_first_default") <= 6), 1)
+                           .otherwise(0))
+              .withColumn("seasoning_at_worst_stage",
+                          F.when(F.col("_worst_entry").isNotNull(),
+                                 F.months_between(F.col("_worst_entry"), F.col("_first_obs"))))
+              .withColumn("_default_months",
+                          F.col("months_observed_total") - F.col("_months_cur"))
+              .withColumn("good_standing_to_default_ratio",
+                          _safe_div(F.col("_months_cur"), F.col("_default_months")))
+              .drop("_first_obs", "_months_cur", "_first_def", "_cur_pre_def",
+                    "_worst_entry", "_worst_ord", "_default_months"))
+
+    return result.dropDuplicates([REF])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 20 — MAIN ORCHESTRATOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_stage_dynamics(
@@ -1264,28 +2096,34 @@ def run_stage_dynamics(
     enquiry_df: Optional[DataFrame] = None,
 ) -> DataFrame:
     """
-    Run complete stage dynamics pipeline.
+    Run complete stage dynamics pipeline (~250 features).
 
     Execution order:
-         0. enrich_account_dimensions     — NCB ACCOUNTTYPE dimension flags
-         1. build_dpd_stage               — CURRENT/X/SM/NPL/CO/CO_DEEP assignment
-         2. build_stage_episodes          — episode ID + month-in-episode
-         3. build_stage_transition_features  — Cat 1
-         4. build_payment_behavior_features  — Cat 2
-         5. build_exposure_utilisation_features — Cat 3
-         6. build_enquiry_features        — Cat 4 (optional)
-         7. build_account_closure_features   — Cat 5
-         8. build_delinquency_severity_features — Cat 6
-         9. build_cross_dimension_features   — Cat 7
-        10. build_recovery_indicators        — Cat 8
-        11. build_within_stage_exposure_dynamics — Cat 9a
-        12. build_restructuring_features     — Cat 9b
-        13. build_temporal_velocity_features — Cat 10 (NEW)
+         0. enrich_account_dimensions              — NCB ACCOUNTTYPE dimension flags
+         1. build_dpd_stage                        — CURRENT/X/SM/NPL/CO/CO_DEEP assignment
+         2. build_stage_episodes                   — episode ID + month-in-episode
+         3. build_stage_transition_features        — Cat 1
+         4. build_payment_behavior_features        — Cat 2
+         5. build_exposure_utilisation_features    — Cat 3
+         6. build_enquiry_features                 — Cat 4 (optional)
+         7. build_account_closure_features         — Cat 5
+         8. build_delinquency_severity_features    — Cat 6
+         9. build_cross_dimension_features         — Cat 7
+        10. build_recovery_indicators              — Cat 8
+        11. build_within_stage_exposure_dynamics   — Cat 9a
+        12. build_restructuring_features           — Cat 9b
+        13. build_temporal_velocity_features       — Cat 10
+        14. build_payment_effort_dynamics          — Cat 11 (NEW)
+        15. build_stage_velocity_features          — Cat 12 (NEW)
+        16. build_cure_redefault_dynamics          — Cat 13 (NEW)
+        17. build_balance_recovery_potential       — Cat 14 (NEW)
+        18. build_engagement_recency_signals       — Cat 15 (NEW)
+        19. build_vintage_seasoning_features       — Cat 16 (NEW)
 
     Returns: Wide DataFrame keyed on (ref_no, asofdate).
     """
     sep = "=" * 70
-    print(f"\n{sep}\nBureau Stage Dynamics Engine v2.1\n{sep}")
+    print(f"\n{sep}\nBureau Stage Dynamics Engine v2.3\n{sep}")
 
     print("[0] Enriching account dimensions...")
     account_enriched = enrich_account_dimensions(account_df)
@@ -1330,8 +2168,26 @@ def run_stage_dynamics(
     print("[12] Cat 9b — Restructuring / TDR features...")
     tdr_feats      = build_restructuring_features(account_enriched, history_df, spark)
 
-    print("[13] Cat 10 — Temporal velocity features (new)...")
+    print("[13] Cat 10 — Temporal velocity features...")
     vel_feats      = build_temporal_velocity_features(episode_df)
+
+    print("[14] Cat 11 — Payment effort dynamics...")
+    effort_feats   = build_payment_effort_dynamics(episode_df, history_df)
+
+    print("[15] Cat 12 — Stage velocity & acceleration...")
+    velocity_feats = build_stage_velocity_features(episode_df)
+
+    print("[16] Cat 13 — Cure & re-default dynamics...")
+    cure_feats     = build_cure_redefault_dynamics(episode_df)
+
+    print("[17] Cat 14 — Balance recovery potential...")
+    recov_pot_feats = build_balance_recovery_potential(episode_df, history_df)
+
+    print("[18] Cat 15 — Engagement recency & decay...")
+    engagement_feats = build_engagement_recency_signals(episode_df, history_df)
+
+    print("[19] Cat 16 — Vintage & seasoning dynamics...")
+    vintage_feats  = build_vintage_seasoning_features(episode_df)
 
     # ── Final join: collapse to latest snapshot per customer ─────────────────
     w_latest = Window.partitionBy(REF).orderBy(F.col(DATE).desc())
@@ -1364,10 +2220,17 @@ def run_stage_dynamics(
         result   = result.join(feat_latest, on=REF, how="left")
         print(f"  ✓ {name:<30} +{len(result.columns) - n_before} features")
 
+    # REF-only joins (no DATE key — cross-history aggregates)
     for feat_df, name in [
-        (closure_feats, "account_closure"),
-        (ws_feats,      "within_stage_exposure"),
-        (tdr_feats,     "restructuring"),
+        (closure_feats,    "account_closure"),
+        (ws_feats,         "within_stage_exposure"),
+        (tdr_feats,        "restructuring"),
+        (effort_feats,     "payment_effort"),
+        (velocity_feats,   "stage_velocity"),
+        (cure_feats,       "cure_redefault"),
+        (recov_pot_feats,  "recovery_potential"),
+        (engagement_feats, "engagement_recency"),
+        (vintage_feats,    "vintage_seasoning"),
     ]:
         n_before = len(result.columns)
         result   = result.join(feat_df, on=REF, how="left")
