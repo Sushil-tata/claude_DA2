@@ -2147,7 +2147,150 @@ def build_vintage_seasoning_features(episode_df: DataFrame) -> DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 20 — MAIN ORCHESTRATOR
+# SECTION 20 — DPD PROFILE SHAPE FEATURES
+# The shape of how DPD evolved — not just where the customer is now
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_dpd_profile_shape_features(state_df: DataFrame) -> DataFrame:
+    """
+    Characterise the DPD trajectory shape across the customer's full history.
+
+    Recovery insight: Two customers both at NPL (90 DPD) can have completely
+    different trajectories:
+        CLIFF      — clean for years, sudden jump to NPL in 1-2 months
+                     (life event — high cure probability)
+        SLIDE      — gradual deterioration over 6-12 months
+                     (cash-flow erosion — needs repayment plan)
+        OSCILLATOR — bouncing repeatedly through delinquency bands
+                     (chronic inability — low cure probability)
+        RECOVERING — DPD declining from a past peak
+                     (self-curing — monitor, low intervention needed)
+        STABLE     — minimal DPD movement, persistently low or high
+                     (entrenched state — reassess strategy)
+
+    Input: state_df with columns (ref_no, asofdate, bureau_max_dpd)
+           One row per customer per month.
+
+    Features:
+        dpd_slope_12m              (dpd_now - dpd_12m_ago) / 12 — positive = deteriorating
+        dpd_std_12m                stddev of DPD in last 12M — high = volatile
+        dpd_range_12m              max_dpd_12m - min_dpd_12m
+        dpd_monotone_flag          1 if DPD never decreased in last 12M
+        dpd_convexity              (delta_6m_recent - delta_6m_prior) — positive = accelerating
+        dpd_zero_crossing_count    times DPD crossed 0 (lifetime) — oscillator signal
+        dpd_max_single_jump        largest single-month DPD increase ever
+        dpd_peak_to_current_ratio  current DPD / max DPD ever (< 1 = improving from peak)
+        dpd_time_above_90_24m      months with DPD > 90 in last 24M
+        dpd_entry_speed            months from last 0-DPD observation to current date
+        dpd_shape_type             CLIFF | SLIDE | OSCILLATOR | RECOVERING | STABLE
+    """
+    # Ensure DPD_COL is present and integer, null → 0
+    df = state_df.withColumn(
+        "_dpd", F.coalesce(F.col(DPD_COL).cast("double"), F.lit(0.0))
+    )
+
+    w_cust   = Window.partitionBy(REF).orderBy(DATE)
+    w_latest = Window.partitionBy(REF).orderBy(F.col(DATE).desc())
+    w_12m    = Window.partitionBy(REF).orderBy(DATE).rowsBetween(-11, 0)
+    w_24m    = Window.partitionBy(REF).orderBy(DATE).rowsBetween(-23, 0)
+    w_6m_rec = Window.partitionBy(REF).orderBy(DATE).rowsBetween(-5,  0)
+    w_6m_pri = Window.partitionBy(REF).orderBy(DATE).rowsBetween(-11, -6)
+    w_all    = Window.partitionBy(REF).orderBy(DATE).rowsBetween(
+                   Window.unboundedPreceding, 0)
+
+    df = df.withColumn("_dpd_prev", F.lag("_dpd", 1).over(w_cust))
+
+    # ── Rolling shape metrics ─────────────────────────────────────────────────
+    df = (df
+          .withColumn("_dpd_12m_ago", F.first("_dpd").over(w_12m))
+          .withColumn("dpd_slope_12m",
+                      _safe_div(F.col("_dpd") - F.col("_dpd_12m_ago"),
+                                F.lit(12.0), F.lit(None)))
+          .withColumn("dpd_std_12m",   F.stddev("_dpd").over(w_12m))
+          .withColumn("dpd_range_12m",
+                      F.max("_dpd").over(w_12m) - F.min("_dpd").over(w_12m))
+          # Monotone: 1 if no month had a DPD decrease in last 12M
+          .withColumn("_dpd_delta", F.col("_dpd") - F.col("_dpd_prev"))
+          .withColumn("dpd_monotone_flag",
+                      F.when(F.min("_dpd_delta").over(w_12m) >= 0, 1).otherwise(0))
+          # Convexity: avg delta in recent 6M vs prior 6M (positive = accelerating)
+          .withColumn("_avg_delta_rec",  F.avg("_dpd_delta").over(w_6m_rec))
+          .withColumn("_avg_delta_pri",  F.avg("_dpd_delta").over(w_6m_pri))
+          .withColumn("dpd_convexity",
+                      F.col("_avg_delta_rec") - F.col("_avg_delta_pri"))
+          # Lifetime metrics
+          .withColumn("dpd_time_above_90_24m",
+                      F.sum(F.when(F.col("_dpd") > 90, 1).otherwise(0)).over(w_24m))
+          .withColumn("_max_dpd_ever",  F.max("_dpd").over(w_all))
+          .withColumn("dpd_peak_to_current_ratio",
+                      _safe_div(F.col("_dpd"), F.col("_max_dpd_ever"), F.lit(None)))
+          .withColumn("dpd_max_single_jump",
+                      F.max(F.when(F.col("_dpd_delta") > 0,
+                                   F.col("_dpd_delta")).otherwise(0)).over(w_all)))
+
+    # ── Zero-crossing count (lifetime) ────────────────────────────────────────
+    # Crossing = DPD goes from 0 to >0 or >0 to 0
+    df = df.withColumn(
+        "_crossed_zero",
+        F.when(
+            ((F.col("_dpd") == 0) & (F.col("_dpd_prev") > 0)) |
+            ((F.col("_dpd") > 0)  & (F.col("_dpd_prev") == 0)),
+            1).otherwise(0))
+    df = df.withColumn(
+        "dpd_zero_crossing_count",
+        F.sum("_crossed_zero").over(w_all))
+
+    # ── Entry speed: months since DPD was last 0 ─────────────────────────────
+    df = df.withColumn(
+        "_last_zero_mn",
+        F.when(F.col("_dpd") == 0, F.col(DATE)))
+    df = df.withColumn(
+        "_last_zero_dt",
+        F.last("_last_zero_mn", ignorenulls=True).over(w_cust))
+    df = df.withColumn(
+        "dpd_entry_speed",
+        F.when(F.col("_last_zero_dt").isNotNull(),
+               F.months_between(F.col(DATE), F.col("_last_zero_dt")))
+         .otherwise(F.lit(None)))
+
+    # ── Shape classification ──────────────────────────────────────────────────
+    df = df.withColumn(
+        "dpd_shape_type",
+        F.when(F.col("dpd_zero_crossing_count") >= 3, "OSCILLATOR")
+         .when(
+             (F.col("dpd_slope_12m") < -5) &
+             (F.col("dpd_peak_to_current_ratio") < 0.7),
+             "RECOVERING")
+         .when(
+             (F.col("dpd_monotone_flag") == 1) &
+             (F.col("dpd_entry_speed").isNotNull()) &
+             (F.col("dpd_entry_speed") <= 3),
+             "CLIFF")
+         .when(
+             (F.col("dpd_monotone_flag") == 1) &
+             (F.col("dpd_entry_speed").isNotNull()) &
+             (F.col("dpd_entry_speed") > 3),
+             "SLIDE")
+         .otherwise("STABLE"))
+
+    # ── Take latest snapshot per customer ─────────────────────────────────────
+    keep = [REF, DATE,
+            "dpd_slope_12m", "dpd_std_12m", "dpd_range_12m",
+            "dpd_monotone_flag", "dpd_convexity",
+            "dpd_zero_crossing_count", "dpd_max_single_jump",
+            "dpd_peak_to_current_ratio", "dpd_time_above_90_24m",
+            "dpd_entry_speed", "dpd_shape_type"]
+
+    return (df
+            .select(keep)
+            .withColumn("_rn", F.row_number().over(w_latest))
+            .filter(F.col("_rn") == 1)
+            .drop("_rn", DATE)
+            .dropDuplicates([REF]))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 21 — MAIN ORCHESTRATOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_stage_dynamics(
@@ -2182,11 +2325,12 @@ def run_stage_dynamics(
         17. build_balance_recovery_potential       — Cat 14 (NEW)
         18. build_engagement_recency_signals       — Cat 15 (NEW)
         19. build_vintage_seasoning_features       — Cat 16 (NEW)
+        20. build_dpd_profile_shape_features       — Cat 17 (NEW)
 
     Returns: Wide DataFrame keyed on (ref_no, asofdate).
     """
     sep = "=" * 70
-    print(f"\n{sep}\nBureau Stage Dynamics Engine v2.3\n{sep}")
+    print(f"\n{sep}\nBureau Stage Dynamics Engine v2.5\n{sep}")
 
     print("[0] Enriching account dimensions...")
     account_enriched = enrich_account_dimensions(account_df)
@@ -2255,6 +2399,9 @@ def run_stage_dynamics(
     print("[19] Cat 16 — Vintage & seasoning dynamics...")
     vintage_feats  = build_vintage_seasoning_features(episode_df)
 
+    print("[20] Cat 17 — DPD profile shape features...")
+    shape_feats    = build_dpd_profile_shape_features(state_df)
+
     # ── Final join: collapse to latest snapshot per customer ─────────────────
     w_latest = Window.partitionBy(REF).orderBy(F.col(DATE).desc())
 
@@ -2298,6 +2445,7 @@ def run_stage_dynamics(
         (recov_pot_feats,  "recovery_potential"),
         (engagement_feats, "engagement_recency"),
         (vintage_feats,    "vintage_seasoning"),
+        (shape_feats,      "dpd_profile_shape"),
     ]:
         n_before = len(result.columns)
         result   = result.join(feat_df, on=REF, how="left")
