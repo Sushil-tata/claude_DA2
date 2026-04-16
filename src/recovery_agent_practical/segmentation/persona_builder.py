@@ -23,9 +23,9 @@ Feature separation:
 5 Personas:
   ACTIVE_PAYER | SELECTIVE_DEFAULTER | LIQUIDITY_CONSTRAINED | STRATEGIC | DORMANT
 
-SIGNAL_SEGMENT — strategic overlay on top of persona:
-  SELECTIVE_CHRONIC | CHRONIC_NPL | HIGH_WORTH_RECOVERY | WRITE_OFF_RISK
-  | BUREAU_THIN_FILE | STANDARD
+SIGNAL_SEGMENT — structural context overlay (data availability + history flags):
+  BUREAU_THIN_FILE | CHARGEOFF_HISTORY | MULTI_LENDER_DISTRESS | STANDARD
+  Behavioural distinctions (selective cycling, chronic NPL) are in persona layer.
 
 observation_date enforcement:
   - assign_batch() requires observation_date (YYYY-MM-DD)
@@ -59,29 +59,33 @@ SEGMENTATION_FEATURES: List[str] = [
 
     # Bureau structural signals
     "bureau_months_on_book",          # vintage — longer = more data confidence
-    "bureau_total_outstanding",       # absolute debt burden
+    "bureau_total_outstanding",       # absolute debt burden (used for ratio computation)
     "bureau_monthly_instalment",      # monthly debt service (structural)
     "bureau_delinquent_other",        # delinquent on other lenders (0/1 or count)
     "bureau_new_loan_12m",            # credit-seeking in last 12m
     "bureau_secured_loan_flag",       # has secured collateral
 
-    # Bureau stage dynamics (from bureau_stage_dynamics.py)
+    # Bureau stage dynamics (from bureau_stage_dynamics.py via BureauFeatureAdapter)
     "dpd_shape_type",                 # CLIFF/SLIDE/OSCILLATOR/RECOVERING/STABLE
     "dpd_slope_12m",                  # trajectory direction (negative = improving)
     "stage_stickiness_score",         # prob of staying in current stage
     "re_default_rate_rolling_24m",    # chronic re-defaulter rate
     "cure_rate_sm_to_lower",          # cure capability from SM stage
 
-    # Persistent avoidance flags
+    # Persistent avoidance / stance signals
     "wrong_number_flag",
     "dispute_flag",
     "complaint_flag",
     "lawyer_mentioned",
     "legal_representation_flag",
     "sms_opt_out",
+    # last_contact_outcome: persistent avoidance stance (hostile/refuse/legal keywords only)
+    # classified as SEGMENTATION because it captures structural stance, not recency
+    "last_contact_outcome",
 ]
 
-# Features reserved for propensity scorecard ONLY — never used in segmentation
+# Features reserved for propensity scorecard ONLY — zero overlap with SEGMENTATION_FEATURES
+# GAP 3: last_contact_outcome removed — it is a persistent avoidance signal (see above)
 PROPENSITY_FEATURES: List[str] = [
     "payment_count_30d",
     "payment_count_90d",
@@ -98,8 +102,26 @@ PROPENSITY_FEATURES: List[str] = [
     "contacts_made_30d",
     "contacts_made_90d",
     "calls_connected",
-    "last_contact_outcome",
 ]
+
+
+def validate_feature_separation() -> None:
+    """
+    Programmatic guard against feature leakage.
+    Raises AssertionError if any feature appears in both SEGMENTATION_FEATURES
+    and PROPENSITY_FEATURES. Call at module import time and in pipeline init.
+    """
+    overlap = set(SEGMENTATION_FEATURES) & set(PROPENSITY_FEATURES)
+    if overlap:
+        raise AssertionError(
+            f"Feature leakage: {sorted(overlap)} appear in both "
+            "SEGMENTATION_FEATURES and PROPENSITY_FEATURES. "
+            "Remove from one list before proceeding."
+        )
+
+
+# Run at import time — fails loudly if the lists drift
+validate_feature_separation()
 
 # Axis score columns produced by assign_batch() — for audit/output ONLY
 AXIS_SCORE_COLUMNS: List[str] = [
@@ -143,9 +165,9 @@ class PersonaAssignment:
     capacity_score: float
     avoidance_score: float
 
-    # Strategic overlay
-    signal_segment: str    # SELECTIVE_CHRONIC | CHRONIC_NPL | HIGH_WORTH_RECOVERY
-                           # | WRITE_OFF_RISK | BUREAU_THIN_FILE | STANDARD
+    # Structural context overlay (data availability + history flags only)
+    signal_segment: str    # BUREAU_THIN_FILE | CHARGEOFF_HISTORY
+                           # | MULTI_LENDER_DISTRESS | STANDARD
 
     # Metadata
     confidence_level: str           # HIGH | MEDIUM | LOW
@@ -191,54 +213,66 @@ class PersonaBuilder:
         """
         Compute data-driven decision thresholds from a training sample.
 
-        Replaces hardcoded DEFAULT_THRESHOLDS with percentile-derived cuts.
-        Call once before running assign_batch() in production.
+        GAP 4 FIX: Thresholds are computed in SCORE SPACE (0-100), not raw
+        feature space. This makes them scale-invariant and directly comparable
+        to what the decision tree evaluates. Prior version used raw
+        bureau_total_outstanding percentiles (e.g. 480,000 THB) as thresholds
+        against 0-100 axis scores — that comparison was dimensionally incorrect.
+
+        Method: compute all four axis scores for every row in df, then derive
+        percentile cuts from the score distributions.
 
         Args:
-            df: Training DataFrame containing SEGMENTATION_FEATURES columns
+            df: Training DataFrame with SEGMENTATION_FEATURES columns. Minimum
+                100 rows recommended for stable percentile estimates.
 
         Returns:
-            Dict of calibrated thresholds (also stored in self.thresholds)
+            Dict of calibrated thresholds in score space (also stored in self.thresholds)
         """
+        if len(df) < 10:
+            logger.warning(
+                f"calibrate() called with only {len(df)} rows — "
+                "thresholds may be unstable. Falling back to defaults."
+            )
+            return dict(DEFAULT_THRESHOLDS)
 
-        def _pct(col: str, q: float, default: float) -> float:
-            if col in df.columns:
-                vals = df[col].dropna()
-                return float(np.percentile(vals, q * 100)) if len(vals) > 10 else default
-            return default
+        # Compute axis scores for every row in the training sample
+        sp_scores, tr_scores, cap_scores, av_scores = [], [], [], []
+        for _, row in df.iterrows():
+            sp_scores.append(self._calculate_structural_payment(row))
+            tr_scores.append(self._calculate_trajectory(row))
+            cap_scores.append(self._calculate_capacity(row))
+            av_scores.append(self._calculate_avoidance(row))
 
-        calibrated: Dict[str, float] = {}
+        sp = np.array(sp_scores)
+        tr = np.array(tr_scores)
+        cap = np.array(cap_scores)
+        av = np.array(av_scores)
 
-        # structural_payment_active_min: 60th percentile of payment_effort_ratio_npl
-        calibrated["structural_payment_active_min"] = _pct(
-            "payment_effort_ratio_npl", 0.60, DEFAULT_THRESHOLDS["structural_payment_active_min"]
-        )
+        calibrated: Dict[str, float] = {
+            # structural_payment thresholds in score space
+            "structural_payment_active_min":    float(np.percentile(sp, 60)),
+            "structural_payment_selective_max": float(np.percentile(sp, 40)),
+            "structural_payment_dormant_max":   float(np.percentile(sp, 20)),
 
-        # trajectory_dormant_max: 30th percentile of trajectory (use dpd_slope_12m as proxy)
-        # Negative slope = improving; 30th pct of slope is the "low trajectory" cut
-        calibrated["trajectory_dormant_max"] = _pct(
-            "dpd_slope_12m", 0.30, DEFAULT_THRESHOLDS["trajectory_dormant_max"]
-        )
+            # trajectory thresholds in score space
+            "trajectory_dormant_max":           float(np.percentile(tr, 30)),
+            "trajectory_constrained_min":       float(np.percentile(tr, 30)),
 
-        # capacity_selective_min: 50th percentile of bureau_total_outstanding
-        calibrated["capacity_selective_min"] = _pct(
-            "bureau_total_outstanding", 0.50, DEFAULT_THRESHOLDS["capacity_selective_min"]
-        )
+            # capacity thresholds in score space (not raw THB amounts)
+            "capacity_selective_min":           float(np.percentile(cap, 50)),
+            "capacity_constrained_max":         float(np.percentile(cap, 30)),
 
-        # Avoidance is flag-based — natural midpoint stays 50
-        calibrated["avoidance_strategic_min"] = 50.0
-
-        # structural_payment_selective_max: 40th percentile
-        calibrated["structural_payment_selective_max"] = _pct(
-            "payment_effort_ratio_npl", 0.40, DEFAULT_THRESHOLDS["structural_payment_selective_max"]
-        )
+            # avoidance: binary flag sum — fixed at 50 regardless of distribution
+            "avoidance_strategic_min":          50.0,
+        }
 
         self.thresholds.update(calibrated)
         self._is_calibrated = True
 
         logger.info(
-            f"PersonaBuilder calibrated on {len(df)} accounts. "
-            f"is_calibrated={self._is_calibrated}. Thresholds: {calibrated}"
+            f"PersonaBuilder calibrated on {len(df)} accounts (score-space percentiles). "
+            f"Thresholds: {calibrated}"
         )
         return calibrated
 
@@ -273,7 +307,7 @@ class PersonaBuilder:
         capacity           = self._calculate_capacity(account)
         avoidance          = self._calculate_avoidance(account)
 
-        persona = self._apply_decision_tree(structural_payment, trajectory, capacity, avoidance)
+        persona = self._apply_decision_tree(structural_payment, trajectory, capacity, avoidance, account)
 
         signal_segment = self._compute_signal_segment(
             account, structural_payment, trajectory, capacity, avoidance
@@ -464,17 +498,20 @@ class PersonaBuilder:
         trajectory: float,
         capacity: float,
         avoidance: float,
+        account: Optional[pd.Series] = None,
     ) -> str:
         """
         Decision tree using calibratable thresholds from self.thresholds.
 
         Priority order (first match wins):
-        1. High avoidance            → STRATEGIC
-        2. Low trajectory + low pay  → DORMANT
-        3. High structural payment   → ACTIVE_PAYER
-        4. High capacity + low pay   → SELECTIVE_DEFAULTER
-        5. Low capacity + mod. traj  → LIQUIDITY_CONSTRAINED
-        6. Default                   → SELECTIVE_DEFAULTER
+        1. High avoidance                   → STRATEGIC
+        2. Low trajectory + low payment     → DORMANT
+        3. High structural payment          → ACTIVE_PAYER
+        4. Chronic cycling (cure+redefault) → SELECTIVE_DEFAULTER
+           (GAP 5: moved from SIGNAL_SEGMENT — this is behavioral, not structural context)
+        5. High capacity + low payment      → SELECTIVE_DEFAULTER
+        6. Low capacity + moderate traj     → LIQUIDITY_CONSTRAINED
+        7. Default                          → SELECTIVE_DEFAULTER
         """
         t = self.thresholds
 
@@ -486,6 +523,14 @@ class PersonaBuilder:
 
         if structural_payment > t["structural_payment_active_min"]:
             return "ACTIVE_PAYER"
+
+        # Chronic cycling: has demonstrated capacity by curing, but keeps re-defaulting.
+        # Absorbed from SELECTIVE_CHRONIC signal segment (GAP 5 fix).
+        if account is not None:
+            cures     = float(account.get("cure_count_24m", 0) or 0)
+            redefaults = float(account.get("re_default_count_24m", 0) or 0)
+            if cures >= 2 and redefaults >= 2 and capacity > t["capacity_constrained_max"]:
+                return "SELECTIVE_DEFAULTER"
 
         if capacity > t["capacity_selective_min"] and structural_payment < t["structural_payment_selective_max"]:
             return "SELECTIVE_DEFAULTER"
@@ -506,42 +551,36 @@ class PersonaBuilder:
         avoidance: float,
     ) -> str:
         """
-        Compute strategic overlay segment — layered ON TOP of persona.
+        Compute structural context segment — layered ON TOP of persona.
 
-        Used for treatment intensity calibration and offer selection.
-        Evaluated in priority order; first match returned.
+        GAP 5 FIX: SIGNAL_SEGMENT now represents structural / data-availability
+        context ONLY. Behavioural logic removed:
+          - SELECTIVE_CHRONIC removed → absorbed into _apply_decision_tree()
+          - CHRONIC_NPL removed → captured by trajectory_score (dpd_shape_type)
+          - HIGH_WORTH_RECOVERY removed → belongs in action routing, not segmentation
 
-        Segments:
-        - BUREAU_THIN_FILE    : <6 months on book — structural signals unreliable
-        - SELECTIVE_CHRONIC   : ≥2 cures AND ≥2 re-defaults — can pay but repeatedly relapses
-        - CHRONIC_NPL         : ≥75% months in NPL + CLIFF or SLIDE shape — structurally stuck
-        - WRITE_OFF_RISK      : worst stage CO/CO_DEEP + >12 months dormant
-        - HIGH_WORTH_RECOVERY : balance >200k + high capacity + some payment history
-        - STANDARD            : no special signal
+        Remaining segments represent structural context that conditions treatment
+        strategy without duplicating persona behavioural differentiation:
+
+        - BUREAU_THIN_FILE       : <6 months on book — structural signals unreliable
+        - CHARGEOFF_HISTORY      : worst stage ever CO or CO_DEEP — structural write-off history
+        - MULTI_LENDER_DISTRESS  : delinquent on ≥1 other lenders — systemic financial stress
+        - STANDARD               : no special structural context flag
+
+        Priority: BUREAU_THIN_FILE → CHARGEOFF_HISTORY → MULTI_LENDER_DISTRESS → STANDARD
         """
-        bureau_mob    = float(account.get("bureau_months_on_book", 0) or 0)
-        cures         = float(account.get("cure_count_24m", 0) or 0)
-        redefaults    = float(account.get("re_default_count_24m", 0) or 0)
-        pct_npl       = float(account.get("pct_months_npl_24m", 0) or 0)
-        shape         = str(account.get("dpd_shape_type", "") or "").upper()
-        worst_stage   = str(account.get("worst_stage_ever", "") or "").upper()
-        months_dormant = float(account.get("months_dormant", 0) or 0)
-        balance       = float(account.get("balance", 0) or 0)
+        bureau_mob      = float(account.get("bureau_months_on_book", 0) or 0)
+        worst_stage     = str(account.get("worst_stage_ever", "") or "").upper()
+        delinquent_other = float(account.get("bureau_delinquent_other", 0) or 0)
 
         if bureau_mob < 6:
             return "BUREAU_THIN_FILE"
 
-        if cures >= 2 and redefaults >= 2:
-            return "SELECTIVE_CHRONIC"
+        if worst_stage in ("CO", "CO_DEEP"):
+            return "CHARGEOFF_HISTORY"
 
-        if pct_npl >= 0.75 and shape in ("CLIFF", "SLIDE"):
-            return "CHRONIC_NPL"
-
-        if worst_stage in ("CO", "CO_DEEP") and months_dormant > 12:
-            return "WRITE_OFF_RISK"
-
-        if balance > 200_000 and capacity > 50 and structural_payment > 30:
-            return "HIGH_WORTH_RECOVERY"
+        if delinquent_other >= 1:
+            return "MULTI_LENDER_DISTRESS"
 
         return "STANDARD"
 
