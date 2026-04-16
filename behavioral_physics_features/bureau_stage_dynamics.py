@@ -37,11 +37,14 @@ Feature Categories (all implemented):
     10. Temporal Velocity Features
 
 Column contract:
-    Join key  : ref_no
-    Time key  : asofdate
-    DPD col   : bureau_max_dpd  (integer, maximum DPD across all tradelines)
-    Stage col : dpd_stage       (CURRENT/X/SM/NPL/CO/CO_DEEP)
-    Source    : mnf_cra_rvw_s_history (history_df), mnf_cra_rvw_s_account (account_df)
+    Join key      : ref_no
+    Time key      : asofdate     (bureau reporting month — used in ALL window/slope/stage computations)
+    Partition key : dl_data_dt   (data landing date — use ONLY to filter Delta table reads before
+                                  passing history_df / account_df into these functions;
+                                  do NOT use dl_data_dt inside any window or feature computation)
+    DPD col       : bureau_max_dpd  (integer, maximum DPD across all tradelines)
+    Stage col     : dpd_stage       (CURRENT/X/SM/NPL/CO/CO_DEEP)
+    Source        : mnf_cra_rvw_s_history (history_df), mnf_cra_rvw_s_account (account_df)
 
 v2.1 Fixes vs v2.0:
     - Join key: accounttype-only lookup table (no fan-out on multi-account customers)
@@ -91,7 +94,8 @@ from typing import Optional
 
 # ── Column name constants ─────────────────────────────────────────────────────
 REF        = "ref_no"
-DATE       = "asofdate"
+DATE       = "asofdate"    # bureau reporting month — all window/slope/stage logic
+LOAD_DATE  = "dl_data_dt"  # partition key — filter Delta table reads ONLY, never in feature windows
 DPD_COL    = "bureau_max_dpd"
 STAGE_COL  = "dpd_stage"       # CURRENT/X/SM/NPL/CO/CO_DEEP
 BAL        = "amountowed"
