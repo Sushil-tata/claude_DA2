@@ -13,6 +13,7 @@ NO NPV optimization - pure rule-based approach.
 """
 
 import logging
+import os
 import uuid
 from datetime import datetime
 from typing import Optional, Literal
@@ -20,12 +21,71 @@ from typing import Optional, Literal
 import numpy as np
 import pandas as pd
 
-from recovery_agent_practical.segmentation.persona_builder import PersonaBuilder
+from recovery_agent_practical.segmentation.persona_builder import (
+    PersonaBuilder, SEGMENTATION_FEATURES, AXIS_SCORE_COLUMNS,
+)
 from recovery_agent_practical.scoring.recovery_scorecard_6m import RecoveryScorecard6M
 from recovery_agent_practical.routing.action_overlay import ActionOverlayRouter
 from recovery_agent_practical.outputs.schemas import create_daily_scoring_row, create_audit_event
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TREATMENT LOGGER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TreatmentLogger:
+    """
+    Persists treatment decisions to a log for causal tracking and validation.
+
+    Schema per row:
+      account_id, score_date, persona, signal_segment,
+      recommended_action, p_recovery_6m, score_band, pipeline_run_id, logged_at
+
+    One Parquet file per score_date. Appends to existing file if present.
+    """
+
+    LOG_COLUMNS = [
+        "account_id", "score_date", "persona", "signal_segment",
+        "recommended_action", "p_recovery_6m", "score_band", "pipeline_run_id",
+    ]
+
+    def __init__(self, log_path: str):
+        """
+        Args:
+            log_path: Directory where treatment log Parquet files are written.
+        """
+        self.log_path = log_path
+
+    def log_batch(self, scoring_df: pd.DataFrame) -> str:
+        """
+        Write treatment decisions from a scored batch.
+
+        Args:
+            scoring_df: Daily scoring DataFrame from score_batch()
+
+        Returns:
+            Path to the written log file.
+        """
+        if scoring_df.empty:
+            logger.warning("TreatmentLogger: empty scoring_df, nothing logged.")
+            return ""
+
+        available_cols = [c for c in self.LOG_COLUMNS if c in scoring_df.columns]
+        log_df = scoring_df[available_cols].copy()
+        log_df["logged_at"] = datetime.now().isoformat()
+
+        score_date = str(scoring_df["score_date"].iloc[0]) if "score_date" in scoring_df.columns else "unknown"
+        log_file = os.path.join(self.log_path, f"treatment_log_{score_date}.parquet")
+
+        if os.path.exists(log_file):
+            existing = pd.read_parquet(log_file)
+            log_df = pd.concat([existing, log_df], ignore_index=True)
+
+        log_df.to_parquet(log_file, index=False)
+        logger.info(f"TreatmentLogger: wrote {len(log_df)} rows → {log_file}")
+        return log_file
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,13 +111,16 @@ class RecoveryAgentPipeline:
         payment_threshold: float = 500.0,
         small_balance_threshold: float = 50_000,
         medium_balance_threshold: float = 200_000,
+        treatment_log_path: Optional[str] = None,
     ):
         """
         Args:
-            scorecard_model_type: TWO_PART (default) or TWEEDIE
-            payment_threshold: Minimum THB to count as recovery
+            scorecard_model_type   : TWO_PART (default) or TWEEDIE
+            payment_threshold      : Minimum THB to count as recovery
             small_balance_threshold: SMALL balance threshold
             medium_balance_threshold: MEDIUM/LARGE threshold
+            treatment_log_path     : Directory for treatment log Parquet files.
+                                     If None, treatment logging is skipped.
         """
         self.scorecard_model_type = scorecard_model_type
         self.payment_threshold = payment_threshold
@@ -75,6 +138,10 @@ class RecoveryAgentPipeline:
             medium_balance_threshold=medium_balance_threshold,
         )
 
+        self.treatment_logger = (
+            TreatmentLogger(treatment_log_path) if treatment_log_path else None
+        )
+
         self.pipeline_run_id = str(uuid.uuid4())
         self.is_scorecard_trained = False
 
@@ -84,35 +151,65 @@ class RecoveryAgentPipeline:
         self,
         features_df: pd.DataFrame,
         labels_df: pd.DataFrame,
+        observation_date: str,
         val_split: float = 0.2,
     ) -> dict:
         """
-        Train recovery scorecard.
+        Train recovery scorecard using propensity features only.
+
+        Feature separation enforced here:
+        - SEGMENTATION_FEATURES and AXIS_SCORE_COLUMNS are explicitly excluded
+          from the training feature set to prevent circular signal leakage.
+        - Persona (categorical) and signal_segment may be added as conditioning
+          variables AFTER segmentation — they are computed fresh inside this method.
 
         Args:
-            features_df: Feature matrix with account_id
-            labels_df: Labels with columns [account_id, recovery_amount_180d]
-            val_split: Validation split ratio
+            features_df      : Feature matrix with account_id. Must contain
+                               both SEGMENTATION_FEATURES (for persona) and
+                               PROPENSITY_FEATURES (for scorecard).
+            labels_df        : Labels with columns [account_id, recovery_amount_180d]
+            observation_date : Snapshot date (YYYY-MM-DD) — passed to persona assignment
+            val_split        : Validation split ratio
 
         Returns:
             Training metrics dict
         """
         logger.info(f"Training {self.scorecard_model_type} scorecard on {len(features_df)} accounts")
 
-        # Merge features with labels
+        # Step 1: Assign personas on segmentation features — separate pass
+        seg_cols = ["account_id"] + [c for c in SEGMENTATION_FEATURES if c in features_df.columns]
+        persona_df = self.persona_builder.assign_batch(
+            features_df[seg_cols],
+            observation_date=observation_date,
+        )
+        # Merge ONLY persona + signal_segment as conditioning variables
+        # Do NOT include axis scores (structural_payment_score etc.)
+        persona_conditioning = persona_df[["account_id", "persona", "signal_segment"]].copy()
+
+        # Step 2: Build scorecard training set — propensity features + persona conditioning
+        # Exclude: SEGMENTATION_FEATURES, AXIS_SCORE_COLUMNS, non-numeric, label
+        excluded = set(SEGMENTATION_FEATURES) | set(AXIS_SCORE_COLUMNS) | {"account_id", "recovery_amount_180d"}
+
         train_data = features_df.merge(labels_df, on="account_id", how="inner")
+        train_data = train_data.merge(persona_conditioning, on="account_id", how="left")
 
         if len(train_data) == 0:
             raise ValueError("No matching accounts between features and labels")
 
-        # Extract features and labels (only numeric columns)
-        numeric_cols = train_data.select_dtypes(include=[np.number]).columns.tolist()
-        numeric_cols = [c for c in numeric_cols if c not in ["account_id", "recovery_amount_180d"]]
+        # One-hot encode persona and signal_segment (categorical conditioning)
+        train_data = pd.get_dummies(train_data, columns=["persona", "signal_segment"], dummy_na=False)
 
-        X = train_data[numeric_cols]
+        numeric_cols = train_data.select_dtypes(include=[np.number]).columns.tolist()
+        scorecard_cols = [c for c in numeric_cols if c not in excluded]
+
+        X = train_data[scorecard_cols]
         y = train_data["recovery_amount_180d"]
 
-        logger.info(f"Using {len(numeric_cols)} numeric features for training")
+        logger.info(
+            f"Scorecard training: {len(scorecard_cols)} features "
+            f"({len(scorecard_cols)} propensity + persona dummies). "
+            f"Segmentation features excluded: {len([c for c in SEGMENTATION_FEATURES if c in features_df.columns])}."
+        )
 
         # Train/val split
         from sklearn.model_selection import train_test_split
@@ -124,7 +221,7 @@ class RecoveryAgentPipeline:
         metrics = self.scorecard.train(X_train, y_train, X_val, y_val)
 
         self.is_scorecard_trained = True
-        logger.info(f"Scorecard training complete. Val AUC: {metrics.get('val', {}).auc_roc if 'val' in metrics else 'N/A'}")
+        logger.info(f"Scorecard training complete.")
 
         return metrics
 
@@ -140,11 +237,17 @@ class RecoveryAgentPipeline:
         """
         Score a batch of accounts and optionally write outputs.
 
+        Feature separation enforced:
+        - PersonaBuilder receives segmentation features only
+        - Scorecard receives propensity features + persona/signal_segment dummies
+        - Axis scores (structural_payment_score etc.) are excluded from scorecard input
+        - Axis scores appear in daily output for audit purposes only
+
         Args:
-            features_df: Feature DataFrame with account_id + all required features
-            score_date: Score date (YYYY-MM-DD)
+            features_df : Feature DataFrame with account_id + all features
+            score_date  : Score date (YYYY-MM-DD) — also used as observation_date
             write_outputs: Whether to write daily scoring table
-            output_path: Path to write outputs (CSV or Parquet)
+            output_path : Directory to write outputs (Parquet)
 
         Returns:
             Daily scoring DataFrame
@@ -153,24 +256,49 @@ class RecoveryAgentPipeline:
             raise ValueError("Scorecard not trained. Call train_scorecard() first.")
 
         logger.info(f"Scoring {len(features_df)} accounts for {score_date}")
-
-        # Generate new run ID for this scoring batch
         self.pipeline_run_id = str(uuid.uuid4())
 
         # ──────────────────────────────────────────────────────────────────────
-        # STEP 1: Persona Assignment
+        # STEP 1: Persona Assignment (segmentation features only)
         # ──────────────────────────────────────────────────────────────────────
         logger.info("Step 1/3: Assigning personas...")
-        persona_df = self.persona_builder.assign_batch(features_df)
+        seg_cols = ["account_id"] + [c for c in SEGMENTATION_FEATURES if c in features_df.columns]
+        persona_df = self.persona_builder.assign_batch(
+            features_df[seg_cols],
+            observation_date=score_date,
+        )
 
-        # Merge personas back to features
-        enriched_df = features_df.merge(persona_df, on="account_id", how="left")
+        # Merge ONLY persona + signal_segment into enriched_df (not axis scores)
+        # Axis scores are kept separately for output/audit
+        _persona_for_scorecard = persona_df[["account_id", "persona", "signal_segment"]].copy()
+        _persona_for_output    = persona_df.copy()  # full — includes axis scores for audit
+
+        enriched_df = features_df.merge(_persona_for_scorecard, on="account_id", how="left")
+
+        # Exclude segmentation features from scorecard input
+        _exclude = set(SEGMENTATION_FEATURES) | set(AXIS_SCORE_COLUMNS) | {"account_id"}
+        _scorecard_cols = [c for c in enriched_df.columns if c not in _exclude]
+
+        # One-hot encode persona + signal_segment before passing to scorecard
+        enriched_for_scoring = pd.get_dummies(
+            enriched_df[_scorecard_cols + ["account_id"]],
+            columns=["persona", "signal_segment"],
+            dummy_na=False,
+        )
 
         # ──────────────────────────────────────────────────────────────────────
-        # STEP 2: Recovery Scoring
+        # STEP 2: Recovery Scoring (propensity features + persona dummies)
         # ──────────────────────────────────────────────────────────────────────
         logger.info("Step 2/3: Scoring recovery potential...")
-        recovery_scores_df = self.scorecard.score_batch(enriched_df, score_date)
+        recovery_scores_df = self.scorecard.score_batch(enriched_for_scoring, score_date)
+
+        # Merge axis scores back to enriched_df for output only (not used by model)
+        enriched_df = enriched_df.merge(
+            _persona_for_output[["account_id"] + AXIS_SCORE_COLUMNS +
+                                ["confidence_level", "data_completeness_pct", "flags"]],
+            on="account_id",
+            how="left",
+        )
 
         # Merge recovery scores
         enriched_df = enriched_df.merge(recovery_scores_df, on="account_id", how="left")
@@ -211,21 +339,24 @@ class RecoveryAgentPipeline:
         audit_events = []
 
         for _, row in enriched_df.iterrows():
-            # Daily scoring row
+            # Daily scoring row — axis scores appear here for audit, NOT model features
             scoring_row = {
                 "account_id": row["account_id"],
                 "score_date": score_date,
 
-                # Persona
+                # Persona (structural segmentation)
                 "persona": row["persona"],
-                "payment_behavior_score": row["payment_behavior_score"],
-                "engagement_score": row["engagement_score"],
-                "capacity_score": row["capacity_score"],
-                "avoidance_score": row["avoidance_score"],
-                "persona_confidence": row["confidence_level"],
-                "persona_flags": row["flags"],
+                "signal_segment": row.get("signal_segment", "STANDARD"),
+                # Axis scores: audit/transparency only — never model input
+                "structural_payment_score": row.get("structural_payment_score"),
+                "trajectory_score": row.get("trajectory_score"),
+                "capacity_score": row.get("capacity_score"),
+                "avoidance_score": row.get("avoidance_score"),
+                "persona_confidence": row.get("confidence_level"),
+                "data_completeness_pct": row.get("data_completeness_pct"),
+                "persona_flags": row.get("flags"),
 
-                # Recovery score
+                # Recovery score (propensity)
                 "score_band": row["score_band"],
                 "p_recovery_6m": row["p_recovery"],
                 "expected_recovery_amount": row["expected_recovery"],
@@ -259,7 +390,11 @@ class RecoveryAgentPipeline:
             audit_events.append(create_audit_event(
                 account_id=row["account_id"],
                 event_type="PERSONA_ASSIGNED",
-                event_detail=f"Persona: {row['persona']}, Confidence: {row['confidence_level']}",
+                event_detail=(
+                    f"Persona: {row['persona']}, "
+                    f"Segment: {row.get('signal_segment','STANDARD')}, "
+                    f"Confidence: {row.get('confidence_level','?')}"
+                ),
                 pipeline_run_id=self.pipeline_run_id,
             ))
 
@@ -282,29 +417,32 @@ class RecoveryAgentPipeline:
         audit_log_df = pd.DataFrame(audit_events)
 
         # ──────────────────────────────────────────────────────────────────────
-        # STEP 5: Write Outputs
+        # STEP 5: Treatment Logging (persistent causal tracking)
+        # ──────────────────────────────────────────────────────────────────────
+        if self.treatment_logger is not None:
+            self.treatment_logger.log_batch(daily_scoring_df)
+
+        # ──────────────────────────────────────────────────────────────────────
+        # STEP 6: Write Outputs
         # ──────────────────────────────────────────────────────────────────────
         if write_outputs and output_path:
             logger.info(f"Writing outputs to {output_path}")
 
-            # Daily scoring table
             scoring_file = f"{output_path}/daily_scoring_{score_date}.parquet"
             daily_scoring_df.to_parquet(scoring_file, index=False)
             logger.info(f"  ✓ Daily scoring: {scoring_file}")
 
-            # Audit log
             audit_file = f"{output_path}/audit_log_{score_date}.parquet"
             audit_log_df.to_parquet(audit_file, index=False)
             logger.info(f"  ✓ Audit log: {audit_file}")
 
-            # Summary stats
             summary = self._generate_summary(daily_scoring_df)
             summary_file = f"{output_path}/summary_{score_date}.txt"
             with open(summary_file, "w") as f:
                 f.write(summary)
             logger.info(f"  ✓ Summary: {summary_file}")
 
-        logger.info(f"✓ Scoring complete. {len(daily_scoring_df)} accounts scored.")
+        logger.info(f"Scoring complete. {len(daily_scoring_df)} accounts scored.")
         return daily_scoring_df
 
     # ── UTILITIES ─────────────────────────────────────────────────────────────
@@ -326,6 +464,15 @@ class RecoveryAgentPipeline:
             pct = count / len(daily_scoring_df) * 100
             summary.append(f"  {persona:25s}: {count:5d} ({pct:5.1f}%)")
         summary.append("")
+
+        # Signal segment distribution
+        if "signal_segment" in daily_scoring_df.columns:
+            summary.append("SIGNAL SEGMENT DISTRIBUTION:")
+            seg_counts = daily_scoring_df["signal_segment"].value_counts()
+            for seg, count in seg_counts.items():
+                pct = count / len(daily_scoring_df) * 100
+                summary.append(f"  {seg:25s}: {count:5d} ({pct:5.1f}%)")
+            summary.append("")
 
         # Score band distribution
         summary.append("SCORE BAND DISTRIBUTION:")

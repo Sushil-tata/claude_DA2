@@ -1,32 +1,41 @@
 """
 Persona Builder - Rule-Based Customer Segmentation
 ===================================================
+v2.0 — Redesigned with strict feature separation and snapshot enforcement
 
-Assigns recovery personas using only historical behavioral signals.
-No predictive models - pure rule-based logic.
+Core principle: Segmentation uses LONG-TERM STRUCTURAL signals only.
+Short-window (≤30/90-day) payment and engagement signals are reserved
+exclusively for the propensity scorecard (see PROPENSITY_FEATURES).
+
+Axes (redesigned from v1):
+  - structural_payment_score : cure history, re-default count, effort in NPL
+  - trajectory_score         : bureau stage dynamics (shape type, slope, stickiness)
+  - capacity_score           : bureau debt burden and DSR
+  - avoidance_score          : persistent avoidance flags (wrong number, lawyer, opt-out)
+
+Axis scores are written to the audit output ONLY.
+They must never enter the propensity scorecard feature set.
+
+Feature separation:
+  - SEGMENTATION_FEATURES : long-term structural signals — used here ONLY
+  - PROPENSITY_FEATURES   : short-window signals — used in scorecard ONLY
 
 5 Personas:
------------
-1. ActivePayer: Regular payment activity, responsive to contact
-2. SelectiveDefaulter: Has capacity but chooses not to pay
-3. LiquidityConstrained: Wants to pay but lacks funds
-4. Strategic: Sophisticated avoidance behavior
-5. Dormant: No engagement despite contact attempts
+  ACTIVE_PAYER | SELECTIVE_DEFAULTER | LIQUIDITY_CONSTRAINED | STRATEGIC | DORMANT
 
-Methodology:
------------
-Calculate 4 behavioral axes from historical data:
-  - Payment behavior score (0-100)
-  - Engagement score (0-100)
-  - Capacity score (0-100)
-  - Avoidance score (0-100)
+SIGNAL_SEGMENT — strategic overlay on top of persona:
+  SELECTIVE_CHRONIC | CHRONIC_NPL | HIGH_WORTH_RECOVERY | WRITE_OFF_RISK
+  | BUREAU_THIN_FILE | STANDARD
 
-Apply decision tree rules to assign persona.
+observation_date enforcement:
+  - assign_batch() requires observation_date (YYYY-MM-DD)
+  - All window-based features must be pre-computed upstream relative to that date
+  - assign_batch() raises ValueError if observation_date is not supplied
 """
 
 import logging
-from dataclasses import dataclass
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -35,25 +44,113 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OUTPUT
+# FEATURE SET DEFINITIONS  (strict zero-overlap separation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Features used in segmentation ONLY — must never appear in scorecard training
+SEGMENTATION_FEATURES: List[str] = [
+    # Long-term payment structure
+    "payment_effort_ratio_npl",       # avg payment / balance during NPL months
+    "cure_count_24m",                 # times cured from NPL/SM → CURRENT/X in 24m
+    "re_default_count_24m",           # times re-defaulted after cure in 24m
+    "months_dormant",                 # months with zero payment activity
+    "pct_months_npl_24m",             # % of last 24m in NPL or worse
+    "worst_stage_ever",               # worst DPD stage in full history
+
+    # Bureau structural signals
+    "bureau_months_on_book",          # vintage — longer = more data confidence
+    "bureau_total_outstanding",       # absolute debt burden
+    "bureau_monthly_instalment",      # monthly debt service (structural)
+    "bureau_delinquent_other",        # delinquent on other lenders (0/1 or count)
+    "bureau_new_loan_12m",            # credit-seeking in last 12m
+    "bureau_secured_loan_flag",       # has secured collateral
+
+    # Bureau stage dynamics (from bureau_stage_dynamics.py)
+    "dpd_shape_type",                 # CLIFF/SLIDE/OSCILLATOR/RECOVERING/STABLE
+    "dpd_slope_12m",                  # trajectory direction (negative = improving)
+    "stage_stickiness_score",         # prob of staying in current stage
+    "re_default_rate_rolling_24m",    # chronic re-defaulter rate
+    "cure_rate_sm_to_lower",          # cure capability from SM stage
+
+    # Persistent avoidance flags
+    "wrong_number_flag",
+    "dispute_flag",
+    "complaint_flag",
+    "lawyer_mentioned",
+    "legal_representation_flag",
+    "sms_opt_out",
+]
+
+# Features reserved for propensity scorecard ONLY — never used in segmentation
+PROPENSITY_FEATURES: List[str] = [
+    "payment_count_30d",
+    "payment_count_90d",
+    "payment_count_180d",
+    "payment_amt_30d",
+    "payment_amt_90d",
+    "payment_amt_180d",
+    "days_since_last_payment",
+    "ptp_kept_rate",
+    "last_payment_amount",
+    "call_response_rate",
+    "sms_response_rate",
+    "days_since_last_contact",
+    "contacts_made_30d",
+    "contacts_made_90d",
+    "calls_connected",
+    "last_contact_outcome",
+]
+
+# Axis score columns produced by assign_batch() — for audit/output ONLY
+AXIS_SCORE_COLUMNS: List[str] = [
+    "structural_payment_score",
+    "trajectory_score",
+    "capacity_score",
+    "avoidance_score",
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEFAULT THRESHOLDS  (overridden by calibrate())
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_THRESHOLDS: Dict[str, float] = {
+    "avoidance_strategic_min":         50.0,
+    "trajectory_dormant_max":          30.0,
+    "structural_payment_dormant_max":  20.0,
+    "structural_payment_active_min":   60.0,
+    "capacity_selective_min":          50.0,
+    "structural_payment_selective_max":40.0,
+    "capacity_constrained_max":        40.0,
+    "trajectory_constrained_min":      30.0,
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTPUT DATACLASS
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class PersonaAssignment:
-    """Persona assignment with supporting scores"""
+    """Persona assignment with structural axis scores and strategic overlay."""
     account_id: str
-    persona: str  # ACTIVE_PAYER | SELECTIVE_DEFAULTER | LIQUIDITY_CONSTRAINED | STRATEGIC | DORMANT
+    observation_date: str  # Snapshot anchor — all windows relative to this date
+    persona: str           # ACTIVE_PAYER | SELECTIVE_DEFAULTER | LIQUIDITY_CONSTRAINED | STRATEGIC | DORMANT
 
-    # Underlying axis scores (0-100)
-    payment_behavior_score: float
-    engagement_score: float
+    # Axis scores (0-100) — audit/transparency ONLY, never scorecard input
+    structural_payment_score: float
+    trajectory_score: float
     capacity_score: float
     avoidance_score: float
 
-    # Supporting metrics
-    confidence_level: str  # HIGH | MEDIUM | LOW
+    # Strategic overlay
+    signal_segment: str    # SELECTIVE_CHRONIC | CHRONIC_NPL | HIGH_WORTH_RECOVERY
+                           # | WRITE_OFF_RISK | BUREAU_THIN_FILE | STANDARD
+
+    # Metadata
+    confidence_level: str           # HIGH | MEDIUM | LOW
     data_completeness_pct: float
-    flags: list[str]  # Additional context flags
+    flags: List[str] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,374 +159,520 @@ class PersonaAssignment:
 
 class PersonaBuilder:
     """
-    Rule-based persona assignment using historical behavior only.
-    Uses stage-wise windows: 0-30, 31-90, 91-180, 181-365 days.
+    Rule-based persona assignment using long-term structural signals only.
+
+    v2.0 changes vs v1:
+    - observation_date required — feature windows must be upstream-anchored
+    - Axes redesigned: structural_payment, trajectory, capacity, avoidance
+    - Short-window payment/engagement signals removed (moved to PROPENSITY_FEATURES)
+    - Bureau stage dynamics features (dpd_shape_type, dpd_slope_12m, etc.) added
+    - Thresholds calibratable from training data via calibrate()
+    - SIGNAL_SEGMENT computed as strategic overlay
     """
 
-    def __init__(self, payment_threshold: float = 500.0):
+    def __init__(
+        self,
+        payment_threshold: float = 500.0,
+        thresholds: Optional[Dict[str, float]] = None,
+    ):
         """
         Args:
-            payment_threshold: Minimum THB to count as meaningful payment
+            payment_threshold : Minimum THB to count as meaningful payment
+            thresholds        : Override decision thresholds. Use calibrate() for
+                                data-driven splits derived from actual portfolio.
         """
         self.payment_threshold = payment_threshold
+        self.thresholds = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
+        self._is_calibrated = False
 
-    def assign_persona(self, account: pd.Series) -> PersonaAssignment:
+    # ── CALIBRATION ───────────────────────────────────────────────────────────
+
+    def calibrate(self, df: pd.DataFrame) -> Dict[str, float]:
         """
-        Assign persona based on behavioral axes.
+        Compute data-driven decision thresholds from a training sample.
 
-        Expected fields in account:
-        - Payment fields: payment_count_30d, payment_count_90d, payment_count_180d,
-                         payment_amt_30d, payment_amt_90d, payment_amt_180d,
-                         days_since_last_payment, ptp_kept_rate
-        - Engagement fields: call_response_rate, sms_response_rate,
-                            contacts_made_30d, contacts_made_90d
-        - Capacity fields: bureau_monthly_instalment, bureau_total_outstanding,
-                          balance, principal_outstanding, last_payment_amount
-        - Avoidance fields: wrong_number_flag, dispute_flag, lawyer_mentioned,
-                           sms_opt_out, last_contact_outcome
+        Replaces hardcoded DEFAULT_THRESHOLDS with percentile-derived cuts.
+        Call once before running assign_batch() in production.
+
+        Args:
+            df: Training DataFrame containing SEGMENTATION_FEATURES columns
+
+        Returns:
+            Dict of calibrated thresholds (also stored in self.thresholds)
+        """
+
+        def _pct(col: str, q: float, default: float) -> float:
+            if col in df.columns:
+                vals = df[col].dropna()
+                return float(np.percentile(vals, q * 100)) if len(vals) > 10 else default
+            return default
+
+        calibrated: Dict[str, float] = {}
+
+        # structural_payment_active_min: 60th percentile of payment_effort_ratio_npl
+        calibrated["structural_payment_active_min"] = _pct(
+            "payment_effort_ratio_npl", 0.60, DEFAULT_THRESHOLDS["structural_payment_active_min"]
+        )
+
+        # trajectory_dormant_max: 30th percentile of trajectory (use dpd_slope_12m as proxy)
+        # Negative slope = improving; 30th pct of slope is the "low trajectory" cut
+        calibrated["trajectory_dormant_max"] = _pct(
+            "dpd_slope_12m", 0.30, DEFAULT_THRESHOLDS["trajectory_dormant_max"]
+        )
+
+        # capacity_selective_min: 50th percentile of bureau_total_outstanding
+        calibrated["capacity_selective_min"] = _pct(
+            "bureau_total_outstanding", 0.50, DEFAULT_THRESHOLDS["capacity_selective_min"]
+        )
+
+        # Avoidance is flag-based — natural midpoint stays 50
+        calibrated["avoidance_strategic_min"] = 50.0
+
+        # structural_payment_selective_max: 40th percentile
+        calibrated["structural_payment_selective_max"] = _pct(
+            "payment_effort_ratio_npl", 0.40, DEFAULT_THRESHOLDS["structural_payment_selective_max"]
+        )
+
+        self.thresholds.update(calibrated)
+        self._is_calibrated = True
+
+        logger.info(
+            f"PersonaBuilder calibrated on {len(df)} accounts. "
+            f"is_calibrated={self._is_calibrated}. Thresholds: {calibrated}"
+        )
+        return calibrated
+
+    # ── SINGLE ACCOUNT ────────────────────────────────────────────────────────
+
+    def assign_persona(
+        self,
+        account: pd.Series,
+        observation_date: str,
+    ) -> PersonaAssignment:
+        """
+        Assign persona based on long-term structural behavioral axes.
+
+        Args:
+            account          : Series with fields from SEGMENTATION_FEATURES
+            observation_date : Snapshot date (YYYY-MM-DD). Stored for audit trail.
+                               All window features must be pre-computed upstream
+                               relative to this date.
+
+        Expected fields (see SEGMENTATION_FEATURES for full list):
+          payment_effort_ratio_npl, cure_count_24m, re_default_count_24m,
+          months_dormant, pct_months_npl_24m,
+          bureau_months_on_book, bureau_total_outstanding, bureau_monthly_instalment,
+          dpd_shape_type, dpd_slope_12m, stage_stickiness_score,
+          re_default_rate_rolling_24m, cure_rate_sm_to_lower,
+          wrong_number_flag, dispute_flag, lawyer_mentioned, sms_opt_out
         """
         account_id = str(account.get("account_id", "unknown"))
 
-        # Calculate behavioral axes
-        payment_score = self._calculate_payment_behavior(account)
-        engagement_score = self._calculate_engagement(account)
-        capacity_score = self._calculate_capacity(account)
-        avoidance_score = self._calculate_avoidance(account)
+        structural_payment = self._calculate_structural_payment(account)
+        trajectory         = self._calculate_trajectory(account)
+        capacity           = self._calculate_capacity(account)
+        avoidance          = self._calculate_avoidance(account)
 
-        # Assign persona using decision tree
-        persona = self._apply_decision_tree(
-            payment_score, engagement_score, capacity_score, avoidance_score
+        persona = self._apply_decision_tree(structural_payment, trajectory, capacity, avoidance)
+
+        signal_segment = self._compute_signal_segment(
+            account, structural_payment, trajectory, capacity, avoidance
         )
 
-        # Calculate confidence based on data completeness
         completeness, confidence = self._assess_confidence(account)
-
-        # Generate context flags
-        flags = self._generate_flags(account, payment_score, engagement_score, capacity_score, avoidance_score)
+        flags = self._generate_flags(account, structural_payment, trajectory, capacity, avoidance)
 
         return PersonaAssignment(
             account_id=account_id,
+            observation_date=observation_date,
             persona=persona,
-            payment_behavior_score=round(payment_score, 2),
-            engagement_score=round(engagement_score, 2),
-            capacity_score=round(capacity_score, 2),
-            avoidance_score=round(avoidance_score, 2),
+            structural_payment_score=round(structural_payment, 2),
+            trajectory_score=round(trajectory, 2),
+            capacity_score=round(capacity, 2),
+            avoidance_score=round(avoidance, 2),
+            signal_segment=signal_segment,
             confidence_level=confidence,
             data_completeness_pct=round(completeness, 2),
-            flags=flags
+            flags=flags,
         )
 
-    # ── BEHAVIORAL AXES ───────────────────────────────────────────────────────
+    # ── STRUCTURAL AXES ───────────────────────────────────────────────────────
 
-    def _calculate_payment_behavior(self, account: pd.Series) -> float:
+    def _calculate_structural_payment(self, account: pd.Series) -> float:
         """
-        Payment behavior score (0-100).
-        Higher = more payment activity.
+        Structural payment score (0-100) using long-term cure/effort signals.
+        Higher = stronger long-term payment behaviour.
 
         Components:
-        - Payment frequency (40%): weighted by recency
-        - Payment amount ratio (30%): payments vs. balance
-        - PTP kept rate (20%): promise-to-pay reliability
-        - Recency (10%): days since last payment
+        - Payment effort in NPL months (35%) : avg payment / balance during NPL
+        - Cure history (30%)                 : times cured from NPL/SM in 24m
+        - Re-default penalty (25%)           : chronic re-defaulting reduces score
+        - Dormancy penalty (10%)             : months with zero payment activity
         """
         score = 0.0
 
-        # Payment frequency (weighted by recency)
-        p30 = float(account.get("payment_count_30d", 0) or 0)
-        p90 = float(account.get("payment_count_90d", 0) or 0)
-        p180 = float(account.get("payment_count_180d", 0) or 0)
+        # Payment effort in NPL — structural willingness signal
+        effort = float(account.get("payment_effort_ratio_npl", 0) or 0)
+        score += min(100, effort * 100) * 0.35
 
-        # Weighted frequency: recent payments matter more
-        freq = (p30 * 0.5 + p90 * 0.3 + p180 * 0.2)
-        freq_score = min(100, freq * 20)  # 5+ payments = 100
-        score += freq_score * 0.4
+        # Cure history: 3+ cures in 24m → 100 pts
+        cures = float(account.get("cure_count_24m", 0) or 0)
+        score += min(100, cures * 33.3) * 0.30
 
-        # Payment amount ratio
-        amt_90d = float(account.get("payment_amt_90d", 0) or 0)
-        balance = float(account.get("balance", 1) or 1)
-        payment_ratio = amt_90d / balance if balance > 0 else 0
-        amt_score = min(100, payment_ratio * 100)  # 100% coverage = 100
-        score += amt_score * 0.3
+        # Re-default penalty: each re-default removes 25 pts from this component
+        redefaults = float(account.get("re_default_count_24m", 0) or 0)
+        score -= min(100, redefaults * 25) * 0.25
 
-        # PTP kept rate
-        ptp_rate = float(account.get("ptp_kept_rate", 0) or 0)
-        score += ptp_rate * 100 * 0.2
+        # Dormancy penalty: 12m dormant = full penalty
+        dormant = float(account.get("months_dormant", 0) or 0)
+        score -= min(100, dormant * 8.33) * 0.10
 
-        # Recency
-        days_since = float(account.get("days_since_last_payment", 999) or 999)
-        recency_score = max(0, 100 - (days_since / 3.65))  # Linear decay over 365d
-        score += recency_score * 0.1
+        return min(100.0, max(0.0, score))
 
-        return min(100, max(0, score))
-
-    def _calculate_engagement(self, account: pd.Series) -> float:
+    def _calculate_trajectory(self, account: pd.Series) -> float:
         """
-        Engagement score (0-100).
-        Higher = more responsive to contact.
+        Trajectory score (0-100) using bureau stage dynamics signals.
+        Higher = improving or stable DPD trajectory.
 
         Components:
-        - Call response rate (40%)
-        - SMS response rate (30%)
-        - Contact recency (20%)
-        - Contact frequency acceptance (10%): answers vs. attempts
+        - DPD shape type (35%)      : RECOVERING/STABLE positive; CLIFF/SLIDE negative
+        - DPD slope 12m (25%)       : negative slope = improving
+        - Stage stickiness (20%)    : low stickiness in bad stage = cure potential
+        - Re-default rate (20%)     : chronic pattern lowers trajectory
         """
-        score = 0.0
+        score = 50.0  # Neutral baseline
 
-        # Call response rate
-        call_rate = float(account.get("call_response_rate", 0) or 0)
-        score += call_rate * 100 * 0.4
+        # DPD shape type
+        shape = str(account.get("dpd_shape_type", "") or "").upper()
+        shape_delta = {
+            "RECOVERING": 40,
+            "STABLE":     20,
+            "OSCILLATOR":  0,
+            "SLIDE":     -20,
+            "CLIFF":     -40,
+        }.get(shape, 0)
+        score += shape_delta * 0.35
 
-        # SMS response rate
-        sms_rate = float(account.get("sms_response_rate", 0) or 0)
-        score += sms_rate * 100 * 0.3
+        # DPD slope: negative = improving (DPD falling)
+        slope = float(account.get("dpd_slope_12m", 0) or 0)
+        slope_contribution = max(-30.0, min(30.0, -slope * 2))
+        score += slope_contribution * 0.25
 
-        # Contact recency
-        days_since_contact = float(account.get("days_since_last_contact", 999) or 999)
-        recency_score = max(0, 100 - (days_since_contact / 0.9))  # Decay over 90d
-        score += recency_score * 0.2
+        # Stage stickiness: in bad stage, low stickiness = cure potential
+        stickiness = float(account.get("stage_stickiness_score", 0.5) or 0.5)
+        pct_npl = float(account.get("pct_months_npl_24m", 0) or 0)
+        if pct_npl > 0.5:
+            # Currently in bad stage: low stickiness is GOOD
+            stickiness_contribution = (1.0 - stickiness) * 30 - 15
+        else:
+            stickiness_contribution = 0.0
+        score += stickiness_contribution * 0.20
 
-        # Contact frequency acceptance
-        contacts_made = float(account.get("contacts_made_30d", 0) or 0)
-        calls_connected = float(account.get("calls_connected", 0) or 0)
-        if contacts_made > 0:
-            acceptance_rate = calls_connected / contacts_made
-            score += min(100, acceptance_rate * 100) * 0.1
+        # Re-default rate: 100% rate → -40 pts
+        redefault_rate = float(account.get("re_default_rate_rolling_24m", 0) or 0)
+        score -= redefault_rate * 40 * 0.20
 
-        return min(100, max(0, score))
+        return min(100.0, max(0.0, score))
 
     def _calculate_capacity(self, account: pd.Series) -> float:
         """
-        Capacity score (0-100).
+        Capacity score (0-100) using bureau structural debt signals.
         Higher = more financial capacity to pay.
 
         Components:
-        - Bureau DSR (40%): debt service ratio
-        - Balance burden (30%): CardX balance vs. total exposure
-        - Last payment size (20%): shows payment capacity
-        - Bureau velocity (10%): new loan activity
+        - Bureau DSR proxy (40%) : total instalment / (outstanding / 3)
+        - Balance burden (30%)   : CardX balance vs. total bureau outstanding
+        - Secured asset (20%)    : has collateral = implicit capacity
+        - Credit access (10%)    : new loans taken = able to access credit market
         """
         score = 0.0
 
-        # Bureau DSR
-        bureau_instalment = float(account.get("bureau_monthly_instalment", 0) or 0)
-        # Assume 30% income proxy from bureau_total_outstanding / 36
-        total_outstanding = float(account.get("bureau_total_outstanding", 0) or 0)
+        bureau_instalment  = float(account.get("bureau_monthly_instalment", 0) or 0)
+        total_outstanding  = float(account.get("bureau_total_outstanding", 0) or 0)
+        cardx_balance      = float(account.get("balance", 0) or 0)
+
+        # DSR proxy
         if total_outstanding > 0:
-            implied_income = total_outstanding / 3  # Conservative estimate
+            implied_income = total_outstanding / 3.0
             dsr = bureau_instalment / implied_income if implied_income > 0 else 1.0
-            dsr_score = max(0, 100 - (dsr * 100))  # Lower DSR = higher capacity
-            score += dsr_score * 0.4
+            score += max(0, 100 - dsr * 100) * 0.4
         else:
-            # No bureau data = use CardX balance as proxy
-            balance = float(account.get("balance", 0) or 0)
-            if balance < 50000:
-                score += 70 * 0.4  # Small balance = likely has capacity
-            elif balance < 200000:
+            # No bureau data: use CardX balance as fallback
+            if cardx_balance < 50_000:
+                score += 70 * 0.4
+            elif cardx_balance < 200_000:
                 score += 50 * 0.4
             else:
                 score += 30 * 0.4
 
         # Balance burden
-        cardx_balance = float(account.get("balance", 0) or 0)
         if total_outstanding > 0:
             burden_ratio = cardx_balance / total_outstanding
-            burden_score = max(0, 100 - (burden_ratio * 100))
-            score += burden_score * 0.3
+            score += max(0, 100 - burden_ratio * 100) * 0.3
         else:
-            score += 50 * 0.3  # Neutral if no bureau data
+            score += 50 * 0.3
 
-        # Last payment size
-        last_payment = float(account.get("last_payment_amount", 0) or 0)
-        if last_payment >= self.payment_threshold:
-            payment_score = min(100, (last_payment / cardx_balance) * 100) if cardx_balance > 0 else 50
-            score += payment_score * 0.2
-
-        # Bureau velocity
-        new_loan_12m = int(account.get("bureau_new_loan_12m", 0) or 0)
-        if new_loan_12m == 0:
-            score += 30 * 0.1  # No new loans = may be stressed
-        elif new_loan_12m == 1:
-            score += 70 * 0.1  # One new loan = accessing credit (capacity)
+        # Secured asset
+        if account.get("bureau_secured_loan_flag", False):
+            score += 70 * 0.2
         else:
-            score += 50 * 0.1  # Multiple = credit seeking
+            score += 30 * 0.2
 
-        return min(100, max(0, score))
+        # Credit access
+        new_loans = int(account.get("bureau_new_loan_12m", 0) or 0)
+        score += min(100, new_loans * 30) * 0.1
+
+        return min(100.0, max(0.0, score))
 
     def _calculate_avoidance(self, account: pd.Series) -> float:
         """
-        Avoidance score (0-100).
-        Higher = more signs of strategic avoidance.
+        Avoidance score (0-100) using persistent structural avoidance flags.
+        Higher = stronger strategic avoidance behaviour.
 
-        Components:
+        Components (all binary persistent flags — unchanged from v1):
         - Wrong number flag (25%)
-        - Dispute/complaint flag (25%)
+        - Dispute / complaint flag (25%)
         - Lawyer mentioned (20%)
         - SMS opt-out (15%)
-        - Refused to engage outcome (15%)
+        - Refused engagement outcome (15%)
         """
         score = 0.0
 
-        # Wrong number flag
         if account.get("wrong_number_flag", False):
             score += 25
 
-        # Dispute flag
         if account.get("dispute_flag", False) or account.get("complaint_flag", False):
             score += 25
 
-        # Lawyer mentioned
         if account.get("lawyer_mentioned", False) or account.get("legal_representation_flag", False):
             score += 20
 
-        # SMS opt-out
         if account.get("sms_opt_out", False):
             score += 15
 
-        # Last contact outcome = refused
-        last_outcome = str(account.get("last_contact_outcome", "")).lower()
-        if "refuse" in last_outcome or "hostile" in last_outcome or "legal" in last_outcome:
+        last_outcome = str(account.get("last_contact_outcome", "") or "").lower()
+        if any(kw in last_outcome for kw in ("refuse", "hostile", "legal")):
             score += 15
 
-        return min(100, max(0, score))
+        return min(100.0, max(0.0, score))
 
     # ── DECISION TREE ─────────────────────────────────────────────────────────
 
     def _apply_decision_tree(
         self,
-        payment_score: float,
-        engagement_score: float,
-        capacity_score: float,
-        avoidance_score: float
+        structural_payment: float,
+        trajectory: float,
+        capacity: float,
+        avoidance: float,
     ) -> str:
         """
-        Decision tree to assign persona based on axis scores.
+        Decision tree using calibratable thresholds from self.thresholds.
 
-        Logic:
-        1. High avoidance (>50) → STRATEGIC
-        2. Low engagement (<30) → DORMANT
-        3. High payment (>60) → ACTIVE_PAYER
-        4. High capacity (>50) + low payment (<40) → SELECTIVE_DEFAULTER
-        5. Low capacity (<40) + moderate engagement (>30) → LIQUIDITY_CONSTRAINED
-        6. Default → SELECTIVE_DEFAULTER
+        Priority order (first match wins):
+        1. High avoidance            → STRATEGIC
+        2. Low trajectory + low pay  → DORMANT
+        3. High structural payment   → ACTIVE_PAYER
+        4. High capacity + low pay   → SELECTIVE_DEFAULTER
+        5. Low capacity + mod. traj  → LIQUIDITY_CONSTRAINED
+        6. Default                   → SELECTIVE_DEFAULTER
         """
-        # Strategic avoidance
-        if avoidance_score > 50:
+        t = self.thresholds
+
+        if avoidance > t["avoidance_strategic_min"]:
             return "STRATEGIC"
 
-        # Dormant (no engagement despite contact)
-        if engagement_score < 30:
+        if trajectory < t["trajectory_dormant_max"] and structural_payment < t["structural_payment_dormant_max"]:
             return "DORMANT"
 
-        # Active payer
-        if payment_score > 60:
+        if structural_payment > t["structural_payment_active_min"]:
             return "ACTIVE_PAYER"
 
-        # Selective defaulter (has capacity but not paying)
-        if capacity_score > 50 and payment_score < 40:
+        if capacity > t["capacity_selective_min"] and structural_payment < t["structural_payment_selective_max"]:
             return "SELECTIVE_DEFAULTER"
 
-        # Liquidity constrained (wants to engage but can't pay)
-        if capacity_score < 40 and engagement_score > 30:
+        if capacity < t["capacity_constrained_max"] and trajectory > t["trajectory_constrained_min"]:
             return "LIQUIDITY_CONSTRAINED"
 
-        # Default to selective defaulter
         return "SELECTIVE_DEFAULTER"
+
+    # ── SIGNAL SEGMENT ────────────────────────────────────────────────────────
+
+    def _compute_signal_segment(
+        self,
+        account: pd.Series,
+        structural_payment: float,
+        trajectory: float,
+        capacity: float,
+        avoidance: float,
+    ) -> str:
+        """
+        Compute strategic overlay segment — layered ON TOP of persona.
+
+        Used for treatment intensity calibration and offer selection.
+        Evaluated in priority order; first match returned.
+
+        Segments:
+        - BUREAU_THIN_FILE    : <6 months on book — structural signals unreliable
+        - SELECTIVE_CHRONIC   : ≥2 cures AND ≥2 re-defaults — can pay but repeatedly relapses
+        - CHRONIC_NPL         : ≥75% months in NPL + CLIFF or SLIDE shape — structurally stuck
+        - WRITE_OFF_RISK      : worst stage CO/CO_DEEP + >12 months dormant
+        - HIGH_WORTH_RECOVERY : balance >200k + high capacity + some payment history
+        - STANDARD            : no special signal
+        """
+        bureau_mob    = float(account.get("bureau_months_on_book", 0) or 0)
+        cures         = float(account.get("cure_count_24m", 0) or 0)
+        redefaults    = float(account.get("re_default_count_24m", 0) or 0)
+        pct_npl       = float(account.get("pct_months_npl_24m", 0) or 0)
+        shape         = str(account.get("dpd_shape_type", "") or "").upper()
+        worst_stage   = str(account.get("worst_stage_ever", "") or "").upper()
+        months_dormant = float(account.get("months_dormant", 0) or 0)
+        balance       = float(account.get("balance", 0) or 0)
+
+        if bureau_mob < 6:
+            return "BUREAU_THIN_FILE"
+
+        if cures >= 2 and redefaults >= 2:
+            return "SELECTIVE_CHRONIC"
+
+        if pct_npl >= 0.75 and shape in ("CLIFF", "SLIDE"):
+            return "CHRONIC_NPL"
+
+        if worst_stage in ("CO", "CO_DEEP") and months_dormant > 12:
+            return "WRITE_OFF_RISK"
+
+        if balance > 200_000 and capacity > 50 and structural_payment > 30:
+            return "HIGH_WORTH_RECOVERY"
+
+        return "STANDARD"
 
     # ── CONFIDENCE & FLAGS ────────────────────────────────────────────────────
 
-    def _assess_confidence(self, account: pd.Series) -> tuple[float, str]:
+    def _assess_confidence(self, account: pd.Series) -> Tuple[float, str]:
         """
-        Assess confidence based on data completeness.
-        Returns (completeness_pct, confidence_level).
+        Assess confidence based on structural feature completeness.
+        Required fields align with SEGMENTATION_FEATURES (core subset).
         """
         required_fields = [
-            "payment_count_30d", "payment_count_90d", "payment_count_180d",
-            "call_response_rate", "sms_response_rate",
-            "bureau_monthly_instalment", "balance",
-            "days_since_last_payment", "days_since_last_contact"
+            "payment_effort_ratio_npl",
+            "cure_count_24m",
+            "re_default_count_24m",
+            "months_dormant",
+            "pct_months_npl_24m",
+            "bureau_total_outstanding",
+            "bureau_months_on_book",
+            "dpd_shape_type",
+            "dpd_slope_12m",
+            "stage_stickiness_score",
         ]
 
-        present_count = sum(
+        present = sum(
             1 for f in required_fields
             if f in account.index and pd.notna(account[f])
         )
+        completeness = (present / len(required_fields)) * 100
 
-        completeness = (present_count / len(required_fields)) * 100
-
-        if completeness >= 80:
-            confidence = "HIGH"
-        elif completeness >= 60:
-            confidence = "MEDIUM"
-        else:
-            confidence = "LOW"
-
+        confidence = "HIGH" if completeness >= 80 else ("MEDIUM" if completeness >= 60 else "LOW")
         return completeness, confidence
 
     def _generate_flags(
         self,
         account: pd.Series,
-        payment_score: float,
-        engagement_score: float,
-        capacity_score: float,
-        avoidance_score: float
-    ) -> list[str]:
-        """Generate context flags for transparency."""
-        flags = []
+        structural_payment: float,
+        trajectory: float,
+        capacity: float,
+        avoidance: float,
+    ) -> List[str]:
+        """Generate context flags for audit and transparency."""
+        flags: List[str] = []
 
-        # Payment flags
-        if payment_score > 70:
-            flags.append("high_payment_activity")
-        elif payment_score < 20:
-            flags.append("no_payment_activity")
+        if structural_payment > 70:
+            flags.append("strong_structural_payment_history")
+        elif structural_payment < 20:
+            flags.append("no_meaningful_payment_history")
 
-        # Engagement flags
-        if engagement_score > 70:
-            flags.append("highly_responsive")
-        elif engagement_score < 20:
-            flags.append("unresponsive")
+        if trajectory > 70:
+            flags.append("improving_dpd_trajectory")
+        elif trajectory < 30:
+            flags.append("deteriorating_or_stagnant_trajectory")
 
-        # Capacity flags
-        if capacity_score > 70:
+        if capacity > 70:
             flags.append("high_capacity")
-        elif capacity_score < 30:
+        elif capacity < 30:
             flags.append("low_capacity")
 
-        # Avoidance flags
-        if avoidance_score > 50:
-            flags.append("avoidance_behavior")
+        if avoidance > 50:
+            flags.append("avoidance_behaviour")
 
-        # Bureau flags
-        if pd.notna(account.get("bureau_delinquent_other")) and account.get("bureau_delinquent_other", 0) > 0:
+        redefaults = float(account.get("re_default_count_24m", 0) or 0)
+        if redefaults >= 2:
+            flags.append("repeat_re_defaulter")
+
+        shape = str(account.get("dpd_shape_type", "") or "").upper()
+        if shape == "RECOVERING":
+            flags.append("recovery_trajectory")
+        elif shape in ("CLIFF", "SLIDE"):
+            flags.append("deterioration_trajectory")
+
+        if pd.notna(account.get("bureau_delinquent_other")) and float(account.get("bureau_delinquent_other", 0) or 0) > 0:
             flags.append("delinquent_elsewhere")
 
-        if pd.notna(account.get("bureau_secured_loan_flag")) and account.get("bureau_secured_loan_flag", False):
-            flags.append("has_secured_assets")
-
-        # Stage flags
-        stage = str(account.get("stage", "")).upper()
-        if stage == "CHARGEOFF":
+        stage = str(account.get("stage", "") or "").upper()
+        if stage in ("CO", "CO_DEEP"):
             flags.append("chargeoff_stage")
 
         return flags
 
-    def assign_batch(self, df: pd.DataFrame) -> pd.DataFrame:
+    # ── BATCH PROCESSING ─────────────────────────────────────────────────────
+
+    def assign_batch(
+        self,
+        df: pd.DataFrame,
+        observation_date: str,
+    ) -> pd.DataFrame:
         """
         Assign personas for a batch of accounts.
-        Returns DataFrame with persona assignments.
+
+        Args:
+            df               : DataFrame with SEGMENTATION_FEATURES columns + account_id.
+                               Caller should filter to only segmentation-relevant columns
+                               before passing in — do NOT pass the full feature matrix.
+            observation_date : Snapshot date (YYYY-MM-DD). All feature windows must
+                               be pre-computed upstream relative to this date.
+                               Raises ValueError if not supplied.
+
+        Returns:
+            DataFrame with columns:
+              account_id, observation_date, persona, signal_segment,
+              structural_payment_score, trajectory_score, capacity_score,
+              avoidance_score, confidence_level, data_completeness_pct, flags
+
+        IMPORTANT — caller must NOT merge axis score columns (structural_payment_score,
+        trajectory_score, capacity_score, avoidance_score) into the propensity
+        scorecard feature set. These are audit columns only.
+        Use AXIS_SCORE_COLUMNS constant to identify and exclude them.
         """
+        if not observation_date:
+            raise ValueError(
+                "observation_date is required in assign_batch() — "
+                "it anchors all feature window computations."
+            )
+
         results = []
         for _, row in df.iterrows():
-            assignment = self.assign_persona(row)
+            a = self.assign_persona(row, observation_date)
             results.append({
-                "account_id": assignment.account_id,
-                "persona": assignment.persona,
-                "payment_behavior_score": assignment.payment_behavior_score,
-                "engagement_score": assignment.engagement_score,
-                "capacity_score": assignment.capacity_score,
-                "avoidance_score": assignment.avoidance_score,
-                "confidence_level": assignment.confidence_level,
-                "data_completeness_pct": assignment.data_completeness_pct,
-                "flags": "; ".join(assignment.flags),
+                "account_id":               a.account_id,
+                "observation_date":         a.observation_date,
+                "persona":                  a.persona,
+                "signal_segment":           a.signal_segment,
+                # Axis scores: audit/transparency ONLY — excluded from scorecard
+                "structural_payment_score": a.structural_payment_score,
+                "trajectory_score":         a.trajectory_score,
+                "capacity_score":           a.capacity_score,
+                "avoidance_score":          a.avoidance_score,
+                "confidence_level":         a.confidence_level,
+                "data_completeness_pct":    a.data_completeness_pct,
+                "flags":                    "; ".join(a.flags),
             })
 
         return pd.DataFrame(results)
