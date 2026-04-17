@@ -24,7 +24,9 @@ Feature separation:
   ACTIVE_PAYER | SELECTIVE_DEFAULTER | LIQUIDITY_CONSTRAINED | STRATEGIC | DORMANT
 
 SIGNAL_SEGMENT — structural context overlay (data availability + history flags):
-  BUREAU_THIN_FILE | CHARGEOFF_HISTORY | MULTI_LENDER_DISTRESS | STANDARD
+  BUREAU_THIN_FILE | CHARGEOFF_HISTORY | MULTI_LENDER_DISTRESS | EXTERNALLY_ACTIVE | STANDARD
+  EXTERNALLY_ACTIVE: delinquent here but has active (current/X) tradelines elsewhere —
+  customer is financially functional externally, not paying CardX by choice or prioritisation.
   Behavioural distinctions (selective cycling, chronic NPL) are in persona layer.
 
 observation_date enforcement:
@@ -62,6 +64,8 @@ SEGMENTATION_FEATURES: List[str] = [
     "bureau_total_outstanding",       # absolute debt burden (used for ratio computation)
     "bureau_monthly_instalment",      # monthly debt service (structural)
     "bureau_delinquent_other",        # delinquent on other lenders (0/1 or count)
+    "bureau_active_tradelines_count", # count of tradelines in current/X stage on other lenders
+                                      # distinguishes externally-functional from truly dormant
     "bureau_new_loan_12m",            # credit-seeking in last 12m
     "bureau_secured_loan_flag",       # has secured collateral
 
@@ -167,7 +171,7 @@ class PersonaAssignment:
 
     # Structural context overlay (data availability + history flags only)
     signal_segment: str    # BUREAU_THIN_FILE | CHARGEOFF_HISTORY
-                           # | MULTI_LENDER_DISTRESS | STANDARD
+                           # | MULTI_LENDER_DISTRESS | EXTERNALLY_ACTIVE | STANDARD
 
     # Metadata
     confidence_level: str           # HIGH | MEDIUM | LOW
@@ -565,13 +569,18 @@ class PersonaBuilder:
         - BUREAU_THIN_FILE       : <6 months on book — structural signals unreliable
         - CHARGEOFF_HISTORY      : worst stage ever CO or CO_DEEP — structural write-off history
         - MULTI_LENDER_DISTRESS  : delinquent on ≥1 other lenders — systemic financial stress
+        - EXTERNALLY_ACTIVE      : has ≥1 active (current/X) tradelines on other lenders while
+                                   delinquent here — financially functional externally, not paying
+                                   CardX by choice or prioritisation, not genuine inability
         - STANDARD               : no special structural context flag
 
-        Priority: BUREAU_THIN_FILE → CHARGEOFF_HISTORY → MULTI_LENDER_DISTRESS → STANDARD
+        Priority: BUREAU_THIN_FILE → CHARGEOFF_HISTORY → MULTI_LENDER_DISTRESS
+                  → EXTERNALLY_ACTIVE → STANDARD
         """
-        bureau_mob      = float(account.get("bureau_months_on_book", 0) or 0)
-        worst_stage     = str(account.get("worst_stage_ever", "") or "").upper()
-        delinquent_other = float(account.get("bureau_delinquent_other", 0) or 0)
+        bureau_mob           = float(account.get("bureau_months_on_book", 0) or 0)
+        worst_stage          = str(account.get("worst_stage_ever", "") or "").upper()
+        delinquent_other     = float(account.get("bureau_delinquent_other", 0) or 0)
+        active_tradelines    = float(account.get("bureau_active_tradelines_count", 0) or 0)
 
         if bureau_mob < 6:
             return "BUREAU_THIN_FILE"
@@ -581,6 +590,9 @@ class PersonaBuilder:
 
         if delinquent_other >= 1:
             return "MULTI_LENDER_DISTRESS"
+
+        if active_tradelines >= 1:
+            return "EXTERNALLY_ACTIVE"
 
         return "STANDARD"
 
