@@ -459,6 +459,8 @@ SEGMENTATION_FEATURES: List[str] = [
     "dpd_monotone_flag", "dpd_range_12m", "dpd_std_12m",
     # Restructuring success (Section 41) — post-TDR DPD outcome (structural)
     "restructuring_success_flag",
+    # Stage stickiness (Section 42) — probability of staying in current DPD stage
+    "stage_stickiness_score",
 ]
 
 PROPENSITY_FEATURES: List[str] = [
@@ -4010,6 +4012,89 @@ def build_restructuring_success(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SECTION 42 — STAGE STICKINESS SCORE
+# ─────────────────────────────────────────────────────────────────────────────
+# TEAM IMPLEMENTATION NOTE
+# ─────────────────────────────────────────────────────────────────────────────
+# stage_stickiness_score: probability that a customer remains in their CURRENT
+# DPD stage in the next observation month, estimated from their own lifetime
+# transition history.
+#
+# DEFINITION
+#   For the customer's current stage S_curr, count:
+#     stay_count  = number of times the customer was in S_curr at month t
+#                   AND still in S_curr at month t+1 (lifetime history)
+#     total_count = total number of months the customer was in S_curr (lifetime)
+#   stage_stickiness_score = stay_count / total_count
+#
+# RANGE: 0.0 (never stays — always transitions) → 1.0 (always stays)
+#
+# INTERPRETATION IN PERSONA AXIS SCORING (trajectory_score):
+#   If customer is currently in a bad stage (S2/S3/S4):
+#     LOW stickiness  → likely to cure soon           → POSITIVE signal
+#     HIGH stickiness → stuck in bad stage            → NEGATIVE signal
+#   If customer is currently in good stage (S0/S1):
+#     HIGH stickiness → stable                        → POSITIVE signal
+#     LOW stickiness  → volatile, may deteriorate     → NEGATIVE signal
+#
+# DATA SOURCE: NCB bureau history (mnf_cra_rvw_s_history) — no CardX data needed.
+# INPUT DF:    episodes DataFrame (output of _build_stage_episodes + dpd_states)
+#              Requires columns: ref_no, stage (S0–S4), next_stage (lead 1 month)
+#
+# SCAFFOLD — implement using the pattern below:
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#   def build_stage_stickiness(episodes_df: DataFrame) -> DataFrame:
+#       R = CFG["ref_col"]
+#
+#       # Current stage per customer = stage at latest observation month
+#       current_stage = (
+#           episodes_df
+#           .groupBy(R)
+#           .agg(F.last("stage", ignorenulls=True).alias("current_stage"))
+#       )
+#
+#       # Lifetime stay counts: months where stage == next_stage (stayed)
+#       stay = (
+#           episodes_df
+#           .filter(F.col("stage") == F.col("next_stage"))    # stayed in stage
+#           .groupBy(R, "stage")
+#           .agg(F.count("*").alias("stay_count"))
+#       )
+#
+#       # Total months per stage per customer
+#       total = (
+#           episodes_df
+#           .groupBy(R, "stage")
+#           .agg(F.count("*").alias("total_count"))
+#       )
+#
+#       # Join stay + total, compute stickiness per stage
+#       stickiness = (
+#           total
+#           .join(stay, [R, "stage"], "left")
+#           .withColumn("stickiness", _safe_div(F.col("stay_count"), F.col("total_count"), F.lit(0.0)))
+#       )
+#
+#       # Keep only current stage stickiness per customer
+#       result = (
+#           stickiness
+#           .join(current_stage, R)
+#           .filter(F.col("stage") == F.col("current_stage"))
+#           .groupBy(R)
+#           .agg(F.first("stickiness").alias("stage_stickiness_score"))
+#       )
+#
+#       return result
+#
+# ORCHESTRATOR: add as step [39/39] after build_restructuring_success:
+#   stickiness = build_stage_stickiness(episodes)
+#   final = final.join(stickiness, R, "left")
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SECTION 28 — MAIN ASSEMBLY FUNCTION
 # Calls all sections in dependency order and joins all outputs on ref_no.
 # Returns: one wide DataFrame per customer with ~650 features.
@@ -4064,6 +4149,7 @@ def run_complete_bureau_features(
         36. build_balance_structural       → Section 39 (HHI, worst/entry, silence)
         37. build_dpd_profile_shape        → Section 40 (CLIFF/SLIDE/OSCILLATOR/...)
         38. build_restructuring_success    → Section 41 (post-TDR DPD outcome)
+        39. build_stage_stickiness         → Section 42 (stage stay probability — TEAM TODO)
 
     Args:
         spark:              SparkSession (Databricks)
@@ -4283,10 +4369,16 @@ def run_complete_bureau_features(
     final = final.join(dpd_shp, R, "left")
     print(f"  ✓ dpd_profile_shape     +{len(dpd_shp.columns)-1} features")
 
-    print("[38/38] Restructuring success — post-TDR DPD outcome (Section 41)...")
+    print("[38/39] Restructuring success — post-TDR DPD outcome (Section 41)...")
     restr_ok = build_restructuring_success(account, history)
     final = final.join(restr_ok, R, "left")
     print(f"  ✓ restructuring_success +{len(restr_ok.columns)-1} features")
+
+    # [39/39] stage_stickiness_score — Section 42
+    # TEAM TODO: uncomment once build_stage_stickiness is implemented
+    # stickiness = build_stage_stickiness(episodes)
+    # final = final.join(stickiness, R, "left")
+    # print(f"  ✓ stage_stickiness      +1 feature")
 
     final = final.dropDuplicates([R])
 

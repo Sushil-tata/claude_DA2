@@ -51,32 +51,30 @@ logger = logging.getLogger(__name__)
 
 # Features used in segmentation ONLY — must never appear in scorecard training
 SEGMENTATION_FEATURES: List[str] = [
-    # Long-term payment structure
-    "payment_effort_ratio_npl",       # avg payment / balance during NPL months
-    "cure_count_24m",                 # times cured from NPL/SM → CURRENT/X in 24m
-    "re_default_count_24m",           # times re-defaulted after cure in 24m
-    "months_dormant",                 # months with zero payment activity
-    "pct_months_npl_24m",             # % of last 24m in NPL or worse
-    "worst_stage_ever",               # worst DPD stage in full history
+    # Long-term payment structure — mapped to bureau_feature_complete.py column names
+    "avg_payment_effort_ratio_npl",   # avg payment effort ratio during NPL episodes (Section 38)
+    "cure_count_lifetime",            # lifetime cure count S2/S3 → S0/S1 (Section 32)
+    "re_default_count_lifetime",      # lifetime re-default count after cure (Section 32)
+    "total_bureau_silence_months",    # consecutive trailing months of zero activity (Section 39)
+    "pct_s3_48m",                     # % of last 48m in NPL or worse (Section 5)
+    "worst_dpd_ordinal",              # worst DPD stage ordinal 0-4 in full history (Section 5)
 
-    # Bureau structural signals
-    "bureau_months_on_book",          # vintage — longer = more data confidence
-    "bureau_total_outstanding",       # absolute debt burden (used for ratio computation)
-    "bureau_monthly_instalment",      # monthly debt service (structural)
-    "bureau_delinquent_other",        # delinquent on other lenders (0/1 or count)
-    "bureau_active_tradelines_count", # count of tradelines in current/X stage on other lenders
-                                      # distinguishes externally-functional from truly dormant
-    "bureau_new_loan_12m",            # credit-seeking in last 12m
-    "bureau_secured_loan_flag",       # has secured collateral
+    # Bureau structural signals — mapped to bfe_static_snapshot column names (Section 22)
+    "vintage_months_on_book",         # bureau vintage months (Section 13)
+    "bfe_total_amount_owed",          # total outstanding across all bureau accounts
+    "bfe_accounts_opened_12m",        # new credit accounts opened in 12m (credit-seeking)
+    "bfe_secured_accounts",           # count of secured accounts (collateral signal)
+    "bfe_overdue_accounts",           # count of overdue bureau accounts (delinquency on others)
+    "bfe_active_accounts",            # count of active (open) tradelines (external activity signal)
 
-    # Bureau stage dynamics (from bureau_stage_dynamics.py via BureauFeatureAdapter)
-    "dpd_shape_type",                 # CLIFF/SLIDE/OSCILLATOR/RECOVERING/STABLE
-    "dpd_slope_12m",                  # trajectory direction (negative = improving)
-    "stage_stickiness_score",         # prob of staying in current stage
-    "re_default_rate_rolling_24m",    # chronic re-defaulter rate
-    "cure_rate_sm_to_lower",          # cure capability from SM stage
+    # Bureau stage dynamics — mapped to bfc column names
+    "dpd_shape_type",                 # CLIFF/SLIDE/OSCILLATOR/RECOVERING/STABLE (Section 40)
+    "dpd_diff_velocity_12m",          # 12m DPD velocity — negative = improving (Section 11)
+    "stage_stickiness_score",         # prob of staying in current stage (Section 42 — TEAM TODO)
+    "cure_to_redefault_ratio",        # chronic re-defaulter rate (Section 32)
+    "cure_rate_sm",                   # cure capability from SM stage (Section 10)
 
-    # Persistent avoidance / stance signals
+    # Persistent avoidance / stance signals (from CardX collections system — separate feed)
     "wrong_number_flag",
     "dispute_flag",
     "complaint_flag",
@@ -296,12 +294,13 @@ class PersonaBuilder:
                                All window features must be pre-computed upstream
                                relative to this date.
 
-        Expected fields (see SEGMENTATION_FEATURES for full list):
-          payment_effort_ratio_npl, cure_count_24m, re_default_count_24m,
-          months_dormant, pct_months_npl_24m,
-          bureau_months_on_book, bureau_total_outstanding, bureau_monthly_instalment,
-          dpd_shape_type, dpd_slope_12m, stage_stickiness_score,
-          re_default_rate_rolling_24m, cure_rate_sm_to_lower,
+        Expected fields (see SEGMENTATION_FEATURES for full list — all names are bfc column names):
+          avg_payment_effort_ratio_npl, cure_count_lifetime, re_default_count_lifetime,
+          total_bureau_silence_months, pct_s3_48m, worst_dpd_ordinal,
+          vintage_months_on_book, bfe_total_amount_owed, bfe_accounts_opened_12m,
+          bfe_secured_accounts, bfe_overdue_accounts, bfe_active_accounts,
+          dpd_shape_type, dpd_diff_velocity_12m, stage_stickiness_score,
+          cure_to_redefault_ratio, cure_rate_sm,
           wrong_number_flag, dispute_flag, lawyer_mentioned, sms_opt_out
         """
         account_id = str(account.get("account_id", "unknown"))
@@ -349,20 +348,24 @@ class PersonaBuilder:
         """
         score = 0.0
 
-        # Payment effort in NPL — structural willingness signal
-        effort = float(account.get("payment_effort_ratio_npl", 0) or 0)
+        # Payment effort in NPL episodes — structural willingness signal
+        # bfc: avg_payment_effort_ratio_npl (Section 38 — payment_effort_dynamics per stage)
+        effort = float(account.get("avg_payment_effort_ratio_npl", 0) or 0)
         score += min(100, effort * 100) * 0.35
 
-        # Cure history: 3+ cures in 24m → 100 pts
-        cures = float(account.get("cure_count_24m", 0) or 0)
+        # Cure history: 3+ lifetime cures → 100 pts
+        # bfc: cure_count_lifetime (Section 32)
+        cures = float(account.get("cure_count_lifetime", 0) or 0)
         score += min(100, cures * 33.3) * 0.30
 
-        # Re-default penalty: each re-default removes 25 pts from this component
-        redefaults = float(account.get("re_default_count_24m", 0) or 0)
+        # Re-default penalty: each lifetime re-default removes 25 pts
+        # bfc: re_default_count_lifetime (Section 32)
+        redefaults = float(account.get("re_default_count_lifetime", 0) or 0)
         score -= min(100, redefaults * 25) * 0.25
 
-        # Dormancy penalty: 12m dormant = full penalty
-        dormant = float(account.get("months_dormant", 0) or 0)
+        # Silence penalty: 12m consecutive silence = full penalty
+        # bfc: total_bureau_silence_months (Section 39 — trailing zero-activity months)
+        dormant = float(account.get("total_bureau_silence_months", 0) or 0)
         score -= min(100, dormant * 8.33) * 0.10
 
         return min(100.0, max(0.0, score))
@@ -391,14 +394,17 @@ class PersonaBuilder:
         }.get(shape, 0)
         score += shape_delta * 0.35
 
-        # DPD slope: negative = improving (DPD falling)
-        slope = float(account.get("dpd_slope_12m", 0) or 0)
+        # DPD velocity 12m: negative = improving (DPD falling)
+        # bfc: dpd_diff_velocity_12m (Section 11 — trajectory & physics)
+        slope = float(account.get("dpd_diff_velocity_12m", 0) or 0)
         slope_contribution = max(-30.0, min(30.0, -slope * 2))
         score += slope_contribution * 0.25
 
         # Stage stickiness: in bad stage, low stickiness = cure potential
+        # bfc: stage_stickiness_score (Section 42 — TEAM TODO; defaults to 0.5 until built)
         stickiness = float(account.get("stage_stickiness_score", 0.5) or 0.5)
-        pct_npl = float(account.get("pct_months_npl_24m", 0) or 0)
+        # pct_s3_48m: % of 48m in NPL or worse (bfc Section 5)
+        pct_npl = float(account.get("pct_s3_48m", 0) or 0)
         if pct_npl > 0.5:
             # Currently in bad stage: low stickiness is GOOD
             stickiness_contribution = (1.0 - stickiness) * 30 - 15
@@ -406,9 +412,10 @@ class PersonaBuilder:
             stickiness_contribution = 0.0
         score += stickiness_contribution * 0.20
 
-        # Re-default rate: 100% rate → -40 pts
-        redefault_rate = float(account.get("re_default_rate_rolling_24m", 0) or 0)
-        score -= redefault_rate * 40 * 0.20
+        # Re-default rate: 100% ratio → -40 pts
+        # bfc: cure_to_redefault_ratio (Section 32) — higher = more re-defaults per cure
+        redefault_rate = float(account.get("cure_to_redefault_ratio", 0) or 0)
+        score -= min(1.0, redefault_rate) * 40 * 0.20
 
         return min(100.0, max(0.0, score))
 
@@ -425,11 +432,13 @@ class PersonaBuilder:
         """
         score = 0.0
 
-        bureau_instalment  = float(account.get("bureau_monthly_instalment", 0) or 0)
-        total_outstanding  = float(account.get("bureau_total_outstanding", 0) or 0)
+        # bfc: bfe_total_amount_owed (Section 22 — total outstanding across all bureau accounts)
+        # bureau_monthly_instalment unavailable in bfc; proxy = 4% of outstanding (rough service cost)
+        total_outstanding  = float(account.get("bfe_total_amount_owed", 0) or 0)
+        bureau_instalment  = total_outstanding * 0.04
         cardx_balance      = float(account.get("balance", 0) or 0)
 
-        # DSR proxy
+        # DSR proxy: monthly instalment / implied monthly income (outstanding / 3)
         if total_outstanding > 0:
             implied_income = total_outstanding / 3.0
             dsr = bureau_instalment / implied_income if implied_income > 0 else 1.0
@@ -443,21 +452,21 @@ class PersonaBuilder:
             else:
                 score += 30 * 0.4
 
-        # Balance burden
+        # Balance burden: CardX balance vs total bureau outstanding
         if total_outstanding > 0:
             burden_ratio = cardx_balance / total_outstanding
             score += max(0, 100 - burden_ratio * 100) * 0.3
         else:
             score += 50 * 0.3
 
-        # Secured asset
-        if account.get("bureau_secured_loan_flag", False):
+        # Secured asset: bfc bfe_secured_accounts (Section 22) > 0 = has collateral
+        if int(account.get("bfe_secured_accounts", 0) or 0) > 0:
             score += 70 * 0.2
         else:
             score += 30 * 0.2
 
-        # Credit access
-        new_loans = int(account.get("bureau_new_loan_12m", 0) or 0)
+        # Credit access: bfc bfe_accounts_opened_12m (Section 22) = able to access credit market
+        new_loans = int(account.get("bfe_accounts_opened_12m", 0) or 0)
         score += min(100, new_loans * 30) * 0.1
 
         return min(100.0, max(0.0, score))
@@ -531,8 +540,8 @@ class PersonaBuilder:
         # Chronic cycling: has demonstrated capacity by curing, but keeps re-defaulting.
         # Absorbed from SELECTIVE_CHRONIC signal segment (GAP 5 fix).
         if account is not None:
-            cures     = float(account.get("cure_count_24m", 0) or 0)
-            redefaults = float(account.get("re_default_count_24m", 0) or 0)
+            cures      = float(account.get("cure_count_lifetime", 0) or 0)
+            redefaults = float(account.get("re_default_count_lifetime", 0) or 0)
             if cures >= 2 and redefaults >= 2 and capacity > t["capacity_constrained_max"]:
                 return "SELECTIVE_DEFAULTER"
 
@@ -577,15 +586,19 @@ class PersonaBuilder:
         Priority: BUREAU_THIN_FILE → CHARGEOFF_HISTORY → MULTI_LENDER_DISTRESS
                   → EXTERNALLY_ACTIVE → STANDARD
         """
-        bureau_mob           = float(account.get("bureau_months_on_book", 0) or 0)
-        worst_stage          = str(account.get("worst_stage_ever", "") or "").upper()
-        delinquent_other     = float(account.get("bureau_delinquent_other", 0) or 0)
-        active_tradelines    = float(account.get("bureau_active_tradelines_count", 0) or 0)
+        # bfc: vintage_months_on_book (Section 13)
+        bureau_mob        = float(account.get("vintage_months_on_book", 0) or 0)
+        # bfc: worst_dpd_ordinal (Section 5) — 0=S0 … 4=S4/CO
+        worst_dpd_ord     = int(account.get("worst_dpd_ordinal", 0) or 0)
+        # bfc: bfe_overdue_accounts (Section 22) — count of overdue bureau accounts
+        delinquent_other  = float(account.get("bfe_overdue_accounts", 0) or 0)
+        # bfc: bfe_active_accounts (Section 22) — count of open/active tradelines
+        active_tradelines = float(account.get("bfe_active_accounts", 0) or 0)
 
         if bureau_mob < 6:
             return "BUREAU_THIN_FILE"
 
-        if worst_stage in ("CO", "CO_DEEP"):
+        if worst_dpd_ord >= 4:
             return "CHARGEOFF_HISTORY"
 
         if delinquent_other >= 1:
@@ -604,16 +617,16 @@ class PersonaBuilder:
         Required fields align with SEGMENTATION_FEATURES (core subset).
         """
         required_fields = [
-            "payment_effort_ratio_npl",
-            "cure_count_24m",
-            "re_default_count_24m",
-            "months_dormant",
-            "pct_months_npl_24m",
-            "bureau_total_outstanding",
-            "bureau_months_on_book",
-            "dpd_shape_type",
-            "dpd_slope_12m",
-            "stage_stickiness_score",
+            "avg_payment_effort_ratio_npl",   # Section 38
+            "cure_count_lifetime",             # Section 32
+            "re_default_count_lifetime",       # Section 32
+            "total_bureau_silence_months",     # Section 39
+            "pct_s3_48m",                      # Section 5
+            "bfe_total_amount_owed",           # Section 22
+            "vintage_months_on_book",          # Section 13
+            "dpd_shape_type",                  # Section 40
+            "dpd_diff_velocity_12m",           # Section 11
+            "stage_stickiness_score",          # Section 42 (TEAM TODO — will be NULL until built)
         ]
 
         present = sum(
@@ -654,7 +667,7 @@ class PersonaBuilder:
         if avoidance > 50:
             flags.append("avoidance_behaviour")
 
-        redefaults = float(account.get("re_default_count_24m", 0) or 0)
+        redefaults = float(account.get("re_default_count_lifetime", 0) or 0)
         if redefaults >= 2:
             flags.append("repeat_re_defaulter")
 
@@ -664,7 +677,8 @@ class PersonaBuilder:
         elif shape in ("CLIFF", "SLIDE"):
             flags.append("deterioration_trajectory")
 
-        if pd.notna(account.get("bureau_delinquent_other")) and float(account.get("bureau_delinquent_other", 0) or 0) > 0:
+        # bfc: bfe_overdue_accounts (Section 22)
+        if pd.notna(account.get("bfe_overdue_accounts")) and float(account.get("bfe_overdue_accounts", 0) or 0) > 0:
             flags.append("delinquent_elsewhere")
 
         stage = str(account.get("stage", "") or "").upper()
