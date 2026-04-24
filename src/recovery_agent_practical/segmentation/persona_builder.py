@@ -63,9 +63,9 @@ SEGMENTATION_FEATURES: List[str] = [
     "vintage_months_on_book",         # bureau vintage months (Section 13)
     "bfe_total_amount_owed",          # total outstanding across all bureau accounts
     "bfe_accounts_opened_12m",        # new credit accounts opened in 12m (credit-seeking)
-    "bfe_secured_accounts",           # count of secured accounts (collateral signal)
+    "secured_to_total_ratio",         # secured balance share — ratio has variance, count does not (Section 18)
     "bfe_overdue_accounts",           # count of overdue bureau accounts (delinquency on others)
-    "bfe_active_accounts",            # count of active (open) tradelines (external activity signal)
+    "bfe_active_ratio",               # active/total accounts ratio — normalised, avoids count sparsity (Section 22)
 
     # Bureau stage dynamics — mapped to bfc column names
     "dpd_shape_type",                 # CLIFF/SLIDE/OSCILLATOR/RECOVERING/STABLE (Section 40)
@@ -459,8 +459,8 @@ class PersonaBuilder:
         else:
             score += 50 * 0.3
 
-        # Secured asset: bfc bfe_secured_accounts (Section 22) > 0 = has collateral
-        if int(account.get("bfe_secured_accounts", 0) or 0) > 0:
+        # Secured asset: secured_to_total_ratio (Section 18) > 0 = has collateral
+        if float(account.get("secured_to_total_ratio", 0) or 0) > 0:
             score += 70 * 0.2
         else:
             score += 30 * 0.2
@@ -592,8 +592,8 @@ class PersonaBuilder:
         worst_dpd_ord     = int(account.get("worst_dpd_ordinal", 0) or 0)
         # bfc: bfe_overdue_accounts (Section 22) — count of overdue bureau accounts
         delinquent_other  = float(account.get("bfe_overdue_accounts", 0) or 0)
-        # bfc: bfe_active_accounts (Section 22) — count of open/active tradelines
-        active_tradelines = float(account.get("bfe_active_accounts", 0) or 0)
+        # bfc: bfe_active_ratio (Section 22) — active/total ratio; >0 means customer has live tradelines
+        active_ratio = float(account.get("bfe_active_ratio", 0) or 0)
 
         if bureau_mob < 6:
             return "BUREAU_THIN_FILE"
@@ -604,7 +604,7 @@ class PersonaBuilder:
         if delinquent_other >= 1:
             return "MULTI_LENDER_DISTRESS"
 
-        if active_tradelines >= 1:
+        if active_ratio > 0:
             return "EXTERNALLY_ACTIVE"
 
         return "STANDARD"
