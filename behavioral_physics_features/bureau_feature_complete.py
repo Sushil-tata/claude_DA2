@@ -1839,7 +1839,7 @@ def build_bfe_static_snapshot(account: DataFrame) -> DataFrame:
 
     # ── standardised status classification ───────────────────────────────────
     # Thai NCB uses numeric accountstatus codes: "10" = Normal/Active
-    # Closed/settled codes: "30"=closed, "40"=written-off, "41"=settled, "50"=bad-debt
+    # Closed/settled codes: "11"=closed, "33"=settled, "40"=written-off, "43"=bad-debt, "44"=write-off
     # Secured is identified via accounttype numeric codes (credittypeflag is often NULL)
     # CC codes: "04","22","55","58" (revolving); PL: "02","03"; HL: "01"; Auto: "10","11","12"
     _acct = F.col("accounttype").cast("string")
@@ -1849,7 +1849,7 @@ def build_bfe_static_snapshot(account: DataFrame) -> DataFrame:
         F.when(_stat == "10", 1).otherwise(0)
     ).withColumn(
         "_is_closed",
-        F.when(_stat.isin("30", "40", "41", "50"), 1).otherwise(0)
+        F.when(_stat.isin("11", "33", "40", "43", "44"), 1).otherwise(0)
     ).withColumn(
         "_is_secured",
         F.when(_acct.isin(*list(_SECURED_CODES)), 1).otherwise(0)
