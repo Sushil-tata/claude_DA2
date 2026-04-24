@@ -1838,23 +1838,29 @@ def build_bfe_static_snapshot(account: DataFrame) -> DataFrame:
             .filter(F.col("_rn") == 1).drop("_rn"))
 
     # ── standardised status classification ───────────────────────────────────
+    # Thai NCB uses numeric accountstatus codes: "10" = Normal/Active
+    # Closed/settled codes: "30"=closed, "40"=written-off, "41"=settled, "50"=bad-debt
+    # Secured is identified via accounttype numeric codes (credittypeflag is often NULL)
+    # CC codes: "04","22","55","58" (revolving); PL: "02","03"; HL: "01"; Auto: "10","11","12"
+    _acct = F.col("accounttype").cast("string")
+    _stat = F.col("accountstatus").cast("string")
     snap = snap.withColumn(
         "_is_active",
-        F.when(F.upper(F.col("accountstatus")).isin("ACTIVE", "CURRENT", "OPEN"), 1).otherwise(0)
+        F.when(_stat == "10", 1).otherwise(0)
     ).withColumn(
         "_is_closed",
-        F.when(F.upper(F.col("accountstatus")).isin("CLOSED", "SETTLED", "PAID"), 1).otherwise(0)
+        F.when(_stat.isin("30", "40", "41", "50"), 1).otherwise(0)
     ).withColumn(
         "_is_secured",
-        F.when(F.upper(F.coalesce(F.col("credittypeflag"), F.lit(""))) == "SECURED", 1).otherwise(0)
+        F.when(_acct.isin(*list(_SECURED_CODES)), 1).otherwise(0)
     ).withColumn(
-        "_is_cc", F.when(F.upper(F.coalesce(F.col("accounttype"), F.lit(""))).contains("CREDIT_CARD"), 1).otherwise(0)
+        "_is_cc", F.when(_acct.isin("04", "22", "55", "58"), 1).otherwise(0)
     ).withColumn(
-        "_is_pl", F.when(F.upper(F.coalesce(F.col("accounttype"), F.lit(""))).contains("PERSONAL_LOAN"), 1).otherwise(0)
+        "_is_pl", F.when(_acct.isin("02", "03"), 1).otherwise(0)
     ).withColumn(
-        "_is_hl", F.when(F.upper(F.coalesce(F.col("accounttype"), F.lit(""))).contains("HOME_LOAN"), 1).otherwise(0)
+        "_is_hl", F.when(_acct.isin("01"), 1).otherwise(0)
     ).withColumn(
-        "_is_auto", F.when(F.upper(F.coalesce(F.col("accounttype"), F.lit(""))).contains("AUTO_LOAN"), 1).otherwise(0)
+        "_is_auto", F.when(_acct.isin("10", "11", "12"), 1).otherwise(0)
     ).withColumn(
         "_has_restructure",
         F.when(F.col("dateoflastdebtrestructure").isNotNull(), 1).otherwise(0)
