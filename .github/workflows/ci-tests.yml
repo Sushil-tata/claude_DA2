@@ -1,0 +1,93 @@
+name: CI - Unit Tests (No Spark)
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies (NO SPARK)
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov
+          pip install pandas numpy scikit-learn jsonschema pyyaml
+          # Note: NO pyspark in unit test dependencies
+
+      - name: Run unit tests
+        run: |
+          # Run only unit tests (no Spark required)
+          pytest tests/unit/ -v --cov=src/decision_agent --cov-report=xml --cov-report=term
+          # Unit tests must NOT import pyspark
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+
+      - name: Test import checks
+        run: |
+          # Verify all modules are importable
+          python -c "from decision_agent.config import config_loader"
+          python -c "from decision_agent.orchestrator import router"
+          python -c "from decision_agent.data import splits"
+          python -c "from decision_agent.features import windows"
+          python -c "from decision_agent.training import training_harness"
+          python -c "from decision_agent.validation import segment_eval"
+          python -c "from decision_agent.decisions import output_writer"
+
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install linting tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install black isort flake8 pylint
+
+      - name: Check formatting with black
+        run: |
+          black --check src/ tests/
+
+      - name: Check import sorting with isort
+        run: |
+          isort --check-only src/ tests/
+
+      - name: Lint with flake8
+        run: |
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 src/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Exit-zero treats all errors as warnings
+          flake8 src/ tests/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Lint with pylint
+        run: |
+          # Run pylint with relaxed settings
+          pylint src/decision_agent --exit-zero --max-line-length=127 --disable=C0114,C0115,C0116

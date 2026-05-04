@@ -1,0 +1,177 @@
+# Action Catalog for NBA System
+# Version: 1.0
+# Last Updated: 2024-02-12
+
+actions:
+  A0_NONE:
+    name: "NO_ACTION"
+    description: "Hold - no contact this cycle"
+    channel: "none"
+    cost: 0.00
+    eligibility:
+      - all_accounts: true
+
+  A1_LINE:
+    name: "LINE_MESSAGE"
+    description: "Send LINE message with payment reminder"
+    channel: "line"
+    cost: 0.15
+    eligibility:
+      - line_optin: true
+      - line_id_present: true
+      - fatigue_score: < 0.7
+    contraindications:
+      - dnc: true
+      - cease_and_desist: true
+      - contact_count_7d: >= 3
+
+  A2_SMS:
+    name: "SMS_REMINDER"
+    description: "Send SMS payment reminder"
+    channel: "sms"
+    cost: 0.25
+    eligibility:
+      - mobile_present: true
+      - sms_optin: true
+      - fatigue_score: < 0.7
+    contraindications:
+      - dnc: true
+      - cease_and_desist: true
+      - contact_count_7d: >= 3
+      - sms_sent_last_48h: true
+
+  A3_VOICE_IVR:
+    name: "VOICE_BLAST"
+    description: "Automated IVR payment reminder"
+    channel: "voice_ivr"
+    cost: 1.00
+    eligibility:
+      - mobile_present: true
+      - bucket: <= 2  # Only early buckets
+      - balance: >= 500
+    contraindications:
+      - dnc: true
+      - cease_and_desist: true
+      - contact_count_7d: >= 3
+      - quiet_hours: true  # 9pm-8am
+
+  A4_CALL:
+    name: "AGENT_CALL"
+    description: "Live agent outbound call"
+    channel: "call"
+    cost: 5.00
+    capacity_daily: 5000
+    eligibility:
+      - mobile_present: true
+      - bucket: [0, 1, 2, 3]  # Not for NPL
+      - balance: >= 1000
+      - priority_score: >= 0.6
+    contraindications:
+      - dnc: true
+      - cease_and_desist: true
+      - contact_count_7d: >= 3
+      - quiet_hours: true
+      - active_ptp: true  # Don't call if promise to pay exists
+
+  A5_SETTLEMENT_OFFER:
+    name: "SETTLEMENT_OFFER_SMS"
+    description: "Send settlement offer via SMS (persona-specific discount)"
+    channel: "sms"
+    cost: 0.30
+    eligibility:
+      - bucket: >= 2  # Mid to late buckets
+      - balance: >= 2000
+      - days_past_due: >= 60
+      - persona: ["high_value_unresponsive", "medium_value_willing"]
+    contraindications:
+      - dnc: true
+      - cease_and_desist: true
+      - active_settlement: true
+      - settlement_offered_last_30d: true
+
+  A6_OA_REFERRAL:
+    name: "OUTSOURCED_AGENCY"
+    description: "Refer to collection agency"
+    channel: "oa"
+    cost: 10.00  # Flat fee + commission
+    capacity_daily: 1000
+    eligibility:
+      - bucket: >= 3  # Late buckets only
+      - balance: >= 3000
+      - days_past_due: >= 120
+      - max_delay_6m: >= 90
+    contraindications:
+      - active_legal: true
+      - bankruptcy_flag: true
+      - fraud_flag: true
+
+# Action sequencing preferences (soft constraints)
+sequencing:
+  digital_first:
+    enabled: true
+    order: ["LINE", "SMS", "VOICE_IVR", "CALL"]
+    buckets: [0, 1]  # Only for early buckets
+
+  escalation_ladder:
+    enabled: true
+    rules:
+      - if_action_failed: "LINE"
+        then_try: "SMS"
+        wait_days: 2
+
+      - if_action_failed: "SMS"
+        then_try: "VOICE_IVR"
+        wait_days: 3
+
+      - if_action_failed: "VOICE_IVR"
+        then_try: "CALL"
+        wait_days: 5
+
+# Fatigue rules (soft constraints)
+fatigue:
+  max_contacts_per_week: 3
+  max_contacts_per_month: 8
+  cooldown_periods:
+    LINE: 1  # days
+    SMS: 2
+    VOICE_IVR: 3
+    CALL: 7
+
+  fatigue_score_calculation:
+    formula: "weighted_sum"
+    weights:
+      LINE: 0.2
+      SMS: 0.3
+      VOICE_IVR: 0.5
+      CALL: 1.0
+    decay_half_life_days: 14
+
+# Cost constraints
+cost_constraints:
+  max_cost_per_account_per_month: 15.00
+  max_cost_per_dollar_collected: 0.35
+
+# Capacity constraints
+capacity:
+  CALL:
+    daily_limit: 5000
+    allocation_method: "top_expected_value"
+
+  OA_REFERRAL:
+    daily_limit: 1000
+    allocation_method: "worst_performers_high_balance"
+
+  VOICE_IVR:
+    daily_limit: 10000
+    allocation_method: "first_come_first_serve"
+
+# Business hours (local time)
+business_hours:
+  no_contact_before: "08:00"
+  no_contact_after: "21:00"
+  timezone: "Asia/Bangkok"  # Adjust per market
+
+  quiet_days:
+    - "2024-12-25"  # Christmas
+    - "2024-01-01"  # New Year
+    # Add market-specific holidays

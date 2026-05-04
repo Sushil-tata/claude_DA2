@@ -1,0 +1,60 @@
+use_case_id: income_estimation
+version: v1.0.0
+description: Estimate individual income levels based on transaction patterns and liquidity features
+
+features:
+  snapshot_timestamp: "2024-01-31"
+  lookback_windows: [7, 30, 90]
+  feature_list:
+    - transaction_count_7d
+    - transaction_count_30d
+    - transaction_count_90d
+    - transaction_sum_7d
+    - transaction_sum_30d
+    - transaction_sum_90d
+    - salary_deposit_frequency
+    - rent_payment_frequency
+    - groceries_frequency
+    - tag_pca_component_1
+    - tag_pca_component_2
+    - tag_pca_component_3
+    - income_expense_ratio_30d
+    - income_expense_ratio_90d
+    - avg_balance_30d
+    - avg_balance_90d
+  leakage_prevention: true
+  point_in_time_join: true
+
+model:
+  algorithm: gradient_boosting
+  hyperparameters:
+    n_estimators: 100
+    max_depth: 5
+    learning_rate: 0.1
+    min_samples_split: 20
+    min_samples_leaf: 10
+    random_state: 42
+  target_variable: income_level
+
+validation:
+  segments:
+    - dimension: income_quartile
+      values: [Q1, Q2, Q3, Q4]
+    - dimension: time_period
+      values: ["2023-Q3", "2023-Q4", "2024-Q1"]
+
+  calibration_config:
+    method: isotonic
+    by_segment: true
+    by_time: false
+    min_samples_per_bin: 100
+
+  quality_gates:
+    min_mae: 5000
+    min_r2: 0.6
+    max_calibration_error: 0.10
+
+output:
+  table_name: decision_agent.income_decisions
+  decision_threshold: 0.5
+  include_confidence_bands: true

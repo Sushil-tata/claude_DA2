@@ -1,0 +1,305 @@
+# Databricks Workflow: Agentic NBA Pipeline
+# ==========================================
+# 7-agent DAG for debt collection Next Best Action
+#
+# Execution order:
+#   data_quality_agent
+#       ↓
+#   feature_agent
+#       ↓
+#   model_agent ──┐
+#                 ├── (parallel) ── decision_agent
+#   constraint_agent ─┘
+#       ↓
+#   validation_agent
+#       ↓
+#   explain_agent
+#
+# Shared state: Delta Lake (recovery.* tables) via AgentMemory
+# Claude API:   Called by decision_agent for high-value / ambiguous accounts only
+# Secrets:      anthropic-api-key stored in Databricks Secrets scope: cardx-secrets
+
+name: cardx_agentic_nba_pipeline
+
+tags:
+  team:        data-science
+  domain:      debt-collections
+  version:     "1.0.0"
+
+schedule:
+  quartz_cron_expression: "0 0 3 * * ?"   # 03:00 daily (after recovery-engine-v2 completes at 02:00)
+  timezone_id: "Asia/Bangkok"
+  pause_status: UNPAUSED
+
+email_notifications:
+  on_failure: ["ds-oncall@cardx.co.th"]
+  on_success: ["ds-team@cardx.co.th"]
+
+max_concurrent_runs: 1
+
+parameters:
+  - name: execution_date
+    default: "{{ds}}"
+  - name: dry_run
+    default: "false"
+  - name: local_mode
+    default: "false"
+  - name: champion_challenger_enabled
+    default: "true"
+  - name: holdout_pct
+    default: "5"
+
+# ── Shared cluster config ─────────────────────────────────────────────────────
+# Referenced by tasks that don't need heavy compute
+_standard_cluster: &standard_cluster
+  spark_version: "14.3.x-scala2.12"
+  node_type_id:  "i3.xlarge"
+  num_workers:   2
+  spark_conf:
+    "spark.sql.extensions":      "io.delta.sql.DeltaSparkSessionExtension"
+    "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.delta.catalog.DeltaCatalog"
+  libraries:
+    - pypi: {package: "anthropic>=0.40.0"}
+    - pypi: {package: "delta-spark==3.1.0"}
+    - pypi: {package: "mlflow>=2.10.0"}
+
+tasks:
+
+  # ── Task 0: Propensity Agent ─────────────────────────────────────────────────
+  - task_key: propensity_agent
+    description: >
+      Scores all delinquent accounts for propensity at three horizons:
+        propensity_30d  (P_1M) — tactical decisions: DIGITAL_NUDGE, AGENT_CALL
+        propensity_90d  (P_3M) — intermediate monitoring signal
+        propensity_180d (P_6M) — strategic decisions: AGENCY, LEGAL
+      Uses PropensityModelTrainer (LightGBM per horizon) trained on enterprise
+      features. Falls back to recovery-engine-v2 scores if models not fitted yet.
+      Sets low_confidence_flag for accounts with propensity_30d near 0.5.
+      Writes to recovery.model_scores.
+    depends_on: []
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point:  run_agent
+      parameters:
+        - "--agent"
+        - "propensity"
+        - "--execution-date"
+        - "{{job.parameters.execution_date}}"
+        - "--dry-run"
+        - "{{job.parameters.dry_run}}"
+
+    new_cluster: *standard_cluster
+    timeout_seconds: 3600    # scoring 100+ features on large portfolio takes longer
+    max_retries: 1
+    retry_on_timeout: false
+
+  # ── Task 1: Data Quality Agent ──────────────────────────────────────────────
+  - task_key: data_quality_agent
+    description: >
+      Validates recovery.model_scores written by PropensityAgent (or upstream
+      recovery-engine-v2 in fallback mode). Checks: null rates on propensity
+      scores, score distribution shift vs prior week.
+      Raises BLOCKED if null_rate > 5% on propensity_30d or propensity_180d,
+      or if score distribution shifts > 10% week-over-week.
+    depends_on:
+      - task_key: propensity_agent
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point:  run_agent
+      parameters:
+        - "--agent"
+        - "data_quality"
+        - "--execution-date"
+        - "{{job.parameters.execution_date}}"
+        - "--dry-run"
+        - "{{job.parameters.dry_run}}"
+
+    new_cluster: *standard_cluster
+    timeout_seconds: 1800
+    max_retries: 1
+    retry_on_timeout: false
+
+  # ── Task 2: Feature Agent ────────────────────────────────────────────────────
+  - task_key: feature_agent
+    description: >
+      Reads recovery.model_scores (propensity scores from PropensityAgent).
+      Joins enterprise feature store. Derives SIGNAL_SEGMENT + BEHAVIOURAL_PERSONA.
+      Writes recovery.feature_output for ModelAgent + ConstraintAgent.
+    depends_on:
+      - task_key: data_quality_agent
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point:  run_agent
+      parameters:
+        - "--agent"
+        - "feature"
+        - "--execution-date"
+        - "{{job.parameters.execution_date}}"
+
+    new_cluster: *standard_cluster
+    timeout_seconds: 3600
+
+  # ── Task 2b: Holdout Agent ────────────────────────────────────────────────
+  - task_key: holdout_agent
+    description: >
+      Assigns 5% per SIGNAL_SEGMENT to holdout (control group) for uplift
+      model training. Uses deterministic hash(account_id) % 100 so the same
+      account always lands in the control group across daily runs.
+      Adds holdout_flag, holdout_group, holdout_assigned_date to
+      recovery.feature_output (overwrite). Appends control-group rows to
+      recovery.treatment_log. champion_challenger_enabled parameter controls
+      activation.
+    depends_on:
+      - task_key: feature_agent
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point:  run_agent
+      parameters:
+        - "--agent"
+        - "holdout"
+        - "--execution-date"
+        - "{{job.parameters.execution_date}}"
+
+    new_cluster: *standard_cluster
+    timeout_seconds: 1800
+    max_retries: 1
+    retry_on_timeout: false
+
+  # ── Task 3: Model Agent (parallel with Task 4) ───────────────────────────────
+  - task_key: model_agent
+    description: >
+      Reads recovery.model_scores (already scored — does NOT re-score).
+      Selects d_optimal and erv_at_d_optimal per account.
+      Applies no constraint overrides here — that is Constraint Agent's job.
+      Writes to recovery.model_agent_output.
+    depends_on:
+      - task_key: holdout_agent
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point:  run_agent
+      parameters:
+        - "--agent"
+        - "model"
+        - "--execution-date"
+        - "{{job.parameters.execution_date}}"
+
+    new_cluster: *standard_cluster
+    timeout_seconds: 1800
+
+  # ── Task 4: Constraint Agent (parallel with Task 3) ─────────────────────────
+  - task_key: constraint_agent
+    description: >
+      Reads recovery.model_scores in parallel with model_agent.
+      Applies business rules: max_discount_by_segment, legal_threshold,
+      write_off_threshold.
+      Overrides d_optimal where rules are violated.
+      Writes overrides to recovery.constraint_overrides.
+      Raises BLOCKED if leakage detected in feature columns.
+    depends_on:
+      - task_key: holdout_agent
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point:  run_agent
+      parameters:
+        - "--agent"
+        - "constraint"
+        - "--execution-date"
+        - "{{job.parameters.execution_date}}"
+
+    new_cluster: *standard_cluster
+    timeout_seconds: 1800
+
+  # ── Task 5: Decision Agent ───────────────────────────────────────────────────
+  - task_key: decision_agent
+    description: >
+      Waits for BOTH model_agent and constraint_agent to complete.
+      Merges model output with constraint overrides.
+      Calls claude_reasoner for:
+        - erv_at_d_optimal > THB 30,000
+        - low_confidence_flag=True AND erv > THB 20,000
+        - propensity_180d < 0.15 AND segment_label is NOT null
+      All other accounts: pure rule-based decision (no API call).
+      Writes final decisions to recovery.nba_decisions.
+    depends_on:
+      - task_key: model_agent
+      - task_key: constraint_agent
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point:  run_agent
+      parameters:
+        - "--agent"
+        - "decision"
+        - "--execution-date"
+        - "{{job.parameters.execution_date}}"
+        - "--dry-run"
+        - "{{job.parameters.dry_run}}"
+
+    new_cluster:
+      spark_version: "14.3.x-scala2.12"
+      node_type_id:  "i3.xlarge"
+      num_workers:   2
+      spark_conf:
+        "spark.sql.extensions":      "io.delta.sql.DeltaSparkSessionExtension"
+        "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.delta.catalog.DeltaCatalog"
+      libraries:
+        - pypi: {package: "anthropic>=0.40.0"}
+        - pypi: {package: "delta-spark==3.1.0"}
+      # Secrets mounted for Claude API key
+      spark_env_vars:
+        DATABRICKS_SECRETS_SCOPE: "cardx-secrets"
+
+    timeout_seconds: 3600
+
+  # ── Task 6: Validation Agent ─────────────────────────────────────────────────
+  - task_key: validation_agent
+    description: >
+      Reads recovery.nba_decisions before any action is taken.
+      Checks all decisions are within allowed parameters.
+      Flags for human review if: constraint_override=True AND erv > THB 50,000.
+      Writes validation results to recovery.validation_results.
+      Raises BLOCKED if > 5% of decisions fail validation rules.
+    depends_on:
+      - task_key: decision_agent
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point:  run_agent
+      parameters:
+        - "--agent"
+        - "validation"
+        - "--execution-date"
+        - "{{job.parameters.execution_date}}"
+
+    new_cluster: *standard_cluster
+    timeout_seconds: 1800
+
+  # ── Task 7: Explain Agent ────────────────────────────────────────────────────
+  - task_key: explain_agent
+    description: >
+      Reads final validated decisions + model_scores.
+      Produces human-readable explanations for the collector dashboard.
+      Format: "Account X in Segment A with 61% 180d recovery probability.
+               Recommended 30% discount (ERV: THB 12,500). Digital + call channel.
+               Confidence: High."
+      Writes to recovery.nba_explanations.
+    depends_on:
+      - task_key: validation_agent
+
+    python_wheel_task:
+      package_name: decision_agent
+      entry_point:  run_agent
+      parameters:
+        - "--agent"
+        - "explain"
+        - "--execution-date"
+        - "{{job.parameters.execution_date}}"
+
+    new_cluster: *standard_cluster
+    timeout_seconds: 1800

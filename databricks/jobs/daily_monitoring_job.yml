@@ -1,0 +1,98 @@
+name: daily_monitoring_job
+description: Daily production monitoring for drift detection and alerting
+
+# Schedule: Daily at 9 AM UTC
+schedule:
+  quartz_cron_expression: "0 0 9 * * ?"
+  timezone_id: "UTC"
+  pause_status: "UNPAUSED"
+
+# Email notifications
+email_notifications:
+  on_failure:
+    - ml-team@company.com
+    - data-engineering@company.com
+  no_alert_for_skipped_runs: true
+
+# Job cluster configuration
+job_clusters:
+  - job_cluster_key: monitoring_cluster
+    new_cluster:
+      spark_version: "13.3.x-scala2.12"
+      node_type_id: "i3.xlarge"
+      num_workers: 2  # Small cluster for monitoring
+      spark_conf:
+        "spark.databricks.delta.preview.enabled": "true"
+      custom_tags:
+        job: "monitoring"
+        use_case: "income_estimation"
+
+# Tasks
+tasks:
+  # Task 1: Run Model Monitor
+  - task_key: run_model_monitor
+    job_cluster_key: monitoring_cluster
+    python_task:
+      python_file: "dbfs:/Workspace/src/decision_agent/monitoring/model_monitor.py"
+      parameters:
+        - "--config"
+        - "/Workspace/conf/monitoring/monitoring_config.yaml"
+        - "--date"
+        - "{{ task.start_time }}"
+    libraries:
+      - pypi:
+          package: "pyyaml"
+    timeout_seconds: 3600  # 1 hour
+    max_retries: 2
+    min_retry_interval_millis: 300000  # 5 minutes
+
+  # Task 2: Prepare Dashboard Data
+  - task_key: prepare_dashboard_data
+    depends_on:
+      - task_key: run_model_monitor
+    job_cluster_key: monitoring_cluster
+    python_task:
+      python_file: "dbfs:/Workspace/src/decision_agent/monitoring/dashboard_data.py"
+      parameters:
+        - "--config"
+        - "/Workspace/conf/monitoring/monitoring_config.yaml"
+        - "--lookback-days"
+        - "30"
+    timeout_seconds: 1800  # 30 minutes
+    max_retries: 1
+
+  # Task 3: Check Rollback Conditions (if A/B testing enabled)
+  - task_key: check_rollback_conditions
+    depends_on:
+      - task_key: run_model_monitor
+    job_cluster_key: monitoring_cluster
+    notebook_task:
+      notebook_path: "/Workspace/databricks/notebooks/monitoring/check_rollback"
+      base_parameters:
+        date: "{{ task.start_time }}"
+    timeout_seconds: 600  # 10 minutes
+    max_retries: 1
+
+# Webhook notifications (optional)
+webhook_notifications:
+  on_failure:
+    - id: slack_monitoring_failure
+
+# Access control
+access_control_list:
+  - user_name: "ml-team-lead@company.com"
+    permission_level: "CAN_MANAGE_RUN"
+  - group_name: "ml-team"
+    permission_level: "CAN_VIEW"
+
+# Tags
+tags:
+  environment: "production"
+  use_case: "income_estimation"
+  job_type: "monitoring"
+
+# Max concurrent runs
+max_concurrent_runs: 1
+
+# Format version
+format: MULTI_TASK
