@@ -201,13 +201,35 @@ def generate_synthetic_offers(
     account_nos = [f"A{str(i).zfill(6)}" for i in range(n)]
     card_nums = [f"K{str(i).zfill(6)}" for i in range(n)]
 
-    start_date = pd.Timestamp("2023-04-01")
-    end_date = pd.Timestamp("2026-04-30")
-    date_range_days = (end_date - start_date).days
-    offer_dates = [
-        (start_date + pd.Timedelta(days=int(d))).strftime("%d/%m/%Y")
-        for d in rng.integers(0, date_range_days, size=n)
-    ]
+    # Monthly offer volume distribution (from actual CardX data)
+    # Jan-Apr 2024 pause period flagged — low volume, excluded from model training
+    monthly_counts = {
+        "2023-04": 67,  "2023-05": 86,  "2023-06": 142, "2023-07": 304,
+        "2023-08": 647, "2023-09": 746, "2023-10": 680, "2023-11": 729,
+        "2023-12": 972, "2024-01": 196, "2024-02": 34,  "2024-03": 28,
+        "2024-04": 23,  "2024-05": 216, "2024-06": 311, "2024-07": 585,
+        "2024-08": 836, "2024-09": 832, "2024-10": 1522,"2024-11": 1841,
+        "2024-12": 1724,"2025-01": 1873,"2025-02": 837, "2025-03": 519,
+        "2025-04": 461, "2025-05": 437, "2025-06": 618, "2025-07": 547,
+        "2025-08": 678, "2025-09": 608, "2025-10": 651, "2025-11": 620,
+        "2025-12": 1172,"2026-01": 729, "2026-02": 557, "2026-03": 625,
+        "2026-04": 452,
+    }
+    months = list(monthly_counts.keys())
+    weights = np.array(list(monthly_counts.values()), dtype=float)
+    weights /= weights.sum()
+
+    sampled_months = rng.choice(months, size=n, p=weights)
+    offer_dates = []
+    for ym in sampled_months:
+        year, month = int(ym[:4]), int(ym[5:])
+        month_start = pd.Timestamp(year=year, month=month, day=1)
+        days_in_month = (month_start + pd.offsets.MonthEnd(0)).day
+        day = rng.integers(1, days_in_month + 1)
+        offer_dates.append(pd.Timestamp(year=year, month=month, day=int(day)).strftime("%d/%m/%Y"))
+
+    # Campaign pause flag — Jan-Apr 2024 accounts are structurally different
+    pause_months = {"2024-01", "2024-02", "2024-03", "2024-04"}
 
     # ── 8. ASSEMBLE ───────────────────────────────────────────────────────────
 
@@ -242,6 +264,10 @@ def generate_synthetic_offers(
         "offer_velocity":               offer_velocity,
         "months_in_collection":         months_in_collection,
         "final_offer_date":             offer_dates,
+        "is_campaign_pause":            [
+            1 if f"{d[6:10]}-{d[3:5]}" in pause_months else 0
+            for d in offer_dates
+        ],
         # audit cols
         "_audit_method":       "payment_in_window (replaced FC=15)",
         "_audit_source":       "lis_negotiation + spc_txn_dly (payment-validated)",
@@ -276,6 +302,15 @@ def validate_synthetic(df: pd.DataFrame) -> None:
     print(df.groupby("final_campaign")["effective_acceptance"].mean().round(3).to_string())
     print(f"\n  Acceptance by discount tier:")
     print(df.groupby("discount_tier")["effective_acceptance"].mean().round(3).sort_values().to_string())
+
+    # Monthly distribution check
+    df["_offer_month"] = pd.to_datetime(df["final_offer_date"], dayfirst=True).dt.to_period("M")
+    by_year = df.groupby(df["_offer_month"].dt.year)["_offer_month"].count()
+    print(f"\n  Volume by year:")
+    print(by_year.to_string())
+    pause_pct = df["is_campaign_pause"].mean() * 100
+    print(f"\n  Campaign pause accounts (Jan-Apr 2024): {df['is_campaign_pause'].sum():,} ({pause_pct:.1f}%)")
+    print(f"  Target: ~281 / 23,905 = 1.2%")
 
 
 if __name__ == "__main__":
